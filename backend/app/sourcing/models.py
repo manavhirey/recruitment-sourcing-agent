@@ -19,7 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.candidates import models as candidate_models  # noqa: F401
-from app.core.database import Base
+from app.core.models import Base
 from app.sourcing.state_machine import RunState
 
 

@@ -133,19 +133,12 @@ def _production_scheduler_payload() -> dict[str, object]:
 
 
 def _production_migration_payload() -> dict[str, object]:
-    suffix = "@db.internal:5432/sourcing?sslmode=verify-full"
     return {
         "environment": "production",
-        "database_url": (
-            "postgresql+psycopg://sourcing_api:api-password-with-32-random" + suffix
-        ),
         "migration_database_url": (
             "postgresql+psycopg://sourcing_migration:"
-            "migration-password-with-32-random" + suffix
-        ),
-        "maintenance_database_url": (
-            "postgresql+psycopg://sourcing_maintenance:"
-            "maintenance-password-with-32-random" + suffix
+            "migration-password-with-32-random@db.internal:5432/sourcing"
+            "?sslmode=verify-full"
         ),
     }
 
@@ -290,15 +283,15 @@ def test_production_settings_reject_weak_reused_placeholder_or_insecure_values(
     assert unsafe_value not in str(caught.value)
 
 
-def test_production_migration_database_credentials_are_distinct() -> None:
+def test_production_migration_database_requires_dedicated_role() -> None:
     payload = _production_migration_payload()
-    api_password = make_url(str(payload["database_url"])).password
     payload["migration_database_url"] = (
-        "postgresql+psycopg://sourcing_migration:"
-        f"{api_password}@db.internal:5432/sourcing?sslmode=verify-full"
+        "postgresql+psycopg://sourcing_api:"
+        "migration-password-with-32-random@db.internal:5432/sourcing"
+        "?sslmode=verify-full"
     )
 
-    with pytest.raises(ValidationError, match="credentials must be distinct"):
+    with pytest.raises(ValidationError, match="dedicated migration role"):
         MigrationSettings(_env_file=None, **payload)
 
 
@@ -380,16 +373,60 @@ def test_runtime_settings_do_not_require_schema_owner_credentials(
     assert not hasattr(settings, "migration_database_url")
 
 
-def test_migration_database_url_must_use_a_distinct_role() -> None:
-    runtime = Settings.for_test()
-    payload = {
-        "database_url": runtime.database_url,
-        "migration_database_url": runtime.database_url,
-        "maintenance_database_url": MaintenanceSettings.for_test().maintenance_database_url,
+def test_migration_settings_expose_only_the_migration_database_credential() -> None:
+    MigrationSettings(
+        _env_file=None,
+        environment="test",
+        migration_database_url=(
+            "postgresql+psycopg://postgres:postgres@localhost:5432/sourcing_test"
+        ),
+    )
+
+    assert set(MigrationSettings.model_fields) == {
+        "environment",
+        "migration_database_url",
     }
 
-    with pytest.raises(ValidationError, match="database roles must be distinct"):
-        MigrationSettings.model_validate(payload)
+
+def test_production_alembic_starts_with_only_migration_credentials() -> None:
+    backend_root = Path(__file__).resolve().parents[2]
+    runtime_environment_names = {
+        field_name.upper()
+        for model in (
+            Settings,
+            WorkerSettings,
+            MaintenanceSettings,
+            LifecycleAdminSettings,
+            SchedulerSettings,
+        )
+        for field_name in model.model_fields
+    }
+    probe_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in runtime_environment_names
+    }
+    probe_environment.update(
+        {
+            "ENVIRONMENT": "production",
+            "MIGRATION_DATABASE_URL": (
+                "postgresql+psycopg://sourcing_migration:"
+                "migration-password-with-32-random@db.internal:5432/sourcing"
+                "?sslmode=verify-full"
+            ),
+        }
+    )
+
+    probe = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
+        cwd=backend_root,
+        env=probe_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
 
 
 def test_maintenance_database_url_is_required_only_by_maintenance_settings(
@@ -415,19 +452,6 @@ def test_maintenance_database_url_must_use_a_distinct_api_role() -> None:
 
     with pytest.raises(ValidationError, match="dedicated maintenance role"):
         MaintenanceSettings.model_validate(payload)
-
-
-def test_maintenance_database_url_must_differ_from_migration_role() -> None:
-    runtime = Settings.for_test()
-    maintenance = MaintenanceSettings.for_test()
-    payload = {
-        "database_url": runtime.database_url,
-        "migration_database_url": maintenance.maintenance_database_url,
-        "maintenance_database_url": maintenance.maintenance_database_url,
-    }
-
-    with pytest.raises(ValidationError, match="database roles must be distinct"):
-        MigrationSettings.model_validate(payload)
 
 
 def test_app_loads_the_project_root_env_file_from_backend(tmp_path: Path) -> None:

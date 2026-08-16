@@ -256,15 +256,24 @@ def enqueue_top_enrichment(
             _finalize_if_terminal(session_factory, context, run_id)
             raise
         except ProviderRateLimited as error:
-            submissions.append(
-                _defer_rate_limited_request(
-                    session_factory,
-                    context,
-                    enrichment_id,
-                    retry_after=error.retry_after,
-                )
+            deferred = _defer_rate_limited_request(
+                session_factory,
+                context,
+                enrichment_id,
+                retry_after=error.retry_after,
             )
-            continue
+            submissions.append(deferred)
+            retry_after = max(1, error.retry_after or 1)
+            undispatched_ids = prepared_request_ids[batch_index + 1 :]
+            paused_count = _pause_undispatched_requests(
+                session_factory,
+                context,
+                undispatched_ids,
+                retry_after=retry_after,
+            )
+            if isinstance(deferred, FailedEnrichment) and paused_count:
+                submissions.append(DeferredEnrichment(retry_after_seconds=retry_after))
+            break
         except ProviderTemporaryError:
             submissions.append(
                 _defer_ambiguous_request(
@@ -698,6 +707,19 @@ def _prepare_request(
             if existing.status != "queued":
                 session.rollback()
                 return None
+            retry_at = existing.poll_after
+            if retry_at is not None and retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            remaining = (
+                (retry_at - datetime.now(UTC)).total_seconds()
+                if retry_at is not None
+                else 0
+            )
+            if remaining > 0:
+                session.rollback()
+                return DeferredEnrichment(
+                    retry_after_seconds=max(1, int(remaining) + 1)
+                )
             run = _load_run(session, context, run_id, for_update=True)
             if run.cancellation_requested or run.state is RunState.CANCELLED:
                 session.rollback()
@@ -705,6 +727,7 @@ def _prepare_request(
             token = codec.issue(existing.id, context.tenant_id)
             existing.capability_token_hmac = codec.digest(token, context.tenant_id)
             existing.status = "submitting"
+            existing.poll_after = None
             existing.stage_deadline = datetime.now(UTC) + _STAGE_DEADLINE
             session.commit()
             return existing.id, token
@@ -914,7 +937,7 @@ def _abort_prepared_requests(
                 if index == failed_index
                 else "provider_dispatch_aborted"
             ),
-            charge_reserved=index < failed_index,
+            charge_reserved=None,
         )
 
 
@@ -924,7 +947,7 @@ def _fail_request(
     request_id: UUID,
     *,
     error_code: str,
-    charge_reserved: bool = False,
+    charge_reserved: bool | None = False,
 ) -> None:
     with _tenant_session(session_factory, context.tenant_id) as session:
         enrichment = session.scalar(
@@ -937,6 +960,12 @@ def _fail_request(
         )
         if enrichment is None or enrichment.status in ("completed", "cancelled"):
             return
+        if charge_reserved is None:
+            charge_reserved = (
+                enrichment.provider_request_id is not None
+                or enrichment.status == "pending"
+                or enrichment.usage_reconciled_at is not None
+            )
         _mark_request_failed(
             session,
             enrichment,
@@ -1065,11 +1094,44 @@ def _defer_rate_limited_request(
                 charge_reserved=False,
             )
             terminal_run_id = enrichment.run_id
+        else:
+            enrichment.poll_after = datetime.now(UTC) + timedelta(seconds=delay)
         session.commit()
     if terminal_run_id is not None:
         _finalize_if_terminal(session_factory, context, terminal_run_id)
         return FailedEnrichment(request_id=request_id)
     return DeferredEnrichment(retry_after_seconds=delay)
+
+
+def _pause_undispatched_requests(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    request_ids: Sequence[UUID],
+    *,
+    retry_after: int,
+) -> int:
+    if not request_ids:
+        return 0
+    retry_at = datetime.now(UTC) + timedelta(seconds=max(1, retry_after))
+    with _tenant_session(session_factory, context.tenant_id) as session:
+        requests = session.scalars(
+            select(EnrichmentRequest)
+            .where(
+                EnrichmentRequest.id.in_(request_ids),
+                EnrichmentRequest.tenant_id == context.tenant_id,
+            )
+            .with_for_update()
+        ).all()
+        paused = 0
+        for enrichment in requests:
+            if enrichment.status != "submitting":
+                continue
+            enrichment.status = "queued"
+            enrichment.stage_deadline = None
+            enrichment.poll_after = retry_at
+            paused += 1
+        session.commit()
+        return paused
 
 
 def _defer_ambiguous_request(

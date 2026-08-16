@@ -7,7 +7,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Mapped, Session, mapped_column, sessionmaker
 
-from app.core.database import Base
+from app.core.models import Base
 
 _REASONS = frozenset({"authentication_error", "permission_error"})
 

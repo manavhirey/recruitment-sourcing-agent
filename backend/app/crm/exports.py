@@ -45,7 +45,7 @@ def export_shortlist_csv(
     def rows() -> Iterator[str]:
         completed = False
         cursor_score: int | None = None
-        cursor_id: UUID | None = None
+        cursor_candidate_id: UUID | None = None
         try:
             yield _csv_row(_HEADERS)
             while True:
@@ -64,16 +64,16 @@ def export_shortlist_csv(
                         JobCandidate.job_id == job_id,
                         JobCandidate.stage == CandidateStage.SHORTLISTED,
                     )
-                    .order_by(JobCandidate.score.desc(), JobCandidate.id)
+                    .order_by(JobCandidate.score.desc(), JobCandidate.candidate_id)
                     .limit(1)
                 )
-                if cursor_score is not None and cursor_id is not None:
+                if cursor_score is not None and cursor_candidate_id is not None:
                     statement = statement.where(
                         or_(
                             JobCandidate.score < cursor_score,
                             and_(
                                 JobCandidate.score == cursor_score,
-                                JobCandidate.id > cursor_id,
+                                JobCandidate.candidate_id > cursor_candidate_id,
                             ),
                         )
                     )
@@ -87,7 +87,7 @@ def export_shortlist_csv(
                     return
                 row, candidate = result
                 cursor_score = row.score
-                cursor_id = row.id
+                cursor_candidate_id = row.candidate_id
                 candidate_values = (
                     str(candidate.id),
                     candidate.full_name,

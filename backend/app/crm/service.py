@@ -231,7 +231,7 @@ class CrmService:
         descending = sort == "-score"
         cursor_scope = self._cursor_scope(
             context,
-            "job-candidates",
+            "job-candidates-v2",
             {
                 "job_id": str(job_id),
                 "classification": classification,
@@ -253,7 +253,7 @@ class CrmService:
             values = self._decode_cursor(cursor, cursor_scope)
             try:
                 cursor_score = int(str(values["score"]))
-                cursor_id = UUID(str(values["id"]))
+                cursor_candidate_id = UUID(str(values["candidate_id"]))
             except (KeyError, TypeError, ValueError) as error:
                 raise CrmError("cursor_invalid") from error
             score_comparison = (
@@ -266,13 +266,13 @@ class CrmService:
                     score_comparison,
                     and_(
                         JobCandidate.score == cursor_score,
-                        JobCandidate.id > cursor_id,
+                        JobCandidate.candidate_id > cursor_candidate_id,
                     ),
                 )
             )
         statement = statement.order_by(
             JobCandidate.score.desc() if descending else JobCandidate.score.asc(),
-            JobCandidate.id.asc(),
+            JobCandidate.candidate_id.asc(),
         ).limit(limit + 1)
         rows = list(self.session.execute(statement).tuples())
         next_cursor = None
@@ -280,7 +280,7 @@ class CrmService:
             last = rows[limit - 1][0]
             next_cursor = self._encode_cursor(
                 cursor_scope,
-                {"score": last.score, "id": str(last.id)},
+                {"score": last.score, "candidate_id": str(last.candidate_id)},
             )
             rows = rows[:limit]
         return rows, next_cursor
@@ -1677,7 +1677,7 @@ def capture_acceptance_cohort(
                 RunCandidate.classification == "main",
                 RunCandidate.scoring_version.is_not(None),
             )
-            .order_by(RunCandidate.match_score.desc(), RunCandidate.id)
+            .order_by(RunCandidate.match_score.desc(), RunCandidate.candidate_id)
             .limit(20)
         )
     )
@@ -1694,7 +1694,7 @@ def capture_acceptance_cohort(
                     JobCandidate.latest_run_id == run.id,
                     JobCandidate.classification == "main",
                 )
-                .order_by(JobCandidate.score.desc(), JobCandidate.id)
+                .order_by(JobCandidate.score.desc(), JobCandidate.candidate_id)
                 .limit(20)
             )
         )
@@ -1887,7 +1887,7 @@ def _acceptance_market(job: Job, scorecard: ScorecardVersion) -> str:
         ):
             return market
     if any(
-        value.rstrip(".,").split()[-1] in _US_REGION_CODES
+        value.strip().rstrip(".,").split()[-1].upper() in _US_REGION_CODES
         for value in locations
         if value.strip()
     ):

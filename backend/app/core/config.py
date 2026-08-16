@@ -460,35 +460,18 @@ class MigrationSettings(BaseSettings):
     )
 
     environment: Environment = "development"
-    database_url: str
     migration_database_url: str
-    maintenance_database_url: str
 
     @model_validator(mode="after")
-    def require_distinct_database_roles(self) -> "MigrationSettings":
-        roles = {
-            make_url(value).username
-            for value in (
-                self.database_url,
-                self.migration_database_url,
-                self.maintenance_database_url,
-            )
-        }
-        if None in roles or len(roles) != 3:
-            raise ValueError(
-                "API, migration, and maintenance database roles must be distinct"
-            )
+    def require_dedicated_migration_role(self) -> "MigrationSettings":
         if self.environment == "production":
-            database_urls = {
-                "database_url": self.database_url,
-                "migration_database_url": self.migration_database_url,
-                "maintenance_database_url": self.maintenance_database_url,
-            }
-            for name, value in database_urls.items():
-                _require_production_database_url(name, value)
-            passwords = {make_url(value).password for value in database_urls.values()}
-            if None in passwords or len(passwords) != len(database_urls):
-                raise ValueError("production database credentials must be distinct")
+            _require_production_database_url(
+                "migration_database_url", self.migration_database_url
+            )
+            if make_url(self.migration_database_url).username != "sourcing_migration":
+                raise ValueError(
+                    "migration_database_url must use the dedicated migration role"
+                )
         return self
 
 

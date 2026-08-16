@@ -1,5 +1,5 @@
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
@@ -489,7 +489,7 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
             owner_user_id=crm_api["recruiter_id"],
             title="Acceptance Cohort",
             job_description="Measure review acceptance.",
-            location="Boston, MA",
+            location="Boston, ma",
         )
         session.add(job)
         session.flush()
@@ -501,7 +501,7 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
             seniority=[],
             minimum_years=None,
             maximum_years=None,
-            locations=["Boston, MA"],
+            locations=["Boston, mA"],
             industry_code="technology.fintech",
             suggested_adjacent_industries=[],
             uncertainties=[],
@@ -652,6 +652,111 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
     assert immutable.run_id == early.run_id
     assert immutable.accepted == early.accepted
     assert immutable.rejected == early.rejected
+
+
+def test_acceptance_cohort_matches_visible_top_twenty_for_tied_scores(crm_api) -> None:
+    with Session(crm_api["engine"], expire_on_commit=False) as session:
+        job = Job(
+            tenant_id=crm_api["tenant_id"],
+            client_id=crm_api["granted_client_id"],
+            owner_user_id=crm_api["recruiter_id"],
+            title="Tie-breaker Cohort",
+            job_description="Use one canonical candidate ordering.",
+        )
+        session.add(job)
+        session.flush()
+        scorecard = ScorecardVersion(
+            tenant_id=crm_api["tenant_id"],
+            job_id=job.id,
+            version=1,
+            target_titles=["Engineer"],
+            seniority=[],
+            minimum_years=None,
+            maximum_years=None,
+            locations=[],
+            industry_code="technology.software",
+            suggested_adjacent_industries=[],
+            uncertainties=[],
+            extraction_status="ready",
+            confirmed_by_user_id=crm_api["recruiter_id"],
+        )
+        session.add(scorecard)
+        session.flush()
+        job.current_scorecard_id = scorecard.id
+        run = SourcingRun(
+            tenant_id=crm_api["tenant_id"],
+            job_id=job.id,
+            scorecard_version_id=scorecard.id,
+            started_by_user_id=crm_api["recruiter_id"],
+            state=RunState.READY,
+            current_stage=RunState.READY.value,
+            completed_at=datetime.now(UTC),
+        )
+        session.add(run)
+        session.flush()
+        for position in range(21):
+            candidate_id = UUID(int=0x100000 + position)
+            session.add(
+                Candidate(
+                    id=candidate_id,
+                    tenant_id=crm_api["tenant_id"],
+                    full_name=f"Tied Candidate {position}",
+                    normalized_name=f"tied candidate {position}",
+                )
+            )
+            session.add(
+                RunCandidate(
+                    id=UUID(int=0x500000 - position),
+                    tenant_id=crm_api["tenant_id"],
+                    run_id=run.id,
+                    candidate_id=candidate_id,
+                    scorecard_version_id=scorecard.id,
+                    match_score=90,
+                    classification="main",
+                    scoring_version="matching-v1",
+                )
+            )
+            session.add(
+                JobCandidate(
+                    id=UUID(int=0x300000 + position),
+                    tenant_id=crm_api["tenant_id"],
+                    job_id=job.id,
+                    candidate_id=candidate_id,
+                    latest_run_id=run.id,
+                    scorecard_version_id=scorecard.id,
+                    classification="main",
+                    score=90,
+                    score_json={"total": 90},
+                    scoring_version="matching-v1",
+                    stage=CandidateStage.NEW,
+                )
+            )
+        session.flush()
+        cohort = capture_acceptance_cohort(session, run)
+        context = RequestContext(
+            tenant_id=crm_api["tenant_id"],
+            user_id=crm_api["recruiter_id"],
+            role=Role.RECRUITER,
+            allowed_client_ids=frozenset((crm_api["granted_client_id"],)),
+        )
+        service = CrmService(session, b"canonical-candidate-order")
+        visible_rows, next_cursor = service.list_job_candidates(
+            context, job.id, limit=20
+        )
+        assert next_cursor is not None
+        remaining_rows, final_cursor = service.list_job_candidates(
+            context,
+            job.id,
+            limit=20,
+            cursor=next_cursor,
+        )
+
+    visible_ids = [str(row.candidate_id) for row, _candidate in visible_rows]
+    assert cohort.candidate_ids == visible_ids
+    assert [row.candidate_id for row, _candidate in remaining_rows] == [
+        UUID(int=0x100014)
+    ]
+    assert final_cursor is None
 
 
 def test_acceptance_route_uses_server_time_not_caller_supplied_as_of(crm_api) -> None:

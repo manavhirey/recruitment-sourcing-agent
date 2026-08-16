@@ -3,17 +3,14 @@ from collections.abc import Callable, Generator
 
 from fastapi import Request
 from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.core import models as core_models
 from app.core.config import get_settings
 
-
-class Base(DeclarativeBase):
-    pass
-
-
+Base = core_models.Base
 engine = create_engine(get_settings().database_url, pool_pre_ping=True)
 session_factory = sessionmaker(bind=engine, expire_on_commit=False)
 _REQUEST_SESSION_KEY = "sourcing.database_session"
