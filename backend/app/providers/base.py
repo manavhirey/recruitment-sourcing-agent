@@ -42,6 +42,8 @@ class ProviderPerson:
     location: str | None
     linkedin_url: str | None
     experiences: tuple[ProviderExperience, ...]
+    skills: tuple[str, ...] = ()
+    industry_codes: tuple[str, ...] = ()
     contacts: tuple["ProviderContact", ...] = ()
 
 

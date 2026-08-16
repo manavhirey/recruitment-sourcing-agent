@@ -6,6 +6,7 @@ from typing import Any, Self
 
 import httpx
 
+from app.clients.taxonomy import IndustryTaxonomy
 from app.core.config import Settings
 from app.core.log_redaction import install_sensitive_data_log_filters
 from app.providers.base import (
@@ -31,6 +32,7 @@ APOLLO_BULK_ENRICHMENT_URL = "https://api.apollo.io/api/v1/people/bulk_match"
 APOLLO_WEBHOOK_RESULT_URL = "https://api.apollo.io/api/v1/webhook_result"
 _MAX_PEOPLE_PER_PAGE = 100
 _MAX_UNIQUE_PEOPLE = 300
+_INDUSTRY_TAXONOMY = IndustryTaxonomy.load_version("v1")
 
 
 class ApolloGateway:
@@ -459,6 +461,8 @@ def _person(value: object) -> ProviderPerson:
         location=_location(value),
         linkedin_url=_optional_string(value, "linkedin_url"),
         experiences=experiences,
+        skills=_optional_string_list(value, "skills"),
+        industry_codes=_industry_codes(value, organization),
     )
 
 
@@ -487,6 +491,41 @@ def _experiences(value: object) -> tuple[ProviderExperience, ...]:
             )
         )
     return tuple(experiences)
+
+
+def _optional_string_list(value: Mapping[str, object], key: str) -> tuple[str, ...]:
+    raw = value.get(key)
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ProviderPayloadError(f"provider field {key} must be a list")
+    parsed: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ProviderPayloadError(
+                f"provider field {key} contains an invalid value"
+            )
+        parsed.append(item.strip())
+    return tuple(parsed)
+
+
+def _industry_codes(
+    person: Mapping[str, object],
+    organization: object,
+) -> tuple[str, ...]:
+    supplied_codes = _optional_string_list(person, "industry_codes")
+    resolved = {
+        normalized
+        for value in supplied_codes
+        if _INDUSTRY_TAXONOMY.contains(normalized := value.casefold())
+    }
+    if isinstance(organization, dict):
+        label = _optional_string(organization, "industry")
+        if label is not None:
+            code = _INDUSTRY_TAXONOMY.code_for_label(label)
+            if code is not None:
+                resolved.add(code)
+    return tuple(sorted(resolved))
 
 
 def _location(person: Mapping[str, object]) -> str | None:

@@ -126,7 +126,7 @@ def test_0007_to_head_upgrade_downgrade_and_model_parity(owner_engine: Engine) -
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0008_retention_maintenance"
+            "0009_crm"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -282,8 +282,10 @@ def test_postgres_contact_row_contains_no_plaintext(owner_engine: Engine) -> Non
         connection.execute(
             text(
                 "INSERT INTO candidates "
-                "(id, tenant_id, full_name, normalized_name, created_at, updated_at) "
-                "VALUES (:id, :tenant, 'Priya Sharma', 'priya sharma', now(), now())"
+                "(id, tenant_id, full_name, normalized_name, normalized_skills, "
+                "industry_codes, created_at, updated_at) VALUES "
+                "(:id, :tenant, 'Priya Sharma', 'priya sharma', '[]'::jsonb, "
+                "'[]'::jsonb, now(), now())"
             ),
             {"id": candidate_id, "tenant": tenant_id},
         )
@@ -346,9 +348,10 @@ def test_postgres_erasure_tombstone_blocks_stale_replay_under_forced_rls(
         connection.execute(
             text(
                 "INSERT INTO candidates "
-                "(id, tenant_id, full_name, normalized_name, created_at, updated_at) "
-                "VALUES (:id, :tenant, 'Retention Candidate', "
-                "'retention candidate', now(), now())"
+                "(id, tenant_id, full_name, normalized_name, normalized_skills, "
+                "industry_codes, created_at, updated_at) VALUES "
+                "(:id, :tenant, 'Retention Candidate', 'retention candidate', "
+                "'[]'::jsonb, '[]'::jsonb, now(), now())"
             ),
             {"id": candidate_id, "tenant": tenant_id},
         )

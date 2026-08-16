@@ -40,6 +40,13 @@ class IndustryTaxonomy:
     def get(self, code: str) -> IndustryCode:
         return self._industries[code]
 
+    def code_for_label(self, label: str) -> str | None:
+        normalized = " ".join(label.casefold().split())
+        for industry in self._industries.values():
+            if " ".join(industry.label.casefold().split()) == normalized:
+                return industry.code
+        return None
+
     def default_adjacency(self, code: str) -> set[str]:
         return set(self.get(code).default_adjacency_codes)
 

@@ -54,7 +54,8 @@ def test_apollo_search_normalizes_people(
                         "city": "New York",
                         "state": "New York",
                         "country": "United States",
-                        "organization": {"name": "PayFlow"},
+                        "organization": {"name": "PayFlow", "industry": "Fintech"},
+                        "skills": ["Payment Processing", " SQL "],
                         "employment_history": [
                             {
                                 "title": "Product Manager",
@@ -82,6 +83,8 @@ def test_apollo_search_normalizes_people(
     assert page.people[0].current_company == "PayFlow"
     assert page.people[0].location == "New York, New York, United States"
     assert page.people[0].experiences[0].company_name == "BankCo"
+    assert page.people[0].skills == ("Payment Processing", "SQL")
+    assert page.people[0].industry_codes == ("technology.fintech",)
     assert page.next_page is None
     assert page.provider_request_id == "apollo-request-123"
     assert dict(page.charged_units) == {

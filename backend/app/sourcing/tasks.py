@@ -17,6 +17,7 @@ from app.candidates.contacts import ContactCipher
 from app.candidates.service import CandidateService
 from app.core.config import get_settings
 from app.core.database import session_factory as database_session_factory
+from app.crm.service import materialize_run_matches
 from app.identity.schemas import RequestContext, Role
 from app.jobs.service import JobService
 from app.matching.engine import MatchingEngine
@@ -281,6 +282,7 @@ def execute_match_run(
                 )
             )
             if not unmatched:
+                materialize_run_matches(session, run, context)
                 run.matched_count = int(
                     session.scalar(
                         select(func.count())

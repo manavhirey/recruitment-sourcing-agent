@@ -5,10 +5,13 @@ from fastapi import FastAPI
 from openai import OpenAI
 from redis import Redis
 
+from app.candidates.contacts import ContactCipher
+from app.candidates.router import router as candidates_router
 from app.clients.router import router as clients_router
 from app.core.config import Settings, get_settings
 from app.core.log_redaction import install_sensitive_data_log_filters
 from app.core.security import TokenVerifier
+from app.crm.router import router as crm_router
 from app.identity.router import router as identity_router
 from app.jobs.llm import OpenAIResponsesScorecardGateway, ScorecardGateway
 from app.jobs.router import router as jobs_router
@@ -22,7 +25,6 @@ from app.sourcing.webhooks import (
 )
 
 if False:  # pragma: no cover - imported only for static typing
-    from app.candidates.contacts import ContactCipher
     from app.providers.snapshots import SnapshotStore
 
 SourcingDispatcher = Callable[[UUID, UUID, UUID], None]
@@ -65,7 +67,10 @@ def create_app(
         enrichment_dispatcher or _dispatch_enrichment_request
     )
     app.state.snapshot_store = snapshot_store
-    app.state.contact_cipher = contact_cipher
+    app.state.contact_cipher = contact_cipher or ContactCipher(
+        app.state.settings.contact_encryption_key.get_secret_value(),
+        app.state.settings.suppression_hmac_key.get_secret_value().encode(),
+    )
     app.state.webhook_rate_limiter = webhook_rate_limiter or RedisWebhookRateLimiter(
         Redis.from_url(app.state.settings.redis_url)
     )
@@ -74,6 +79,8 @@ def create_app(
     app.include_router(clients_router)
     app.include_router(jobs_router)
     app.include_router(sourcing_router)
+    app.include_router(crm_router)
+    app.include_router(candidates_router)
     app.include_router(webhooks_router)
 
     @app.get("/health/ready")

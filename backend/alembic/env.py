@@ -8,6 +8,7 @@ from app.candidates import models as candidate_models  # noqa: F401
 from app.clients import models as client_models  # noqa: F401
 from app.core.config import get_migration_settings
 from app.core.database import Base
+from app.crm import models as crm_models  # noqa: F401
 from app.identity import models  # noqa: F401
 from app.jobs import models as job_models  # noqa: F401
 from app.sourcing import models as sourcing_models  # noqa: F401

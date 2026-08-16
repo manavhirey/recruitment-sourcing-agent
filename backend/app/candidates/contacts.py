@@ -317,6 +317,7 @@ class ContactService:
         contact_point_id: UUID,
         *,
         used_at: datetime | None = None,
+        record_use: bool = True,
     ) -> str:
         point = self.session.scalar(
             select(ContactPoint)
@@ -357,9 +358,10 @@ class ContactService:
             encrypted,
             ContactContext(context.tenant_id, point.candidate_id, point.kind),
         )
-        point.last_used_at = use_time
-        point.expires_at = point.last_used_at + _CONTACT_RETENTION
-        self.session.flush()
+        if record_use:
+            point.last_used_at = use_time
+            point.expires_at = point.last_used_at + _CONTACT_RETENTION
+            self.session.flush()
         return value
 
     def _candidate(self, tenant_id: UUID, candidate_id: UUID) -> Candidate:

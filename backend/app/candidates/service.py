@@ -93,6 +93,13 @@ class CandidateService:
         self._observe_fields(
             candidate, identity, provider_person, timestamp, confidence, normalized_url
         )
+        self._observe_fact_lists(
+            candidate,
+            identity,
+            provider_person,
+            timestamp,
+            confidence,
+        )
         self._observe_experiences(
             candidate,
             identity,
@@ -135,9 +142,12 @@ class CandidateService:
             .order_by(CandidateExperience.position, CandidateExperience.id)
         ).all()
         profile_values = CandidateProfile.model_validate(candidate).model_dump()
-        profile_values.pop("experiences")
+        for derived_field in ("experiences", "skills", "industry_codes"):
+            profile_values.pop(derived_field)
         return CandidateProfile(
             **profile_values,
+            skills=tuple(candidate.normalized_skills),
+            industry_codes=tuple(candidate.industry_codes),
             experiences=tuple(
                 CandidateExperienceProfile.model_validate(item) for item in experiences
             ),
@@ -345,6 +355,94 @@ class CandidateService:
                 record.source_timestamp = source_timestamp
                 record.observed_value_hash = value_hash
                 record.confidence = confidence
+
+    def _observe_fact_lists(
+        self,
+        candidate: Candidate,
+        identity: SourceIdentity,
+        person: ProviderPerson,
+        source_timestamp: datetime,
+        confidence: float,
+    ) -> None:
+        facts = (
+            (
+                "skills",
+                "normalized_skills",
+                sorted(
+                    {
+                        normalized
+                        for value in person.skills
+                        if (normalized := normalize_text(value))
+                    }
+                ),
+            ),
+            (
+                "industry_codes",
+                "industry_codes",
+                sorted(
+                    {
+                        normalized
+                        for value in person.industry_codes
+                        if (normalized := value.strip().casefold())
+                    }
+                ),
+            ),
+        )
+        for field_name, candidate_attribute, values in facts:
+            if not values:
+                continue
+            value_hash = observed_value_hash(
+                json.dumps(values, sort_keys=True, separators=(",", ":"))
+            )
+            observation = self.session.scalar(
+                select(CandidateFieldProvenance).where(
+                    CandidateFieldProvenance.tenant_id == candidate.tenant_id,
+                    CandidateFieldProvenance.source_identity_id == identity.id,
+                    CandidateFieldProvenance.field_name == field_name,
+                    CandidateFieldProvenance.observed_value_hash == value_hash,
+                )
+            )
+            current = self.session.scalar(
+                select(CandidateFieldProvenance).where(
+                    CandidateFieldProvenance.tenant_id == candidate.tenant_id,
+                    CandidateFieldProvenance.candidate_id == candidate.id,
+                    CandidateFieldProvenance.field_name == field_name,
+                    CandidateFieldProvenance.is_current.is_(True),
+                )
+            )
+            select_value = current is None or _is_newer_not_lower(
+                source_timestamp,
+                confidence,
+                current.source_timestamp,
+                current.confidence,
+            )
+            if observation is None:
+                observation = CandidateFieldProvenance(
+                    tenant_id=candidate.tenant_id,
+                    candidate_id=candidate.id,
+                    source_identity_id=identity.id,
+                    field_name=field_name,
+                    provider=identity.provider,
+                    source_timestamp=source_timestamp,
+                    observed_value_hash=value_hash,
+                    confidence=confidence,
+                    is_current=False,
+                )
+                self.session.add(observation)
+            elif _is_newer_not_lower(
+                source_timestamp,
+                confidence,
+                observation.source_timestamp,
+                observation.confidence,
+            ):
+                observation.source_timestamp = source_timestamp
+                observation.confidence = confidence
+            if select_value:
+                if current is not None and current is not observation:
+                    current.is_current = False
+                    self.session.flush()
+                observation.is_current = True
+                setattr(candidate, candidate_attribute, values)
 
     def _suggest_duplicates(
         self,

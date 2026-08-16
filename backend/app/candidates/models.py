@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -26,7 +28,39 @@ def utc_now() -> datetime:
 
 class Candidate(Base):
     __tablename__ = "candidates"
-    __table_args__ = (UniqueConstraint("tenant_id", "id"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        Index(
+            "ix_candidates_normalized_name_trgm",
+            "normalized_name",
+            postgresql_using="gin",
+            postgresql_ops={"normalized_name": "gin_trgm_ops"},
+        ).ddl_if(dialect="postgresql"),
+        Index(
+            "ix_candidates_normalized_title_trgm",
+            "normalized_title",
+            postgresql_using="gin",
+            postgresql_ops={"normalized_title": "gin_trgm_ops"},
+        ).ddl_if(dialect="postgresql"),
+        Index(
+            "ix_candidates_normalized_company_trgm",
+            "normalized_company",
+            postgresql_using="gin",
+            postgresql_ops={"normalized_company": "gin_trgm_ops"},
+        ).ddl_if(dialect="postgresql"),
+        Index(
+            "ix_candidates_search_fts",
+            text(
+                "to_tsvector('simple'::regconfig, (((((COALESCE(normalized_name, "
+                "''::character varying)::text || ' '::text) || "
+                "COALESCE(normalized_title, ''::character varying)::text) || "
+                "' '::text) || COALESCE(normalized_company, "
+                "''::character varying)::text) || ' '::text) || "
+                "normalized_skills::text)"
+            ),
+            postgresql_using="gin",
+        ).ddl_if(dialect="postgresql"),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     tenant_id: Mapped[UUID] = mapped_column(
@@ -42,6 +76,12 @@ class Candidate(Base):
     normalized_company: Mapped[str | None] = mapped_column(String(255))
     location: Mapped[str | None] = mapped_column(String(255))
     normalized_location: Mapped[str | None] = mapped_column(String(255))
+    normalized_skills: Mapped[list[str]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), default=list, nullable=False
+    )
+    industry_codes: Mapped[list[str]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), default=list, nullable=False
+    )
     profile_url: Mapped[str | None] = mapped_column(String(2048))
     normalized_profile_url: Mapped[str | None] = mapped_column(String(2048))
     created_at: Mapped[datetime] = mapped_column(
@@ -175,6 +215,27 @@ class CandidateExperience(Base):
             "confidence >= 0 AND confidence <= 1",
             name="ck_candidate_experiences_confidence",
         ),
+        Index(
+            "ix_candidate_experiences_title_trgm",
+            "title",
+            postgresql_using="gin",
+            postgresql_ops={"title": "gin_trgm_ops"},
+        ).ddl_if(dialect="postgresql"),
+        Index(
+            "ix_candidate_experiences_company_trgm",
+            "company_name",
+            postgresql_using="gin",
+            postgresql_ops={"company_name": "gin_trgm_ops"},
+        ).ddl_if(dialect="postgresql"),
+        Index(
+            "ix_candidate_experiences_search_fts",
+            text(
+                "to_tsvector('simple'::regconfig, (COALESCE(title, "
+                "''::character varying)::text || ' '::text) || "
+                "COALESCE(company_name, ''::character varying)::text)"
+            ),
+            postgresql_using="gin",
+        ).ddl_if(dialect="postgresql"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
