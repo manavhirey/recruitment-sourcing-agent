@@ -16,12 +16,10 @@ from app.jobs.llm import ScorecardGateway
 from app.jobs.models import Job
 from app.jobs.schemas import (
     ConfirmedScorecard,
-    EditableScorecardDraft,
     ExtractionStatus,
     JobCreate,
     JobResponse,
     ScorecardConfirmation,
-    ScorecardDraft,
     ScorecardDraftResponse,
     ScorecardDraftUpdate,
     ScorecardGenerationRequest,
@@ -63,21 +61,6 @@ def _job_response(job: Job) -> JobResponse:
         current_scorecard_id=job.current_scorecard_id,
         created_at=job.created_at,
         updated_at=job.updated_at,
-    )
-
-
-def _draft_response(job: Job) -> ScorecardDraftResponse:
-    return ScorecardDraftResponse(
-        job_id=job.id,
-        draft_revision=job.draft_revision,
-        draft=(
-            ScorecardDraft.model_validate(job.draft_payload)
-            if job.draft_payload is not None
-            else EditableScorecardDraft()
-        ),
-        original_job_description=job.job_description,
-        extraction_status=ExtractionStatus(job.draft_extraction_status),
-        extraction_warning=job.draft_extraction_warning,
     )
 
 
@@ -144,7 +127,7 @@ def generate_scorecard_draft(
 ) -> ScorecardDraftResponse:
     service = _service(session, settings, gateway)
     try:
-        job = service.generate_draft(
+        result = service.generate_draft(
             context,
             job_id,
             expected_revision=body.expected_revision,
@@ -152,7 +135,7 @@ def generate_scorecard_draft(
         )
     except JobError as error:
         _raise_job_error(error)
-    return _draft_response(job)
+    return result
 
 
 @router.put("/{job_id}/scorecard/draft", response_model=ScorecardDraftResponse)
@@ -167,7 +150,7 @@ def update_scorecard_draft(
 ) -> ScorecardDraftResponse:
     service = _service(session, settings, gateway)
     try:
-        job = service.update_draft(
+        result = service.update_draft(
             context,
             job_id,
             body.draft,
@@ -176,7 +159,7 @@ def update_scorecard_draft(
         )
     except JobError as error:
         _raise_job_error(error)
-    return _draft_response(job)
+    return result
 
 
 @router.post("/{job_id}/scorecard/confirm", response_model=ConfirmedScorecard)

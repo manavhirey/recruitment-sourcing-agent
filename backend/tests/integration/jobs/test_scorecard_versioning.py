@@ -290,3 +290,103 @@ def test_double_extraction_failure_returns_editable_manual_draft(job_api) -> Non
     assert confirmed.status_code == 200
     assert confirmed.json()["version"] == 1
     assert confirmed.json()["extraction_status"] == "manual_required"
+
+
+def _draft_payload(title: str, criterion_key: str) -> dict[str, object]:
+    return {
+        "target_titles": [title],
+        "criteria": [
+            {
+                "key": criterion_key,
+                "label": f"{criterion_key.title()} experience",
+                "kind": "must_have",
+                "source_text": f"{criterion_key} experience",
+            }
+        ],
+        "seniority": ["manager"],
+        "minimum_years": 5,
+        "maximum_years": 12,
+        "locations": ["India"],
+        "industry_code": "technology.fintech",
+        "suggested_adjacent_industries": [],
+        "uncertainties": [],
+    }
+
+
+def _create_job_for_replay(job_api, idempotency_key: str) -> tuple[dict, dict]:
+    headers = {
+        "Authorization": "Bearer signed-token",
+        "X-Tenant-ID": str(job_api["tenant_id"]),
+    }
+    response = job_api["api"].post(
+        "/api/v1/jobs",
+        headers={**headers, "Idempotency-Key": idempotency_key},
+        json={
+            "client_id": str(job_api["client_id"]),
+            "title": "Product Manager",
+            "job_description": "Hire a product manager with payments experience.",
+        },
+    )
+    assert response.status_code == 201
+    return headers, response.json()
+
+
+def test_generate_replay_returns_original_snapshot_after_later_edit(job_api) -> None:
+    headers, job = _create_job_for_replay(job_api, "create-generate-replay-job")
+    endpoint = f"/api/v1/jobs/{job['id']}/scorecard/generate"
+    first = job_api["api"].post(
+        endpoint,
+        headers={**headers, "Idempotency-Key": "generate-replay-snapshot"},
+        json={"expected_revision": 0},
+    )
+    assert first.status_code == 200
+    later = job_api["api"].put(
+        f"/api/v1/jobs/{job['id']}/scorecard/draft",
+        headers={**headers, "Idempotency-Key": "edit-after-generate"},
+        json={
+            "expected_revision": 1,
+            "draft": _draft_payload("Product Manager", "payments"),
+        },
+    )
+    assert later.status_code == 200
+
+    replay = job_api["api"].post(
+        endpoint,
+        headers={**headers, "Idempotency-Key": "generate-replay-snapshot"},
+        json={"expected_revision": 0},
+    )
+
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert replay.json()["draft_revision"] == 1
+
+
+def test_update_replay_returns_original_snapshot_after_later_edit(job_api) -> None:
+    headers, job = _create_job_for_replay(job_api, "create-update-replay-job")
+    endpoint = f"/api/v1/jobs/{job['id']}/scorecard/draft"
+    first_payload = _draft_payload("Product Manager", "payments")
+    first = job_api["api"].put(
+        endpoint,
+        headers={**headers, "Idempotency-Key": "update-replay-snapshot"},
+        json={"expected_revision": 0, "draft": first_payload},
+    )
+    assert first.status_code == 200
+    later = job_api["api"].put(
+        endpoint,
+        headers={**headers, "Idempotency-Key": "later-draft-edit"},
+        json={
+            "expected_revision": 1,
+            "draft": _draft_payload("Senior Product Manager", "platform"),
+        },
+    )
+    assert later.status_code == 200
+
+    replay = job_api["api"].put(
+        endpoint,
+        headers={**headers, "Idempotency-Key": "update-replay-snapshot"},
+        json={"expected_revision": 0, "draft": first_payload},
+    )
+
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert replay.json()["draft_revision"] == 1

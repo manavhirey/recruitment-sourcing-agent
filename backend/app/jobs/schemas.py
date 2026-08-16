@@ -1,9 +1,10 @@
-import re
 from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.jobs.legal_policy import DEFAULT_SCORECARD_LEGAL_POLICY
 
 
 class CriterionKind(StrEnum):
@@ -12,44 +13,8 @@ class CriterionKind(StrEnum):
     EXCLUSION = "exclusion"
 
 
-_PROTECTED_CHARACTERISTIC_TERMS = (
-    "age",
-    "caste",
-    "color",
-    "disability",
-    "ethnicity",
-    "female",
-    "gender",
-    "genetic information",
-    "male",
-    "marital status",
-    "national origin",
-    "pregnancy",
-    "race",
-    "religion",
-    "sex",
-    "sexual orientation",
-    "veteran status",
-)
-_WORK_AUTHORIZATION_TERMS = (
-    "authorized to work",
-    "citizenship",
-    "right to work",
-    "visa",
-    "work authorization",
-    "work permit",
-)
-
-
 def _criterion_text(criterion: "ScorecardCriterion") -> str:
-    return " ".join(
-        value.casefold().replace("_", " ")
-        for value in (criterion.key, criterion.label, criterion.source_text or "")
-    )
-
-
-def _contains_term(text: str, term: str) -> bool:
-    return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) is not None
+    return " ".join((criterion.key, criterion.label, criterion.source_text or ""))
 
 
 class ScorecardCriterion(BaseModel):
@@ -64,16 +29,26 @@ class ScorecardCriterion(BaseModel):
     recruiter_entered: bool = False
     lawful_requirement_confirmed: bool = False
 
+    @field_validator("source_text", mode="before")
+    @classmethod
+    def normalize_source_text(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        return normalized or None
+
     @model_validator(mode="after")
     def enforce_lawful_criterion(self) -> "ScorecardCriterion":
         criterion_text = _criterion_text(self)
-        if any(
-            _contains_term(criterion_text, protected_term)
-            for protected_term in _PROTECTED_CHARACTERISTIC_TERMS
+        if DEFAULT_SCORECARD_LEGAL_POLICY.protected_characteristic_match(
+            criterion_text
         ):
             raise ValueError("criterion refers to a protected characteristic")
-        if self.inferred and any(
-            _contains_term(criterion_text, term) for term in _WORK_AUTHORIZATION_TERMS
+        if (
+            self.inferred
+            and DEFAULT_SCORECARD_LEGAL_POLICY.refers_to_work_authorization(
+                criterion_text
+            )
         ):
             raise ValueError("work authorization cannot be inferred")
         if (
@@ -210,6 +185,8 @@ class EditableScorecardDraft(BaseModel):
 
 
 class ScorecardDraftResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     job_id: UUID
     draft_revision: int
     draft: ScorecardDraft | EditableScorecardDraft

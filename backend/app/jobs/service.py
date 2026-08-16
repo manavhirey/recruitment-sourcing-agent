@@ -15,9 +15,11 @@ from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
 from app.jobs.schemas import (
     ClientContext,
     ConfirmedScorecard,
+    EditableScorecardDraft,
     ExtractionStatus,
     ScorecardCriterion,
     ScorecardDraft,
+    ScorecardDraftResponse,
 )
 
 
@@ -88,13 +90,20 @@ class JobService:
         self._complete(record, {"job_id": str(job.id)})
         return job
 
-    def get_authorized(self, context: RequestContext, job_id: UUID) -> Job:
-        job = self.session.scalar(
-            select(Job).where(
-                Job.id == job_id,
-                Job.tenant_id == context.tenant_id,
-            )
+    def get_authorized(
+        self,
+        context: RequestContext,
+        job_id: UUID,
+        *,
+        for_update: bool = False,
+    ) -> Job:
+        statement = select(Job).where(
+            Job.id == job_id,
+            Job.tenant_id == context.tenant_id,
         )
+        if for_update:
+            statement = statement.with_for_update()
+        job = self.session.scalar(statement)
         if job is None:
             raise JobError("job_not_found")
         self._authorize_client(context, job.client_id)
@@ -107,8 +116,8 @@ class JobService:
         *,
         expected_revision: int,
         idempotency_key: str,
-    ) -> Job:
-        job = self.get_authorized(context, job_id)
+    ) -> ScorecardDraftResponse:
+        job = self.get_authorized(context, job_id, for_update=True)
         record = self._begin(
             context,
             f"generate_scorecard:{job_id}",
@@ -116,7 +125,7 @@ class JobService:
             {"expected_revision": expected_revision},
         )
         if record.response_payload is not None:
-            return job
+            return ScorecardDraftResponse.model_validate(record.response_payload)
         self._check_revision(job, expected_revision)
         if self._scorecard_gateway is None:
             raise JobError("scorecard_gateway_unavailable")
@@ -147,11 +156,9 @@ class JobService:
             job.draft_extraction_warning = None
         job.draft_revision += 1
         self.session.flush()
-        self._complete(
-            record,
-            {"job_id": str(job.id), "draft_revision": job.draft_revision},
-        )
-        return job
+        result = self._draft_response(job)
+        self._complete(record, result.model_dump(mode="json"))
+        return result
 
     def update_draft(
         self,
@@ -161,8 +168,8 @@ class JobService:
         *,
         expected_revision: int,
         idempotency_key: str,
-    ) -> Job:
-        job = self.get_authorized(context, job_id)
+    ) -> ScorecardDraftResponse:
+        job = self.get_authorized(context, job_id, for_update=True)
         record = self._begin(
             context,
             f"update_scorecard_draft:{job_id}",
@@ -173,7 +180,7 @@ class JobService:
             },
         )
         if record.response_payload is not None:
-            return job
+            return ScorecardDraftResponse.model_validate(record.response_payload)
         self._check_revision(job, expected_revision)
         job.draft_payload = draft.model_dump(mode="json")
         job.draft_revision += 1
@@ -181,11 +188,9 @@ class JobService:
             job.draft_extraction_status = ExtractionStatus.READY.value
             job.draft_extraction_warning = None
         self.session.flush()
-        self._complete(
-            record,
-            {"job_id": str(job.id), "draft_revision": job.draft_revision},
-        )
-        return job
+        result = self._draft_response(job)
+        self._complete(record, result.model_dump(mode="json"))
+        return result
 
     def confirm_scorecard(
         self,
@@ -195,7 +200,7 @@ class JobService:
         expected_revision: int,
         idempotency_key: str | None = None,
     ) -> ConfirmedScorecard:
-        job = self.get_authorized(context, job_id)
+        job = self.get_authorized(context, job_id, for_update=True)
         record = (
             self._begin(
                 context,
@@ -230,7 +235,7 @@ class JobService:
         expected_revision: int | None = None,
         idempotency_key: str | None = None,
     ) -> ConfirmedScorecard:
-        job = self.get_authorized(context, job_id)
+        job = self.get_authorized(context, job_id, for_update=True)
         record = (
             self._begin(
                 context,
@@ -387,6 +392,21 @@ class JobService:
             uncertainties=record.uncertainties,
             confirmed_at=record.confirmed_at,
             extraction_status=ExtractionStatus(record.extraction_status),
+        )
+
+    @staticmethod
+    def _draft_response(job: Job) -> ScorecardDraftResponse:
+        return ScorecardDraftResponse(
+            job_id=job.id,
+            draft_revision=job.draft_revision,
+            draft=(
+                ScorecardDraft.model_validate(job.draft_payload)
+                if job.draft_payload is not None
+                else EditableScorecardDraft()
+            ),
+            original_job_description=job.job_description,
+            extraction_status=ExtractionStatus(job.draft_extraction_status),
+            extraction_warning=job.draft_extraction_warning,
         )
 
     def _authorize_client(self, context: RequestContext, client_id: UUID):
