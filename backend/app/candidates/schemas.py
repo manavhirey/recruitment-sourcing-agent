@@ -27,6 +27,11 @@ class CandidateProfile(BaseModel):
     created_at: datetime
     updated_at: datetime
     experiences: tuple[CandidateExperienceProfile, ...] = ()
+    skills: tuple[str, ...] = ()
+    industry_codes: tuple[str, ...] = ()
+    seniority: str | None = None
+    years_experience: float | None = None
+    work_eligibility: str | None = None
 
 
 @dataclass(frozen=True)
