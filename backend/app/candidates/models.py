@@ -1,0 +1,233 @@
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.core.database import Base
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+class Candidate(Base):
+    __tablename__ = "candidates"
+    __table_args__ = (UniqueConstraint("tenant_id", "id"),)
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True
+    )
+    current_title: Mapped[str | None] = mapped_column(String(255))
+    normalized_title: Mapped[str | None] = mapped_column(String(255))
+    current_company: Mapped[str | None] = mapped_column(String(255))
+    normalized_company: Mapped[str | None] = mapped_column(String(255))
+    location: Mapped[str | None] = mapped_column(String(255))
+    normalized_location: Mapped[str | None] = mapped_column(String(255))
+    profile_url: Mapped[str | None] = mapped_column(String(2048))
+    normalized_profile_url: Mapped[str | None] = mapped_column(String(2048))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class SourceIdentity(Base):
+    __tablename__ = "candidate_source_identities"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "provider", "provider_person_id"),
+        ForeignKeyConstraint(
+            ("tenant_id", "candidate_id"),
+            ("candidates.tenant_id", "candidates.id"),
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_candidate_source_identities_confidence",
+        ),
+        Index(
+            "uq_candidate_source_provider_profile_url",
+            "tenant_id",
+            "provider",
+            "normalized_profile_url",
+            unique=True,
+            postgresql_where=text("normalized_profile_url IS NOT NULL"),
+            sqlite_where=text("normalized_profile_url IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    candidate_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_person_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    profile_url: Mapped[str | None] = mapped_column(String(2048))
+    normalized_profile_url: Mapped[str | None] = mapped_column(String(2048))
+    source_timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class CandidateFieldProvenance(Base):
+    __tablename__ = "candidate_field_provenance"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint(
+            "tenant_id", "source_identity_id", "field_name", "observed_value_hash"
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "candidate_id"),
+            ("candidates.tenant_id", "candidates.id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "source_identity_id"),
+            (
+                "candidate_source_identities.tenant_id",
+                "candidate_source_identities.id",
+            ),
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_candidate_field_provenance_confidence",
+        ),
+        Index(
+            "uq_candidate_current_field_provenance",
+            "tenant_id",
+            "candidate_id",
+            "field_name",
+            unique=True,
+            postgresql_where=text("is_current"),
+            sqlite_where=text("is_current = 1"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    candidate_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    source_identity_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    field_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    observed_value_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class CandidateExperience(Base):
+    __tablename__ = "candidate_experiences"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "source_identity_id", "position"),
+        ForeignKeyConstraint(
+            ("tenant_id", "candidate_id"),
+            ("candidates.tenant_id", "candidates.id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "source_identity_id"),
+            (
+                "candidate_source_identities.tenant_id",
+                "candidate_source_identities.id",
+            ),
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("position >= 0", name="ck_candidate_experiences_position"),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_candidate_experiences_confidence",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    candidate_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    source_identity_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(255))
+    company_name: Mapped[str | None] = mapped_column(String(255))
+    start_date: Mapped[str | None] = mapped_column(String(32))
+    end_date: Mapped[str | None] = mapped_column(String(32))
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    observed_value_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class DuplicateSuggestion(Base):
+    __tablename__ = "candidate_duplicate_suggestions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "candidate_id", "suggested_candidate_id"),
+        ForeignKeyConstraint(
+            ("tenant_id", "candidate_id"),
+            ("candidates.tenant_id", "candidates.id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "suggested_candidate_id"),
+            ("candidates.tenant_id", "candidates.id"),
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "candidate_id <> suggested_candidate_id",
+            name="ck_candidate_duplicate_suggestions_distinct",
+        ),
+        CheckConstraint(
+            "similarity >= 0 AND similarity <= 1",
+            name="ck_candidate_duplicate_suggestions_similarity",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    candidate_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    suggested_candidate_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    similarity: Mapped[float] = mapped_column(Float, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
