@@ -102,7 +102,9 @@ class JobService:
             Job.tenant_id == context.tenant_id,
         )
         if for_update:
-            statement = statement.with_for_update()
+            statement = statement.with_for_update().execution_options(
+                populate_existing=True
+            )
         job = self.session.scalar(statement)
         if job is None:
             raise JobError("job_not_found")
@@ -117,7 +119,7 @@ class JobService:
         expected_revision: int,
         idempotency_key: str,
     ) -> ScorecardDraftResponse:
-        job = self.get_authorized(context, job_id, for_update=True)
+        job = self.get_authorized(context, job_id)
         record = self._begin(
             context,
             f"generate_scorecard:{job_id}",
@@ -134,6 +136,8 @@ class JobService:
         approved_adjacencies = tuple(
             sorted({target for _, target in self._clients.adjacencies_for(client)})
         )
+        draft_payload: dict[str, Any] | None
+        extraction_warning: str | None
         try:
             draft = self._scorecard_gateway.extract(
                 job.job_description,
@@ -144,16 +148,21 @@ class JobService:
                 ),
             )
         except ScorecardExtractionError:
-            job.draft_payload = None
-            job.draft_extraction_status = ExtractionStatus.MANUAL_REQUIRED.value
-            job.draft_extraction_warning = (
+            draft_payload = None
+            extraction_status = ExtractionStatus.MANUAL_REQUIRED.value
+            extraction_warning = (
                 "Automatic extraction failed twice. Enter and confirm the scorecard "
                 "manually."
             )
         else:
-            job.draft_payload = draft.model_dump(mode="json")
-            job.draft_extraction_status = ExtractionStatus.READY.value
-            job.draft_extraction_warning = None
+            draft_payload = draft.model_dump(mode="json")
+            extraction_status = ExtractionStatus.READY.value
+            extraction_warning = None
+        job = self.get_authorized(context, job_id, for_update=True)
+        self._check_revision(job, expected_revision)
+        job.draft_payload = draft_payload
+        job.draft_extraction_status = extraction_status
+        job.draft_extraction_warning = extraction_warning
         job.draft_revision += 1
         self.session.flush()
         result = self._draft_response(job)

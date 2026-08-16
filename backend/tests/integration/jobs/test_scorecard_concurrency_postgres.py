@@ -17,7 +17,12 @@ from app.identity.dependencies import apply_tenant_context
 from app.identity.models import Tenant, User
 from app.identity.schemas import RequestContext, Role
 from app.jobs.models import Job, ScorecardVersion
-from app.jobs.schemas import CriterionKind, ScorecardCriterion, ScorecardDraft
+from app.jobs.schemas import (
+    ClientContext,
+    CriterionKind,
+    ScorecardCriterion,
+    ScorecardDraft,
+)
 from app.jobs.service import JobError, JobService
 
 OWNER_DATABASE_URL = os.getenv("TASK4_OWNER_DATABASE_URL")
@@ -150,6 +155,98 @@ def _wait_until_contender_blocks(owner_engine: Engine, application_name: str) ->
 def _assert_revision_conflict(outcome: object) -> None:
     assert isinstance(outcome, JobError), repr(outcome)
     assert outcome.code == "scorecard_revision_conflict"
+
+
+class BlockingScorecardGateway:
+    def __init__(self, draft: ScorecardDraft) -> None:
+        self.draft = draft
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def extract(
+        self, job_description: str, client_context: ClientContext
+    ) -> ScorecardDraft:
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise AssertionError("test did not release the blocked scorecard gateway")
+        return self.draft
+
+
+def test_generate_does_not_lock_job_during_extraction_and_rechecks_revision(
+    postgres_job_scenario: PostgresJobScenario,
+) -> None:
+    scenario = postgres_job_scenario
+    generated_draft = _draft("AI Product Manager", "artificial_intelligence")
+    recruiter_draft = _draft("Senior Product Manager", "platform")
+    gateway = BlockingScorecardGateway(generated_draft)
+    generation_engine = create_engine(scenario.api_database_url)
+    mutation_engine = create_engine(scenario.api_database_url)
+    generation_outcomes: queue.Queue[object] = queue.Queue()
+    mutation_outcomes: queue.Queue[object] = queue.Queue()
+
+    def generate() -> None:
+        with Session(generation_engine) as session:
+            apply_tenant_context(session, scenario.context.tenant_id)
+            try:
+                JobService(
+                    session,
+                    b"test-suppression-key",
+                    scorecard_gateway=gateway,
+                ).generate_draft(
+                    scenario.context,
+                    scenario.job_id,
+                    expected_revision=1,
+                    idempotency_key="blocked-generation",
+                )
+                session.commit()
+            except (JobError, SQLAlchemyError) as error:
+                session.rollback()
+                generation_outcomes.put(error)
+            else:
+                generation_outcomes.put("succeeded")
+
+    def mutate() -> None:
+        with Session(mutation_engine) as session:
+            apply_tenant_context(session, scenario.context.tenant_id)
+            try:
+                JobService(session, b"test-suppression-key").update_draft(
+                    scenario.context,
+                    scenario.job_id,
+                    recruiter_draft,
+                    expected_revision=1,
+                    idempotency_key="edit-during-generation",
+                )
+                session.commit()
+            except (JobError, SQLAlchemyError) as error:
+                session.rollback()
+                mutation_outcomes.put(error)
+            else:
+                mutation_outcomes.put("succeeded")
+
+    generation_thread = threading.Thread(target=generate)
+    mutation_thread = threading.Thread(target=mutate)
+    generation_thread.start()
+    assert gateway.entered.wait(timeout=5)
+    mutation_thread.start()
+    mutation_thread.join(timeout=1)
+    mutation_completed_while_gateway_blocked = not mutation_thread.is_alive()
+    gateway.release.set()
+    generation_thread.join(timeout=5)
+    mutation_thread.join(timeout=5)
+
+    assert mutation_completed_while_gateway_blocked
+    assert not generation_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert mutation_outcomes.get_nowait() == "succeeded"
+    _assert_revision_conflict(generation_outcomes.get_nowait())
+    with Session(scenario.owner_engine) as session:
+        apply_tenant_context(session, scenario.context.tenant_id)
+        job = session.get(Job, scenario.job_id)
+        assert job is not None
+        assert job.draft_revision == 2
+        assert job.draft_payload == recruiter_draft.model_dump(mode="json")
+    generation_engine.dispose()
+    mutation_engine.dispose()
 
 
 def test_concurrent_draft_update_returns_revision_conflict(
