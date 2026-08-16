@@ -1,7 +1,9 @@
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-from pytest import MonkeyPatch
 
 from app.core.config import Settings
 from app.main import create_app
@@ -13,10 +15,12 @@ def test_test_settings_supply_all_required_secrets() -> None:
     assert settings.database_url.startswith("postgresql+psycopg://")
 
 
-def test_settings_load_an_isolated_environment_file(
-    monkeypatch: MonkeyPatch, tmp_path: Path
-) -> None:
-    environment_file = tmp_path / "settings.env"
+def test_app_loads_the_project_root_env_file_from_backend(tmp_path: Path) -> None:
+    source_backend = Path(__file__).resolve().parents[2]
+    isolated_backend = tmp_path / "backend"
+    shutil.copytree(source_backend / "app", isolated_backend / "app")
+
+    environment_file = tmp_path / ".env"
     environment_file.write_text(
         """DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/sourcing
 REDIS_URL=redis://localhost:6379/0
@@ -29,22 +33,21 @@ SUPPRESSION_HMAC_KEY=development-suppression-key
 WEBHOOK_HMAC_KEY=development-webhook-key
 """
     )
-    for name in (
-        "DATABASE_URL",
-        "REDIS_URL",
-        "OBJECT_STORE_ENDPOINT",
-        "OIDC_ISSUER",
-        "OIDC_AUDIENCE",
-        "APOLLO_API_KEY",
-        "CONTACT_ENCRYPTION_KEY",
-        "SUPPRESSION_HMAC_KEY",
-        "WEBHOOK_HMAC_KEY",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from app.main import app; print(app.state.settings.database_url)",
+        ],
+        capture_output=True,
+        check=False,
+        cwd=isolated_backend,
+        env={},
+        text=True,
+    )
 
-    settings = Settings(_env_file=environment_file)
-
-    assert settings.database_url == "postgresql+psycopg://postgres:postgres@localhost:5432/sourcing"
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "postgresql+psycopg://postgres:postgres@localhost:5432/sourcing\n"
 
 
 def test_health_reports_ready() -> None:
