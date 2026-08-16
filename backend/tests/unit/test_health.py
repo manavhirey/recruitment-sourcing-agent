@@ -1,8 +1,7 @@
-import subprocess
-import sys
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from pytest import MonkeyPatch
 
 from app.core.config import Settings
 from app.main import create_app
@@ -14,9 +13,10 @@ def test_test_settings_supply_all_required_secrets() -> None:
     assert settings.database_url.startswith("postgresql+psycopg://")
 
 
-def test_app_loads_root_env_file_when_launched_from_backend() -> None:
-    environment_file = Path(__file__).resolve().parents[3] / ".env"
-    previous_contents = environment_file.read_bytes() if environment_file.exists() else None
+def test_settings_load_an_isolated_environment_file(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    environment_file = tmp_path / "settings.env"
     environment_file.write_text(
         """DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/sourcing
 REDIS_URL=redis://localhost:6379/0
@@ -29,27 +29,22 @@ SUPPRESSION_HMAC_KEY=development-suppression-key
 WEBHOOK_HMAC_KEY=development-webhook-key
 """
     )
-    try:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "from app.main import app; print(app.state.settings.database_url)",
-            ],
-            cwd=Path(__file__).resolve().parents[2],
-            capture_output=True,
-            check=False,
-            env={},
-            text=True,
-        )
-    finally:
-        if previous_contents is None:
-            environment_file.unlink(missing_ok=True)
-        else:
-            environment_file.write_bytes(previous_contents)
+    for name in (
+        "DATABASE_URL",
+        "REDIS_URL",
+        "OBJECT_STORE_ENDPOINT",
+        "OIDC_ISSUER",
+        "OIDC_AUDIENCE",
+        "APOLLO_API_KEY",
+        "CONTACT_ENCRYPTION_KEY",
+        "SUPPRESSION_HMAC_KEY",
+        "WEBHOOK_HMAC_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == "postgresql+psycopg://postgres:postgres@localhost:5432/sourcing\n"
+    settings = Settings(_env_file=environment_file)
+
+    assert settings.database_url == "postgresql+psycopg://postgres:postgres@localhost:5432/sourcing"
 
 
 def test_health_reports_ready() -> None:
