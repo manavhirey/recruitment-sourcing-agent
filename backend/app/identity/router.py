@@ -1,7 +1,9 @@
+import json
 from typing import Annotated, NoReturn
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -18,6 +20,7 @@ from app.identity.dependencies import (
 from app.identity.models import Membership, User
 from app.identity.schemas import (
     IdentityClaims,
+    InvitationClaim,
     InvitationCreate,
     InvitationResponse,
     MemberResponse,
@@ -31,6 +34,46 @@ from app.identity.service import IdentityError, MembershipResult, MembershipServ
 
 router = APIRouter(prefix="/api/v1", tags=["identity"])
 manager_context = require_role(Role.OWNER, Role.ADMIN)
+_INVITATION_CLAIM_MAX_BYTES = 256
+
+
+async def get_invitation_claim(request: Request) -> InvitationClaim:
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != (
+        "application/json"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail={"code": "invitation_claim_content_type_invalid"},
+        )
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            too_large = int(declared) > _INVITATION_CLAIM_MAX_BYTES
+        except ValueError:
+            too_large = True
+        if too_large:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail={"code": "invitation_claim_too_large"},
+            )
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > _INVITATION_CLAIM_MAX_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail={"code": "invitation_claim_too_large"},
+            )
+        chunks.append(chunk)
+    try:
+        payload = json.loads(b"".join(chunks))
+        return InvitationClaim.model_validate(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invitation_claim_invalid"},
+        ) from None
 
 
 def _allowed_client_ids(membership: Membership) -> frozenset[UUID] | None:
@@ -66,6 +109,7 @@ def _raise_identity_error(error: IdentityError) -> NoReturn:
         "idempotency_conflict": status.HTTP_409_CONFLICT,
         "idempotency_result_missing": status.HTTP_409_CONFLICT,
         "last_owner_required": status.HTTP_409_CONFLICT,
+        "membership_already_active": status.HTTP_409_CONFLICT,
     }.get(error.code, status.HTTP_400_BAD_REQUEST)
     raise HTTPException(status_code=status_code, detail={"code": error.code}) from error
 
@@ -143,11 +187,32 @@ def create_invitation(
 
 
 @router.post(
-    "/membership-invitations/{token}/claim",
+    "/membership-invitations/claim",
     response_model=MembershipResponse,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["token"],
+                        "properties": {
+                            "token": {
+                                "type": "string",
+                                "minLength": 80,
+                                "maxLength": 80,
+                            }
+                        },
+                    }
+                }
+            },
+        }
+    },
 )
 def claim_invitation(
-    token: str,
+    body: Annotated[InvitationClaim, Depends(get_invitation_claim)],
     claims: Annotated[IdentityClaims, Depends(get_identity_claims)],
     session: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_app_settings)],
@@ -155,10 +220,10 @@ def claim_invitation(
 ) -> MembershipResponse:
     try:
         service = _membership_service(session, settings)
-        tenant_id = service.invitation_tenant_id(token)
+        tenant_id = service.invitation_tenant_id(body.token)
         apply_tenant_context(session, tenant_id)
         membership = service.claim_invite(
-            token, claims, idempotency_key=idempotency_key
+            body.token, claims, idempotency_key=idempotency_key
         )
     except IdentityError as error:
         _raise_identity_error(error)

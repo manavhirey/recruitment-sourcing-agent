@@ -15,10 +15,13 @@ from app.crm.schemas import (
     AcceptanceResponse,
     ActivityPage,
     ActivityResponse,
+    CandidateExperienceView,
     CandidateFilter,
+    CandidateProvenanceView,
     ContactRevealResponse,
     JobCandidatePage,
     JobCandidateView,
+    MandatoryGapView,
     MaskedContact,
     NoteCreate,
     NoteResponse,
@@ -71,18 +74,33 @@ def _view(
     detail: bool,
 ) -> JobCandidateView:
     contact_rows = service.masked_contacts(context, candidate.id) if detail else []
+    run_candidate_id = service.run_candidate_id(context, row) if detail else None
+    enrichment = service.enrichment_eligibility(context, run_candidate_id)
     return JobCandidateView(
         id=row.id,
         job_id=row.job_id,
         candidate_id=row.candidate_id,
+        run_candidate_id=run_candidate_id,
         full_name=candidate.full_name,
         current_title=candidate.current_title,
         current_company=candidate.current_company,
         location=candidate.location,
         classification=row.classification,
         score=row.score,
-        score_json=row.score_json if detail else None,
+        score_json=service.safe_score_json(row) if detail else None,
+        mandatory_gaps=[
+            MandatoryGapView(
+                key=gap.key,
+                label=gap.label,
+                state=gap.state,
+                summary=gap.summary,
+            )
+            for gap in service.mandatory_gaps(context, row)
+        ],
         scorecard_version_id=row.scorecard_version_id,
+        scorecard_version=(
+            service.scorecard_version_number(context, row) if detail else None
+        ),
         scoring_version=row.scoring_version,
         stage=row.stage,
         owner_user_id=row.owner_user_id,
@@ -90,6 +108,8 @@ def _view(
         rejection_note=row.rejection_note,
         tags=service.tags_for(context, row.id),
         has_contact=service.has_contact(context, candidate.id),
+        enrichment_eligible=enrichment.eligible,
+        estimated_enrichment_credits=enrichment.estimated_credits,
         contacts=(
             [
                 MaskedContact(
@@ -103,6 +123,43 @@ def _view(
                     expires_at=_utc(contact.expires_at),
                 )
                 for contact in contact_rows
+            ]
+            if detail
+            else None
+        ),
+        experiences=(
+            [
+                CandidateExperienceView(
+                    title=experience.title,
+                    company_name=experience.company_name,
+                    start_date=experience.start_date,
+                    end_date=experience.end_date,
+                    provider=experience.provider,
+                    source_timestamp=_utc(experience.source_timestamp),
+                )
+                for experience in service.candidate_experiences(
+                    context, candidate.id
+                )
+            ]
+            if detail
+            else None
+        ),
+        provenance=(
+            [
+                CandidateProvenanceView(
+                    field_name=item.field_name,
+                    provider=item.provider,
+                    source_timestamp=_utc(item.source_timestamp),
+                )
+                for item in service.candidate_provenance(context, candidate.id)
+            ]
+            if detail
+            else None
+        ),
+        notes=(
+            [
+                NoteResponse.model_validate(note, from_attributes=True)
+                for note in service.notes_for(context, row.id)
             ]
             if detail
             else None
@@ -335,7 +392,11 @@ def list_activity(
         _raise_crm_error(error)
     return ActivityPage(
         items=[
-            ActivityResponse.model_validate(event, from_attributes=True)
+            ActivityResponse(
+                id=event.id,
+                action=event.action,
+                created_at=_utc(event.created_at),
+            )
             for event in events
         ],
         next_cursor=next_cursor,

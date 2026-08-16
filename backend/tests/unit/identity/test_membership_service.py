@@ -164,6 +164,154 @@ def test_invitation_key_is_scoped_to_the_creating_actor(session: Session) -> Non
     assert first[1] != second[1]
 
 
+def test_new_invitation_supersedes_prior_unclaimed_link_for_same_email(
+    session: Session,
+) -> None:
+    tenant = TenantService(session).provision("agency", owner_claims())
+    owner = session.scalar(select(User).where(User.oidc_subject == "oidc|owner-1"))
+    assert owner is not None
+    service = MembershipService(session, b"invitation-key")
+    issued_at = datetime(2026, 8, 15, tzinfo=UTC)
+
+    first_invitation, first_token = service.invite(
+        tenant_id=tenant.id,
+        intended_email="Recruiter@Agency.test",
+        role=Role.RECRUITER,
+        created_by_user_id=owner.id,
+        now=issued_at,
+        idempotency_key="invite-recruiter-old",
+    )
+    second_invitation, second_token = service.invite(
+        tenant_id=tenant.id,
+        intended_email="recruiter@agency.test",
+        role=Role.ADMIN,
+        created_by_user_id=owner.id,
+        now=issued_at + timedelta(minutes=1),
+        idempotency_key="invite-recruiter-new",
+    )
+    claims = IdentityClaims(
+        subject="oidc|recruiter-1",
+        email="recruiter@agency.test",
+        name="Recruiter",
+        email_verified=True,
+    )
+
+    with pytest.raises(IdentityError, match="invitation_invalid"):
+        service.claim_invite(
+            first_token,
+            claims,
+            now=issued_at + timedelta(minutes=2),
+        )
+    membership = service.claim_invite(
+        second_token,
+        claims,
+        now=issued_at + timedelta(minutes=2),
+    )
+
+    assert first_invitation.expires_at == issued_at + timedelta(minutes=1)
+    assert second_invitation.claimed_at is not None
+    assert membership.role is Role.ADMIN
+
+
+def test_invitation_rejects_an_existing_active_member_email(session: Session) -> None:
+    tenant = TenantService(session).provision("agency", owner_claims())
+    owner = session.scalar(select(User).where(User.oidc_subject == "oidc|owner-1"))
+    assert owner is not None
+
+    with pytest.raises(IdentityError, match="membership_already_active"):
+        MembershipService(session, b"invitation-key").invite(
+            tenant_id=tenant.id,
+            intended_email=owner.email,
+            role=Role.RECRUITER,
+            created_by_user_id=owner.id,
+        )
+
+
+def test_claim_cannot_demote_an_existing_active_owner(session: Session) -> None:
+    tenant = TenantService(session).provision("agency", owner_claims())
+    owner = session.scalar(select(User).where(User.oidc_subject == "oidc|owner-1"))
+    assert owner is not None
+    service = MembershipService(session, b"invitation-key")
+    _, token = service.invite(
+        tenant_id=tenant.id,
+        intended_email="future-owner-email@agency.test",
+        role=Role.RECRUITER,
+        created_by_user_id=owner.id,
+    )
+    owner.email = "future-owner-email@agency.test"
+    session.flush()
+
+    with pytest.raises(IdentityError, match="invitation_invalid"):
+        service.claim_invite(
+            token,
+            IdentityClaims(
+                subject=owner.oidc_subject,
+                email=owner.email,
+                name=owner.display_name,
+                email_verified=True,
+            ),
+        )
+
+    membership = session.scalar(
+        select(Membership).where(
+            Membership.tenant_id == tenant.id,
+            Membership.user_id == owner.id,
+        )
+    )
+    assert membership is not None
+    assert membership.role is Role.OWNER
+    assert membership.active is True
+
+
+@pytest.mark.parametrize("mutation", ["change_role", "deactivate"])
+def test_membership_mutation_invalidates_outstanding_invitation(
+    session: Session, mutation: str
+) -> None:
+    tenant = TenantService(session).provision("agency", owner_claims())
+    owner = session.scalar(select(User).where(User.oidc_subject == "oidc|owner-1"))
+    assert owner is not None
+    service = MembershipService(session, b"invitation-key")
+    issued_at = datetime(2026, 8, 15, tzinfo=UTC)
+    invitation, token = service.invite(
+        tenant_id=tenant.id,
+        intended_email="recruiter@agency.test",
+        role=Role.ADMIN,
+        created_by_user_id=owner.id,
+        now=issued_at,
+    )
+    invited_user = User(
+        oidc_subject="oidc|recruiter-1",
+        email="recruiter@agency.test",
+        display_name="Recruiter",
+    )
+    session.add(invited_user)
+    session.flush()
+    membership = Membership(
+        tenant_id=tenant.id,
+        user_id=invited_user.id,
+        role=Role.RECRUITER,
+    )
+    session.add(membership)
+    session.flush()
+
+    if mutation == "change_role":
+        service.change_role(membership, Role.ADMIN)
+    else:
+        service.deactivate(membership)
+
+    assert invitation.expires_at <= datetime.now(UTC)
+    with pytest.raises(IdentityError, match="invitation_invalid"):
+        service.claim_invite(
+            token,
+            IdentityClaims(
+                subject=invited_user.oidc_subject,
+                email=invited_user.email,
+                name=invited_user.display_name,
+                email_verified=True,
+            ),
+        )
+
+
 def test_claim_invitation_requires_verified_matching_email_and_consumes_once(
     session: Session,
 ) -> None:

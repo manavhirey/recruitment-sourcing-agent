@@ -3,6 +3,9 @@ import re
 
 _CAPABILITY_PATH = re.compile(r"(/webhooks/apollo/)[A-Za-z0-9._~-]+")
 _CALLBACK_QUERY = re.compile(r"([?&]webhook_url=)[^&\s\"]+")
+_INVITATION_CLAIM_PATH = re.compile(
+    r"(/api/v1/membership-invitations/)[^/?\s\"]+(/claim)"
+)
 
 
 class SensitiveDataLogFilter(logging.Filter):
@@ -10,6 +13,7 @@ class SensitiveDataLogFilter(logging.Filter):
         message = record.getMessage()
         sanitized = _CAPABILITY_PATH.sub(r"\1[REDACTED]", message)
         sanitized = _CALLBACK_QUERY.sub(r"\1[REDACTED]", sanitized)
+        sanitized = _INVITATION_CLAIM_PATH.sub(r"\1[REDACTED]\2", sanitized)
         if sanitized != message:
             record.msg = sanitized
             record.args = ()

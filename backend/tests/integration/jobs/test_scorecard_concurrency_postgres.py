@@ -244,7 +244,10 @@ def test_generate_does_not_lock_job_during_extraction_and_rechecks_revision(
         job = session.get(Job, scenario.job_id)
         assert job is not None
         assert job.draft_revision == 2
-        assert job.draft_payload == recruiter_draft.model_dump(mode="json")
+        expected_payload = recruiter_draft.model_dump(mode="json")
+        expected_payload["criteria"][0]["source_text"] = None
+        expected_payload["criteria"][0]["recruiter_entered"] = True
+        assert job.draft_payload == expected_payload
     generation_engine.dispose()
     mutation_engine.dispose()
 

@@ -168,19 +168,22 @@ def test_owner_can_invite_and_verified_matching_identity_can_claim(
         name="Recruiter",
         email_verified=True,
     )
+    invitation_token = invitation_response.json()["token"]
     claim_response = identity_api["client"].post(
-        f"/api/v1/membership-invitations/{invitation_response.json()['token']}/claim",
+        "/api/v1/membership-invitations/claim",
         headers={
             "Authorization": "Bearer signed-token",
             "Idempotency-Key": "claim-recruiter-1",
         },
+        json={"token": invitation_token},
     )
     claim_retry = identity_api["client"].post(
-        f"/api/v1/membership-invitations/{invitation_response.json()['token']}/claim",
+        "/api/v1/membership-invitations/claim",
         headers={
             "Authorization": "Bearer signed-token",
             "Idempotency-Key": "claim-recruiter-1",
         },
+        json={"token": invitation_token},
     )
 
     assert claim_response.status_code == 200
@@ -200,6 +203,30 @@ def test_owner_can_invite_and_verified_matching_identity_can_claim(
             session.scalar(select(func.count()).select_from(IdentityIdempotencyKey))
             == 2
         )
+
+
+def test_invitation_claim_uses_a_fixed_bounded_request_path(
+    identity_api: dict[str, Any],
+) -> None:
+    headers = {
+        "Authorization": "Bearer signed-token",
+        "Idempotency-Key": "bounded-claim",
+        "Content-Type": "application/json",
+    }
+    legacy = identity_api["client"].post(
+        "/api/v1/membership-invitations/raw-secret/claim",
+        headers=headers,
+        json={"token": "raw-secret"},
+    )
+    oversized = identity_api["client"].post(
+        "/api/v1/membership-invitations/claim",
+        headers=headers,
+        content='{"token":"' + ("x" * 300) + '"}',
+    )
+
+    assert legacy.status_code == 404
+    assert oversized.status_code == 413
+    assert oversized.json() == {"detail": {"code": "invitation_claim_too_large"}}
 
 
 def test_role_and_deactivation_retries_do_not_repeat_committed_effects(
@@ -222,11 +249,12 @@ def test_role_and_deactivation_retries_do_not_repeat_committed_effects(
         email_verified=True,
     )
     claimed = identity_api["client"].post(
-        f"/api/v1/membership-invitations/{invite.json()['token']}/claim",
+        "/api/v1/membership-invitations/claim",
         headers={
             "Authorization": "Bearer signed-token",
             "Idempotency-Key": "claim-member-for-mutations",
         },
+        json={"token": invite.json()["token"]},
     )
     membership_id = claimed.json()["membership_id"]
     identity_api["verifier"].claims = IdentityClaims(

@@ -19,6 +19,8 @@ class RunResponse(BaseModel):
     current_stage: str
     candidate_count: int
     matched_count: int
+    enriched_count: int
+    failed_count: int
     cancellation_requested: bool
     budget_use: dict[str, int]
     error_code: str | None
@@ -32,10 +34,7 @@ class RunResponse(BaseModel):
 class RunActivityResponse(BaseModel):
     id: UUID
     action: str
-    entity_type: str
-    entity_id: UUID
-    actor_user_id: UUID | None
-    payload: dict[str, object]
+    summary: str | None
     created_at: datetime
 
 

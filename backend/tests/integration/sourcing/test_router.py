@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from app.audit.models import AuditEvent
 from app.candidates.models import Candidate
 from app.clients.models import ClientCompany
 from app.core.config import Settings
@@ -24,6 +25,7 @@ from app.sourcing.models import (
     TenantNotification,
     UsageLedger,
 )
+from app.sourcing.state_machine import RunState
 
 
 class StaticVerifier:
@@ -46,10 +48,16 @@ class RecordingDispatcher:
 
 class RecordingEnrichmentDispatcher:
     def __init__(self) -> None:
-        self.calls: list[tuple[UUID, UUID, UUID]] = []
+        self.calls: list[tuple[UUID, UUID, UUID, str]] = []
+        self.failures_remaining = 0
 
-    def __call__(self, request_id: UUID, tenant_id: UUID, user_id: UUID) -> None:
-        self.calls.append((request_id, tenant_id, user_id))
+    def __call__(
+        self, request_id: UUID, tenant_id: UUID, user_id: UUID, dispatch_key: str
+    ) -> None:
+        self.calls.append((request_id, tenant_id, user_id, dispatch_key))
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise ConnectionError("broker unavailable")
 
 
 @pytest.fixture
@@ -217,6 +225,43 @@ def test_start_status_activity_and_cancel_routes_are_idempotent(
     activity = api.get(f"/api/v1/runs/{run_id}/activity", headers=headers)
     assert activity.status_code == 200
     assert [event["action"] for event in activity.json()] == ["sourcing_run.started"]
+    with Session(sourcing_api["engine"]) as session:
+        session.add_all(
+            (
+                AuditEvent(
+                    tenant_id=sourcing_api["tenant_id"],
+                    run_id=UUID(run_id),
+                    actor_user_id=sourcing_api["user_id"],
+                    event_key="safe-run-action-private-payload",
+                    action="sourcing_run.usage_budget_exhausted",
+                    entity_type="sourcing_run",
+                    entity_id=UUID(run_id),
+                    payload={"provider_error": "private-error", "token": "secret"},
+                ),
+                AuditEvent(
+                    tenant_id=sourcing_api["tenant_id"],
+                    run_id=UUID(run_id),
+                    actor_user_id=sourcing_api["user_id"],
+                    event_key="private-run-action",
+                    action="provider.raw_response_received",
+                    entity_type="provider_snapshot",
+                    entity_id=uuid4(),
+                    payload={"body": "private-provider-body"},
+                ),
+            )
+        )
+        session.commit()
+    sanitized_activity = api.get(f"/api/v1/runs/{run_id}/activity", headers=headers)
+    assert [event["action"] for event in sanitized_activity.json()] == [
+        "sourcing_run.started",
+        "sourcing_run.usage_budget_exhausted",
+    ]
+    assert all(
+        set(event) == {"id", "action", "summary", "created_at"}
+        for event in sanitized_activity.json()
+    )
+    assert "private-error" not in sanitized_activity.text
+    assert "private-provider-body" not in sanitized_activity.text
 
     cancel_missing_key = api.post(f"/api/v1/runs/{run_id}/cancel", headers=headers)
     assert cancel_missing_key.status_code == 400
@@ -331,6 +376,91 @@ def test_run_lookup_does_not_disclose_another_tenant(
     assert hidden.json() == {"detail": {"code": "tenant_not_found"}}
 
 
+def test_latest_job_run_is_deterministic_and_reports_review_counts(
+    sourcing_api: dict[str, Any],
+) -> None:
+    with Session(sourcing_api["engine"], expire_on_commit=False) as session:
+        job = session.get(Job, sourcing_api["job_id"])
+        assert job is not None and job.current_scorecard_id is not None
+        older = SourcingRun(
+            tenant_id=sourcing_api["tenant_id"],
+            job_id=job.id,
+            scorecard_version_id=job.current_scorecard_id,
+            started_by_user_id=sourcing_api["user_id"],
+            state=RunState.CANCELLED,
+            current_stage=RunState.CANCELLED.value,
+            candidate_count=4,
+            matched_count=3,
+            created_at=datetime(2026, 8, 15, tzinfo=UTC),
+        )
+        latest = SourcingRun(
+            tenant_id=sourcing_api["tenant_id"],
+            job_id=job.id,
+            scorecard_version_id=job.current_scorecard_id,
+            started_by_user_id=sourcing_api["user_id"],
+            state=RunState.PARTIALLY_READY,
+            current_stage=RunState.ENRICHING.value,
+            candidate_count=3,
+            matched_count=3,
+            error_code="usage_budget_exhausted",
+            error_message="raw text must not define the public message",
+            created_at=datetime(2026, 8, 16, tzinfo=UTC),
+        )
+        session.add_all((older, latest))
+        session.flush()
+        for position, enrichment_status in enumerate(
+            ("available", "failed", "unavailable")
+        ):
+            candidate = Candidate(
+                tenant_id=sourcing_api["tenant_id"],
+                full_name=f"Candidate {position}",
+                normalized_name=f"candidate {position}",
+            )
+            session.add(candidate)
+            session.flush()
+            session.add(
+                RunCandidate(
+                    tenant_id=sourcing_api["tenant_id"],
+                    run_id=latest.id,
+                    candidate_id=candidate.id,
+                    scorecard_version_id=job.current_scorecard_id,
+                    enrichment_status=enrichment_status,
+                )
+            )
+        session.commit()
+        latest_id = latest.id
+
+    response = sourcing_api["api"].get(
+        f"/api/v1/jobs/{sourcing_api['job_id']}/runs/latest",
+        headers=_headers(sourcing_api),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == str(latest_id)
+    assert response.json()["enriched_count"] == 1
+    assert response.json()["failed_count"] == 1
+    assert response.json()["error_message"] == (
+        "The configured sourcing usage budget was exhausted."
+    )
+
+
+def test_latest_job_run_collapses_missing_job_and_missing_run(
+    sourcing_api: dict[str, Any],
+) -> None:
+    headers = _headers(sourcing_api)
+    no_run = sourcing_api["api"].get(
+        f"/api/v1/jobs/{sourcing_api['job_id']}/runs/latest", headers=headers
+    )
+    missing = sourcing_api["api"].get(
+        f"/api/v1/jobs/{uuid4()}/runs/latest", headers=headers
+    )
+
+    assert no_run.status_code == missing.status_code == 404
+    assert no_run.json() == missing.json() == {
+        "detail": {"code": "run_not_found"}
+    }
+
+
 def test_notifications_are_role_scoped_and_acknowledgement_is_idempotent(
     sourcing_api: dict[str, Any],
 ) -> None:
@@ -391,6 +521,26 @@ def test_on_demand_enrichment_is_authorized_budgeted_and_idempotent(
     with Session(sourcing_api["engine"]) as session:
         run = session.get(SourcingRun, run_id)
         assert run is not None
+        run.state = RunState.READY
+        run.current_stage = RunState.READY.value
+        for position in range(50):
+            ranked = Candidate(
+                tenant_id=sourcing_api["tenant_id"],
+                full_name=f"Ranked Candidate {position}",
+                normalized_name=f"ranked candidate {position}",
+            )
+            session.add(ranked)
+            session.flush()
+            session.add(
+                RunCandidate(
+                    tenant_id=sourcing_api["tenant_id"],
+                    run_id=run.id,
+                    candidate_id=ranked.id,
+                    scorecard_version_id=run.scorecard_version_id,
+                    match_score=100 - position,
+                    classification="main",
+                )
+            )
         candidate = Candidate(
             tenant_id=sourcing_api["tenant_id"],
             full_name="Priya Sharma",
@@ -403,7 +553,7 @@ def test_on_demand_enrichment_is_authorized_budgeted_and_idempotent(
             run_id=run.id,
             candidate_id=candidate.id,
             scorecard_version_id=run.scorecard_version_id,
-            match_score=75,
+            match_score=1,
             classification="main",
         )
         session.add(run_candidate)
@@ -426,3 +576,167 @@ def test_on_demand_enrichment_is_authorized_budgeted_and_idempotent(
     with Session(sourcing_api["engine"]) as session:
         assert session.scalar(select(func.count()).select_from(EnrichmentRequest)) == 1
         assert session.scalar(select(func.count()).select_from(UsageLedger)) == 2
+
+
+def test_on_demand_enrichment_retries_pending_dispatch_with_the_same_key(
+    sourcing_api: dict[str, Any],
+) -> None:
+    api: TestClient = sourcing_api["api"]
+    headers = _headers(sourcing_api)
+    created = api.post(
+        f"/api/v1/jobs/{sourcing_api['job_id']}/runs",
+        headers={**headers, "Idempotency-Key": "dispatch-retry-run"},
+        json={},
+    )
+    run_id = UUID(created.json()["id"])
+    with Session(sourcing_api["engine"]) as session:
+        run = session.get(SourcingRun, run_id)
+        assert run is not None
+        run.state = RunState.READY
+        run.current_stage = RunState.READY.value
+        candidate = Candidate(
+            tenant_id=sourcing_api["tenant_id"],
+            full_name="Dispatch Retry Candidate",
+            normalized_name="dispatch retry candidate",
+        )
+        session.add(candidate)
+        session.flush()
+        row = RunCandidate(
+            tenant_id=sourcing_api["tenant_id"],
+            run_id=run.id,
+            candidate_id=candidate.id,
+            scorecard_version_id=run.scorecard_version_id,
+            match_score=1,
+            classification="main",
+            enrichment_status="failed",
+        )
+        session.add(row)
+        session.commit()
+        run_candidate_id = row.id
+
+    dispatcher: RecordingEnrichmentDispatcher = sourcing_api[
+        "enrichment_dispatcher"
+    ]
+    dispatcher.failures_remaining = 1
+    url = f"/api/v1/job-candidates/{run_candidate_id}/enrich"
+    with pytest.raises(ConnectionError, match="broker unavailable"):
+        api.post(
+            url,
+            headers={**headers, "Idempotency-Key": "enrich-dispatch-retry"},
+        )
+
+    retried = api.post(
+        url,
+        headers={**headers, "Idempotency-Key": "enrich-dispatch-retry"},
+    )
+
+    assert retried.status_code == 202
+    assert len(dispatcher.calls) == 2
+    assert dispatcher.calls[0] == dispatcher.calls[1]
+    with Session(sourcing_api["engine"]) as session:
+        request = session.scalar(select(EnrichmentRequest))
+        assert request is not None
+        assert request.dispatch_pending is False
+
+
+def test_on_demand_enrichment_new_key_binds_the_pending_request(
+    sourcing_api: dict[str, Any],
+) -> None:
+    api: TestClient = sourcing_api["api"]
+    headers = _headers(sourcing_api)
+    created = api.post(
+        f"/api/v1/jobs/{sourcing_api['job_id']}/runs",
+        headers={**headers, "Idempotency-Key": "new-key-retry-run"},
+        json={},
+    )
+    run_id = UUID(created.json()["id"])
+    with Session(sourcing_api["engine"]) as session:
+        run = session.get(SourcingRun, run_id)
+        assert run is not None
+        run.state = RunState.READY
+        run.current_stage = RunState.READY.value
+        candidate = Candidate(
+            tenant_id=sourcing_api["tenant_id"],
+            full_name="New Key Retry Candidate",
+            normalized_name="new key retry candidate",
+        )
+        session.add(candidate)
+        session.flush()
+        row = RunCandidate(
+            tenant_id=sourcing_api["tenant_id"],
+            run_id=run.id,
+            candidate_id=candidate.id,
+            scorecard_version_id=run.scorecard_version_id,
+            match_score=1,
+            classification="main",
+            enrichment_status="failed",
+        )
+        session.add(row)
+        session.commit()
+        run_candidate_id = row.id
+
+    dispatcher: RecordingEnrichmentDispatcher = sourcing_api[
+        "enrichment_dispatcher"
+    ]
+    dispatcher.failures_remaining = 1
+    url = f"/api/v1/job-candidates/{run_candidate_id}/enrich"
+    with pytest.raises(ConnectionError):
+        api.post(url, headers={**headers, "Idempotency-Key": "first-intent"})
+
+    retried = api.post(
+        url,
+        headers={**headers, "Idempotency-Key": "replacement-intent"},
+    )
+
+    assert retried.status_code == 202
+    assert len(dispatcher.calls) == 2
+    assert dispatcher.calls[0] == dispatcher.calls[1]
+    with Session(sourcing_api["engine"]) as session:
+        assert session.scalar(select(func.count()).select_from(EnrichmentRequest)) == 1
+        assert session.scalar(select(func.count()).select_from(UsageLedger)) == 2
+
+
+def test_on_demand_enrichment_rechecks_server_rank_run_state_and_status(
+    sourcing_api: dict[str, Any],
+) -> None:
+    api: TestClient = sourcing_api["api"]
+    headers = _headers(sourcing_api)
+    created = api.post(
+        f"/api/v1/jobs/{sourcing_api['job_id']}/runs",
+        headers={**headers, "Idempotency-Key": "ineligible-run"},
+        json={},
+    )
+    run_id = UUID(created.json()["id"])
+    with Session(sourcing_api["engine"]) as session:
+        run = session.get(SourcingRun, run_id)
+        assert run is not None
+        run.state = RunState.READY
+        run.current_stage = RunState.READY.value
+        candidate = Candidate(
+            tenant_id=sourcing_api["tenant_id"],
+            full_name="Automatic Top Candidate",
+            normalized_name="automatic top candidate",
+        )
+        session.add(candidate)
+        session.flush()
+        row = RunCandidate(
+            tenant_id=sourcing_api["tenant_id"],
+            run_id=run.id,
+            candidate_id=candidate.id,
+            scorecard_version_id=run.scorecard_version_id,
+            match_score=99,
+            classification="main",
+            enrichment_status="not_requested",
+        )
+        session.add(row)
+        session.commit()
+        run_candidate_id = row.id
+
+    response = api.post(
+        f"/api/v1/job-candidates/{run_candidate_id}/enrich",
+        headers={**headers, "Idempotency-Key": "ineligible-top-50"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "enrichment_not_eligible"}}
+    assert sourcing_api["enrichment_dispatcher"].calls == []

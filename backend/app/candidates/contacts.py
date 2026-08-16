@@ -58,6 +58,12 @@ class EncryptedContact:
         return replace(self, encrypted_data_key=value)
 
 
+@dataclass(frozen=True)
+class AuthorizedContactReveal:
+    encrypted: EncryptedContact
+    context: ContactContext
+
+
 class ContactCipher:
     """Envelope encryption for contact values; plaintext never leaves this boundary."""
 
@@ -332,6 +338,22 @@ class ContactService:
         used_at: datetime | None = None,
         record_use: bool = True,
     ) -> str:
+        authorized = self.authorize_reveal(
+            context,
+            contact_point_id,
+            used_at=used_at,
+            record_use=record_use,
+        )
+        return self.decrypt_authorized(authorized)
+
+    def authorize_reveal(
+        self,
+        context: RequestContext,
+        contact_point_id: UUID,
+        *,
+        used_at: datetime | None = None,
+        record_use: bool = True,
+    ) -> AuthorizedContactReveal:
         point = self.session.scalar(
             select(ContactPoint)
             .where(
@@ -367,9 +389,13 @@ class ContactService:
             lookup_hmac=point.lookup_hmac,
             schema_version=point.schema_version,
         )
-        value = self.cipher.decrypt(
-            encrypted,
-            ContactContext(context.tenant_id, point.candidate_id, point.kind),
+        reveal = AuthorizedContactReveal(
+            encrypted=encrypted,
+            context=ContactContext(
+                context.tenant_id,
+                point.candidate_id,
+                point.kind,
+            ),
         )
         if record_use:
             point.last_used_at = use_time
@@ -377,7 +403,10 @@ class ContactService:
                 days=point.retention_days
             )
             self.session.flush()
-        return value
+        return reveal
+
+    def decrypt_authorized(self, reveal: AuthorizedContactReveal) -> str:
+        return self.cipher.decrypt(reveal.encrypted, reveal.context)
 
     def _candidate(self, tenant_id: UUID, candidate_id: UUID) -> Candidate:
         candidate = self.session.scalar(

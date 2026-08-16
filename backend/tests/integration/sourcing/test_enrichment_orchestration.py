@@ -1,6 +1,6 @@
 import base64
 from collections.abc import Generator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -26,6 +26,7 @@ from app.providers.snapshots import SnapshotStore
 from app.sourcing.enrichment import (
     RegionalContactPolicy,
     enqueue_top_enrichment,
+    execute_queued_enrichment_request,
     poll_enrichment_request,
     reconcile_snapshot_references,
 )
@@ -370,6 +371,56 @@ def test_cancelled_run_never_starts_new_provider_work(
     )
 
     assert gateway.calls == []
+
+
+def test_duplicate_delivery_waits_for_in_flight_provider_submission(
+    enrichment_scenario: dict[str, Any],
+) -> None:
+    scenario = enrichment_scenario
+    gateway = RecordingGateway(scenario["factory"], scenario["run_id"])
+    with scenario["factory"]() as session:
+        request = EnrichmentRequest(
+            tenant_id=scenario["tenant_id"],
+            run_id=scenario["run_id"],
+            provider="apollo",
+            candidate_ids=[str(UUID(int=1))],
+            reservation_key="crash-after-publish",
+            status="submitting",
+            stage_deadline=datetime.now(UTC) + timedelta(minutes=4),
+        )
+        session.add(request)
+        session.commit()
+        request_id = request.id
+
+    result = execute_queued_enrichment_request(
+        scenario["factory"],
+        request_id,
+        RequestContext(
+            tenant_id=scenario["tenant_id"],
+            user_id=scenario["user_id"],
+            role=Role.OWNER,
+        ),
+        gateway=gateway,
+        callback_base_url="https://api.example.test",
+        contact_cipher=ContactCipher(
+            base64.b64encode(b"c" * 32).decode(), b"contact-lookup"
+        ),
+        snapshot_store=SnapshotStore(
+            MemoryObjectStore(),
+            "snapshots",
+            base64.b64encode(b"s" * 32).decode(),
+        ),
+        policy=RegionalContactPolicy(False, False),
+        token_codec=CapabilityTokenCodec(b"webhook-key"),
+    )
+
+    assert result is not None
+    assert 1 <= result.retry_after_seconds <= 240
+    assert gateway.calls == []
+    with scenario["factory"]() as session:
+        persisted = session.get(EnrichmentRequest, request_id)
+        assert persisted is not None and persisted.status == "submitting"
+        assert persisted.error_code is None
 
 
 def test_cancellation_race_after_provider_call_is_fenced_before_payload_write(

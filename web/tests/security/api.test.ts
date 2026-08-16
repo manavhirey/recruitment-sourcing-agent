@@ -53,6 +53,24 @@ describe("server-only API client", () => {
     expect(requests[0].cache).toBe("no-store")
   })
 
+  it("forwards an explicit stable export intent key on a streaming GET", async () => {
+    const requests: Request[] = []
+    const fetcher = apiWith(async (input, init) => {
+      requests.push(new Request(input, init))
+      return new Response("candidate_id,name\r\n", {
+        headers: { "Content-Type": "text/csv; charset=utf-8" },
+      })
+    })
+
+    await fetcher(
+      "/api/v1/jobs/00000000-0000-4000-8000-000000000101/export.csv",
+      tenantId,
+      { responseMode: "stream", idempotencyKey: "export-intent" },
+    )
+
+    expect(requests[0].headers.get("Idempotency-Key")).toBe("export-intent")
+  })
+
   it.each([
     "https://evil.example/api/v1/jobs",
     "//evil.example/api/v1/jobs",

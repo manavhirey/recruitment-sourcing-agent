@@ -32,6 +32,7 @@ from app.providers.base import (
 from app.providers.query_planner import QueryPlanner
 from app.providers.snapshots import SnapshotStore
 from app.sourcing.enrichment import (
+    DeferredEnrichment,
     RegionalContactPolicy,
     enqueue_top_enrichment,
     execute_queued_enrichment_request,
@@ -949,6 +950,8 @@ def enrich_request(
         )
     finally:
         gateway.close()
+    if isinstance(submission, DeferredEnrichment):
+        raise self.retry(countdown=submission.retry_after_seconds)
     if submission is not None:
         poll_enrichment_result.apply_async(
             args=(request_id, tenant_id, user_id), countdown=300

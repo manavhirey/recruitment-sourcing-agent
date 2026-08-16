@@ -221,6 +221,13 @@ class EnrichmentRequest(Base):
             "synchronous_credits >= 0",
             name="ck_enrichment_requests_synchronous_credits",
         ),
+        Index(
+            "ix_enrichment_requests_pending_dispatch",
+            "created_at",
+            "id",
+            postgresql_where=text("dispatch_pending"),
+            sqlite_where=text("dispatch_pending = 1"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -234,6 +241,16 @@ class EnrichmentRequest(Base):
     capability_token_hmac: Mapped[str | None] = mapped_column(String(64), index=True)
     reservation_key: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    dispatch_pending: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    dispatch_requested_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    dispatch_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    dispatch_claim_token: Mapped[UUID | None] = mapped_column()
     reveal_personal_emails: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )

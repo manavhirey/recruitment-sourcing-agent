@@ -186,6 +186,51 @@ def test_owner_grant_allows_recruiter_to_read_only_granted_client(
     assert not_visible.status_code == 404
 
 
+def test_owner_can_revoke_recruiter_client_access_idempotently(
+    client_access_api: dict[str, Any], client_factory
+) -> None:
+    client = client_factory(name="Revocable Client")
+    headers = {
+        "Authorization": "Bearer signed-token",
+        "X-Tenant-ID": str(client_access_api["tenant_id"]),
+    }
+    client_access_api["verifier"].claims = IdentityClaims(
+        subject="oidc|owner",
+        email="owner@agency.test",
+        name="Owner",
+        email_verified=True,
+    )
+    granted = client_access_api["api"].post(
+        f"/api/v1/clients/{client.id}/grants",
+        headers={**headers, "Idempotency-Key": "grant-revocable"},
+        json={"membership_id": str(client_access_api["recruiter_membership_id"])},
+    )
+    assert granted.status_code == 200
+
+    url = (
+        f"/api/v1/clients/{client.id}/grants/"
+        f"{client_access_api['recruiter_membership_id']}"
+    )
+    revoked = client_access_api["api"].delete(
+        url, headers={**headers, "Idempotency-Key": "revoke-client"}
+    )
+    replay = client_access_api["api"].delete(
+        url, headers={**headers, "Idempotency-Key": "revoke-client"}
+    )
+    assert revoked.status_code == replay.status_code == 204
+
+    client_access_api["verifier"].claims = IdentityClaims(
+        subject="oidc|recruiter",
+        email="recruiter@agency.test",
+        name="Recruiter",
+        email_verified=True,
+    )
+    hidden = client_access_api["api"].get(
+        f"/api/v1/clients/{client.id}", headers=headers
+    )
+    assert hidden.status_code == 404
+
+
 def test_owner_cannot_approve_adjacency_from_unassigned_industry(
     client_access_api: dict[str, Any],
 ) -> None:

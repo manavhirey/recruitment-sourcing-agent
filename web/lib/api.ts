@@ -152,7 +152,9 @@ export function createApiFetcher(dependencies: ApiFetcherDependencies) {
     headers.set("Authorization", `Bearer ${token}`)
     headers.set("X-Tenant-ID", tenantId)
     headers.set("Accept", init.responseMode === "stream" ? "*/*" : "application/json")
-    if (mutation) headers.set("Idempotency-Key", init.idempotencyKey!)
+    if (init.idempotencyKey) {
+      headers.set("Idempotency-Key", init.idempotencyKey)
+    }
     const timeoutMs = Math.min(Math.max(init.timeoutMs ?? 15_000, 1), 30_000)
     const controller = new AbortController()
     let timedOut = false

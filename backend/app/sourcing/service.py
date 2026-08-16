@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.audit.models import AuditEvent
 from app.audit.service import AuditService
+from app.candidates.models import ContactPoint
 from app.core.errors import AppError
 from app.identity.models import IdentityIdempotencyKey
 from app.identity.schemas import RequestContext, Role
@@ -37,6 +38,10 @@ _UNIT_CAP_COLUMNS = {
     "enrichments": UsageBudget.max_enrichments,
     "estimated_credits": UsageBudget.max_estimated_credits,
 }
+_AUTO_ENRICHMENT_LIMIT = 50
+_ON_DEMAND_ESTIMATED_CREDITS = 9
+_ON_DEMAND_RUN_STATES = frozenset((RunState.PARTIALLY_READY, RunState.READY))
+_RETRYABLE_ENRICHMENT_STATES = frozenset(("failed", "unavailable"))
 
 
 class SourcingError(AppError):
@@ -49,6 +54,18 @@ class SourcingError(AppError):
 class StartRunOutcome:
     run: SourcingRun
     needs_dispatch: bool
+
+
+@dataclass(frozen=True)
+class EnrichmentEligibility:
+    eligible: bool
+    estimated_credits: int | None
+
+
+@dataclass(frozen=True)
+class EnrichmentDispatchOutcome:
+    request: EnrichmentRequest
+    claim_token: UUID | None
 
 
 class SourcingService:
@@ -213,6 +230,51 @@ class SourcingService:
         self._job(context, run.job_id)
         return run
 
+    def latest_for_job(self, context: RequestContext, job_id: UUID) -> SourcingRun:
+        self._job(context, job_id)
+        run = self.session.scalar(
+            select(SourcingRun)
+            .where(
+                SourcingRun.tenant_id == context.tenant_id,
+                SourcingRun.job_id == job_id,
+            )
+            .order_by(SourcingRun.created_at.desc(), SourcingRun.id.desc())
+        )
+        if run is None:
+            raise SourcingError("run_not_found")
+        return run
+
+    def result_counts(
+        self, context: RequestContext, run_id: UUID
+    ) -> tuple[int, int]:
+        run = self.get_authorized(context, run_id)
+        enriched, failed = self.session.execute(
+            select(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (RunCandidate.enrichment_status == "available", 1),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (RunCandidate.enrichment_status == "failed", 1),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+            ).where(
+                RunCandidate.tenant_id == context.tenant_id,
+                RunCandidate.run_id == run.id,
+            )
+        ).one()
+        return int(enriched), int(failed)
+
     def activity(self, context: RequestContext, run_id: UUID) -> list[AuditEvent]:
         self.get_authorized(context, run_id)
         return self._audit.for_run(context.tenant_id, run_id)
@@ -251,18 +313,28 @@ class SourcingService:
         run_candidate_id: UUID,
         *,
         idempotency_key: str,
-    ) -> tuple[EnrichmentRequest, bool]:
+    ) -> EnrichmentDispatchOutcome:
+        run_id = self.session.scalar(
+            select(RunCandidate.run_id).where(
+                RunCandidate.id == run_candidate_id,
+                RunCandidate.tenant_id == context.tenant_id,
+            )
+        )
+        if run_id is None:
+            raise SourcingError("run_candidate_not_found")
+        run = self.get_authorized(context, run_id, for_update=True)
         run_candidate = self.session.scalar(
             select(RunCandidate)
             .where(
                 RunCandidate.id == run_candidate_id,
                 RunCandidate.tenant_id == context.tenant_id,
+                RunCandidate.run_id == run.id,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if run_candidate is None:
             raise SourcingError("run_candidate_not_found")
-        run = self.get_authorized(context, run_candidate.run_id, for_update=True)
         record = self._begin(
             context,
             f"enrich_run_candidate:{run_candidate_id}",
@@ -279,7 +351,36 @@ class SourcingService:
             )
             if request is None:
                 raise SourcingError("enrichment_request_not_found")
-            return request, False
+            return EnrichmentDispatchOutcome(
+                request,
+                self._claim_enrichment_dispatch(request),
+            )
+        active_request = self.session.scalar(
+            select(EnrichmentRequest)
+            .where(
+                EnrichmentRequest.tenant_id == context.tenant_id,
+                EnrichmentRequest.run_id == run.id,
+                func.json_array_length(EnrichmentRequest.candidate_ids) == 1,
+                EnrichmentRequest.candidate_ids[0].as_string()
+                == str(run_candidate.candidate_id),
+                EnrichmentRequest.status.in_(("queued", "submitting", "pending")),
+            )
+            .order_by(EnrichmentRequest.created_at.desc(), EnrichmentRequest.id)
+            .with_for_update()
+        )
+        if active_request is not None:
+            self._complete(
+                record, {"enrichment_request_id": str(active_request.id)}
+            )
+            return EnrichmentDispatchOutcome(
+                active_request,
+                self._claim_enrichment_dispatch(active_request),
+            )
+        eligibility = self._on_demand_enrichment_eligibility(
+            context, run_candidate, run
+        )
+        if not eligibility.eligible:
+            raise SourcingError("enrichment_not_eligible")
         reservation_key = f"on-demand:{record.id}"
         self.reserve_usage(
             context,
@@ -296,6 +397,8 @@ class SourcingService:
             candidate_ids=[str(run_candidate.candidate_id)],
             reservation_key=reservation_key,
             status="queued",
+            dispatch_pending=True,
+            dispatch_requested_by_user_id=context.user_id,
         )
         self.session.add(request)
         run_candidate.enrichment_status = "pending"
@@ -311,7 +414,174 @@ class SourcingService:
             payload={"run_candidate_id": str(run_candidate.id)},
         )
         self._complete(record, {"enrichment_request_id": str(request.id)})
-        return request, True
+        return EnrichmentDispatchOutcome(
+            request,
+            self._claim_enrichment_dispatch(request),
+        )
+
+    def finish_enrichment_dispatch(
+        self,
+        context: RequestContext,
+        request_id: UUID,
+        claim_token: UUID,
+        *,
+        published: bool,
+    ) -> bool:
+        request = self.session.scalar(
+            select(EnrichmentRequest)
+            .where(
+                EnrichmentRequest.id == request_id,
+                EnrichmentRequest.tenant_id == context.tenant_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if request is None or request.dispatch_claim_token != claim_token:
+            return False
+        if published:
+            request.dispatch_pending = False
+        request.dispatch_claimed_at = None
+        request.dispatch_claim_token = None
+        self.session.flush()
+        return True
+
+    @staticmethod
+    def _claim_enrichment_dispatch(request: EnrichmentRequest) -> UUID | None:
+        if (
+            not request.dispatch_pending
+            or request.dispatch_requested_by_user_id is None
+        ):
+            return None
+        now = datetime.now(UTC)
+        claimed_at = request.dispatch_claimed_at
+        if claimed_at is not None:
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=UTC)
+            if claimed_at >= now - timedelta(minutes=5):
+                return None
+        claim_token = uuid4()
+        request.dispatch_claimed_at = now
+        request.dispatch_claim_token = claim_token
+        return claim_token
+
+    def on_demand_enrichment_eligibility(
+        self,
+        context: RequestContext,
+        run_candidate_id: UUID,
+    ) -> EnrichmentEligibility:
+        run_candidate = self.session.scalar(
+            select(RunCandidate).where(
+                RunCandidate.id == run_candidate_id,
+                RunCandidate.tenant_id == context.tenant_id,
+            )
+        )
+        if run_candidate is None:
+            return EnrichmentEligibility(False, None)
+        try:
+            run = self.get_authorized(context, run_candidate.run_id)
+        except SourcingError:
+            return EnrichmentEligibility(False, None)
+        return self._on_demand_enrichment_eligibility(context, run_candidate, run)
+
+    def _on_demand_enrichment_eligibility(
+        self,
+        context: RequestContext,
+        run_candidate: RunCandidate,
+        run: SourcingRun,
+    ) -> EnrichmentEligibility:
+        if run.state not in _ON_DEMAND_RUN_STATES or run.cancellation_requested:
+            return EnrichmentEligibility(False, None)
+        if run_candidate.enrichment_status in {"pending", "available"}:
+            return EnrichmentEligibility(False, None)
+        has_contact = bool(
+            self.session.scalar(
+                select(func.count())
+                .select_from(ContactPoint)
+                .where(
+                    ContactPoint.tenant_id == context.tenant_id,
+                    ContactPoint.candidate_id == run_candidate.candidate_id,
+                    ContactPoint.expires_at > datetime.now(UTC),
+                    ContactPoint.value_ciphertext.is_not(None),
+                    ContactPoint.verification_state != "expired",
+                )
+            )
+        )
+        if has_contact:
+            return EnrichmentEligibility(False, None)
+        automatic_ids = set(
+            self.session.scalars(
+                select(RunCandidate.candidate_id)
+                .where(
+                    RunCandidate.tenant_id == context.tenant_id,
+                    RunCandidate.run_id == run.id,
+                    RunCandidate.classification == "main",
+                    RunCandidate.match_score.is_not(None),
+                )
+                .order_by(RunCandidate.match_score.desc(), RunCandidate.candidate_id)
+                .limit(_AUTO_ENRICHMENT_LIMIT)
+            )
+        )
+        outside_automatic_batch = run_candidate.candidate_id not in automatic_ids
+        retryable_failure = (
+            run_candidate.enrichment_status in _RETRYABLE_ENRICHMENT_STATES
+        )
+        if not outside_automatic_batch and not retryable_failure:
+            return EnrichmentEligibility(False, None)
+        requested = {
+            "enrichments": 1,
+            "estimated_credits": _ON_DEMAND_ESTIMATED_CREDITS,
+        }
+        if not self._has_usage_capacity(context, run, requested):
+            return EnrichmentEligibility(False, None)
+        return EnrichmentEligibility(True, _ON_DEMAND_ESTIMATED_CREDITS)
+
+    def _has_usage_capacity(
+        self,
+        context: RequestContext,
+        run: SourcingRun,
+        requested: dict[str, int],
+    ) -> bool:
+        budgets = list(
+            self.session.scalars(
+                select(UsageBudget).where(
+                    UsageBudget.tenant_id == context.tenant_id,
+                    or_(UsageBudget.job_id.is_(None), UsageBudget.job_id == run.job_id),
+                )
+            )
+        )
+        for unit_type, requested_count in requested.items():
+            for budget in budgets:
+                cap = getattr(budget, _UNIT_CAP_COLUMNS[unit_type].key)
+                if cap is None:
+                    continue
+                filters = [
+                    UsageLedger.tenant_id == context.tenant_id,
+                    UsageLedger.unit_type == unit_type,
+                ]
+                if budget.job_id is not None:
+                    filters.append(UsageLedger.job_id == budget.job_id)
+                used = int(
+                    self.session.scalar(
+                        select(
+                            func.coalesce(
+                                func.sum(
+                                    case(
+                                        (
+                                            UsageLedger.charged_units.is_(None),
+                                            UsageLedger.requested_units,
+                                        ),
+                                        else_=UsageLedger.charged_units,
+                                    )
+                                ),
+                                0,
+                            )
+                        ).where(*filters)
+                    )
+                    or 0
+                )
+                if used + requested_count > cap:
+                    return False
+        return True
 
     def merge_candidate_memberships(
         self,

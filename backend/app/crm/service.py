@@ -10,9 +10,15 @@ from uuid import UUID
 from sqlalchemy import Text, and_, cast, delete, exists, func, or_, select, text
 from sqlalchemy.orm import Session
 
+from app.audit.models import AuditEvent
 from app.audit.service import AuditService
 from app.candidates.contacts import ContactCipher, ContactService
-from app.candidates.models import Candidate, CandidateExperience, ContactPoint
+from app.candidates.models import (
+    Candidate,
+    CandidateExperience,
+    CandidateFieldProvenance,
+    ContactPoint,
+)
 from app.core.errors import AppError
 from app.crm.models import (
     AcceptanceSnapshot,
@@ -26,9 +32,10 @@ from app.crm.models import (
 from app.identity.models import IdentityIdempotencyKey, Membership
 from app.identity.schemas import RequestContext, Role
 from app.identity.service import IdentityError, MembershipService
-from app.jobs.models import Job
+from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
 from app.jobs.service import JobError, JobService
 from app.sourcing.models import RunCandidate, SourcingRun
+from app.sourcing.service import EnrichmentEligibility, SourcingService
 from app.sourcing.state_machine import RunState
 
 REJECTION_REASON_CODES = frozenset(
@@ -58,6 +65,19 @@ _ALLOWED_TRANSITIONS = {
     ),
     CandidateStage.REJECTED: frozenset({CandidateStage.REVIEWED}),
 }
+_PUBLIC_ACTIVITY_ACTIONS = frozenset(
+    {
+        "candidate.match_materialized",
+        "candidate.match_rescored",
+        "candidate.stage_changed",
+        "candidate.note_added",
+        "candidate.owner_changed",
+        "candidate.tags_changed",
+        "candidate.contact_revealed",
+        "candidate.enrichment_queued",
+        "candidate.shortlist_exported",
+    }
+)
 
 
 class CrmError(AppError):
@@ -80,6 +100,14 @@ class AcceptanceReport:
     final: bool
 
 
+@dataclass(frozen=True)
+class MandatoryGap:
+    key: str
+    label: str
+    state: str
+    summary: str
+
+
 class CrmService:
     def __init__(
         self,
@@ -91,6 +119,7 @@ class CrmService:
         self._hmac_key = hmac_key
         self._contact_cipher = contact_cipher
         self._jobs = JobService(session, hmac_key)
+        self._sourcing = SourcingService(session, hmac_key)
         self._idempotency = MembershipService(session, hmac_key)
         self._audit = AuditService(session)
 
@@ -301,6 +330,191 @@ class CrmService:
             )
         )
 
+    def candidate_experiences(
+        self, context: RequestContext, candidate_id: UUID
+    ) -> list[CandidateExperience]:
+        return list(
+            self.session.scalars(
+                select(CandidateExperience)
+                .where(
+                    CandidateExperience.tenant_id == context.tenant_id,
+                    CandidateExperience.candidate_id == candidate_id,
+                )
+                .order_by(CandidateExperience.position, CandidateExperience.id)
+            )
+        )
+
+    def candidate_provenance(
+        self, context: RequestContext, candidate_id: UUID
+    ) -> list[CandidateFieldProvenance]:
+        return list(
+            self.session.scalars(
+                select(CandidateFieldProvenance)
+                .where(
+                    CandidateFieldProvenance.tenant_id == context.tenant_id,
+                    CandidateFieldProvenance.candidate_id == candidate_id,
+                    CandidateFieldProvenance.is_current.is_(True),
+                )
+                .order_by(
+                    CandidateFieldProvenance.field_name,
+                    CandidateFieldProvenance.id,
+                )
+            )
+        )
+
+    def notes_for(
+        self, context: RequestContext, job_candidate_id: UUID
+    ) -> list[CandidateNote]:
+        return list(
+            self.session.scalars(
+                select(CandidateNote)
+                .where(
+                    CandidateNote.tenant_id == context.tenant_id,
+                    CandidateNote.job_candidate_id == job_candidate_id,
+                )
+                .order_by(CandidateNote.created_at.desc(), CandidateNote.id)
+            )
+        )
+
+    def run_candidate_id(
+        self, context: RequestContext, row: JobCandidate
+    ) -> UUID | None:
+        if row.latest_run_id is None:
+            return None
+        return self.session.scalar(
+            select(RunCandidate.id).where(
+                RunCandidate.tenant_id == context.tenant_id,
+                RunCandidate.run_id == row.latest_run_id,
+                RunCandidate.candidate_id == row.candidate_id,
+            )
+        )
+
+    def scorecard_version_number(
+        self, context: RequestContext, row: JobCandidate
+    ) -> int | None:
+        return self.session.scalar(
+            select(ScorecardVersion.version).where(
+                ScorecardVersion.tenant_id == context.tenant_id,
+                ScorecardVersion.id == row.scorecard_version_id,
+            )
+        )
+
+    def enrichment_eligibility(
+        self,
+        context: RequestContext,
+        run_candidate_id: UUID | None,
+    ) -> EnrichmentEligibility:
+        if run_candidate_id is None:
+            return EnrichmentEligibility(False, None)
+        return self._sourcing.on_demand_enrichment_eligibility(
+            context, run_candidate_id
+        )
+
+    def mandatory_gaps(
+        self, context: RequestContext, row: JobCandidate
+    ) -> list[MandatoryGap]:
+        if row.classification != "near_match":
+            return []
+        evidence = row.score_json if isinstance(row.score_json, dict) else {}
+        failed_values = evidence.get("failed_must_haves")
+        unknown_values = evidence.get("unknown_keys")
+        failed = {
+            value for value in failed_values if isinstance(value, str)
+        } if isinstance(failed_values, list) else set()
+        unknown = {
+            value for value in unknown_values if isinstance(value, str)
+        } if isinstance(unknown_values, list) else set()
+        criteria = self.session.scalars(
+            select(ScorecardCriterionRecord)
+            .where(
+                ScorecardCriterionRecord.tenant_id == context.tenant_id,
+                ScorecardCriterionRecord.scorecard_version_id
+                == row.scorecard_version_id,
+                ScorecardCriterionRecord.kind == "must_have",
+            )
+            .order_by(ScorecardCriterionRecord.position, ScorecardCriterionRecord.id)
+        )
+        gaps: list[MandatoryGap] = []
+        for criterion in criteria:
+            if criterion.key in failed:
+                gaps.append(
+                    MandatoryGap(
+                        key=criterion.key,
+                        label=criterion.label,
+                        state="failed",
+                        summary=f"Stored evidence does not support {criterion.label}.",
+                    )
+                )
+            elif criterion.evidence_required and criterion.key in unknown:
+                gaps.append(
+                    MandatoryGap(
+                        key=criterion.key,
+                        label=criterion.label,
+                        state="unknown",
+                        summary=f"Evidence for {criterion.label} is unknown.",
+                    )
+                )
+        return gaps
+
+    @staticmethod
+    def safe_score_json(row: JobCandidate) -> dict[str, object]:
+        source = row.score_json if isinstance(row.score_json, dict) else {}
+        result: dict[str, object] = {}
+        total = source.get("total")
+        if isinstance(total, int) and not isinstance(total, bool):
+            result["total"] = min(max(total, 0), 100)
+        breakdown = source.get("breakdown")
+        if isinstance(breakdown, dict):
+            safe_breakdown: dict[str, int] = {}
+            for breakdown_key in (
+                "role_and_skills",
+                "scope_seniority_years",
+                "industry",
+                "location_and_eligibility",
+                "recency_and_trajectory",
+            ):
+                value = breakdown.get(breakdown_key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    safe_breakdown[breakdown_key] = min(max(value, 0), 100)
+            result["breakdown"] = safe_breakdown
+        criteria = source.get("criteria")
+        safe_criteria: list[dict[str, object]] = []
+        if isinstance(criteria, list):
+            for item in criteria[:100]:
+                if not isinstance(item, dict):
+                    continue
+                key = item.get("key")
+                label = item.get("label")
+                state = item.get("state")
+                summary = item.get("summary")
+                if not (
+                    isinstance(key, str)
+                    and isinstance(label, str)
+                    and state in {"supported", "failed", "unknown"}
+                    and isinstance(summary, str)
+                ):
+                    continue
+                safe_item: dict[str, object] = {
+                    "key": key[:64],
+                    "label": label[:160],
+                    "state": state,
+                    "summary": summary[:500],
+                }
+                for points_key in ("points", "max_points"):
+                    points = item.get(points_key)
+                    if isinstance(points, int) and not isinstance(points, bool):
+                        safe_item[points_key] = min(max(points, 0), 100)
+                safe_criteria.append(safe_item)
+        result["criteria"] = safe_criteria
+        for key in ("failed_must_haves", "unknown_keys"):
+            values = source.get(key)
+            result[key] = (
+                [value[:64] for value in values[:100] if isinstance(value, str)]
+                if isinstance(values, list)
+                else []
+            )
+        return result
+
     def candidate(self, context: RequestContext, candidate_id: UUID) -> Candidate:
         candidate = self.session.scalar(
             select(Candidate).where(
@@ -490,6 +704,7 @@ class CrmService:
         statement = select(ActivityEvent).where(
             ActivityEvent.tenant_id == context.tenant_id,
             ActivityEvent.job_candidate_id == job_candidate_id,
+            ActivityEvent.action.in_(_PUBLIC_ACTIVITY_ACTIONS),
         )
         cursor_scope = self._cursor_scope(
             context,
@@ -861,7 +1076,7 @@ class CrmService:
                 tenant_id=context.tenant_id,
                 actor_user_id=context.user_id,
                 event_key=f"shortlist-exported:{record.id}",
-                action="candidate.shortlist_exported",
+                action="candidate.shortlist_export_started",
                 entity_type="job",
                 entity_id=job_id,
                 payload={"stage": CandidateStage.SHORTLISTED.value, "format": "csv"},
@@ -881,6 +1096,85 @@ class CrmService:
             event_key=f"shortlist-exported:{export_record.id}:{row.id}",
             action="candidate.shortlist_exported",
             payload={"job_id": str(row.job_id), "format": "csv"},
+        )
+
+    def record_exported_contact(
+        self,
+        context: RequestContext,
+        row: JobCandidate,
+        export_record: IdentityIdempotencyKey,
+        contact_point_id: UUID,
+    ) -> None:
+        event_key = self._exported_contact_event_key(
+            export_record, row, contact_point_id
+        )
+        self._audit.record(
+            tenant_id=context.tenant_id,
+            run_id=row.latest_run_id,
+            actor_user_id=context.user_id,
+            event_key=event_key,
+            action="candidate.contact_exported",
+            entity_type="contact_point",
+            entity_id=contact_point_id,
+            payload={"job_candidate_id": str(row.id), "job_id": str(row.job_id)},
+        )
+
+    def exported_contact_recorded(
+        self,
+        context: RequestContext,
+        row: JobCandidate,
+        export_record: IdentityIdempotencyKey,
+        contact_point_id: UUID,
+    ) -> bool:
+        event_key = self._exported_contact_event_key(
+            export_record, row, contact_point_id
+        )
+        if self.session.get_bind().dialect.name == "postgresql":
+            lock_digest = hashlib.sha256(
+                f"audit-event\0{context.tenant_id}\0{event_key}".encode()
+            ).digest()
+            self.session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": int.from_bytes(lock_digest[:8], "big", signed=True)},
+            )
+        return (
+            self.session.scalar(
+                select(AuditEvent.id).where(
+                    AuditEvent.tenant_id == context.tenant_id,
+                    AuditEvent.event_key == event_key,
+                )
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _exported_contact_event_key(
+        export_record: IdentityIdempotencyKey,
+        row: JobCandidate,
+        contact_point_id: UUID,
+    ) -> str:
+        return (
+            f"shortlist-contact-exported:{export_record.id}:"
+            f"{row.id}:{contact_point_id}"
+        )
+
+    def record_export_outcome(
+        self,
+        context: RequestContext,
+        job_id: UUID,
+        export_record: IdentityIdempotencyKey,
+        outcome: str,
+    ) -> None:
+        if outcome not in {"completed", "aborted"}:
+            raise ValueError("export outcome must be completed or aborted")
+        self._audit.record(
+            tenant_id=context.tenant_id,
+            actor_user_id=context.user_id,
+            event_key=f"shortlist-export-{outcome}:{export_record.id}",
+            action=f"candidate.shortlist_export_{outcome}",
+            entity_type="job",
+            entity_id=job_id,
+            payload={"stage": CandidateStage.SHORTLISTED.value, "format": "csv"},
         )
 
     def transition(

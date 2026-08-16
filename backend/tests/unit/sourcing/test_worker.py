@@ -19,6 +19,7 @@ from app.providers.base import (
     ProviderTemporaryError,
 )
 from app.sourcing import maintenance_tasks, tasks
+from app.sourcing.enrichment import DeferredEnrichment
 from app.sourcing.maintenance_tasks import (
     expire_contact_points,
     reconcile_expired_snapshots,
@@ -114,6 +115,43 @@ def test_sourcing_tasks_use_late_acknowledgement_and_bounded_retries() -> None:
         assert OperationalError in task.autoretry_for
     assert source_run.retry_backoff is True
     assert source_run.retry_jitter is True
+
+
+def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class RetryRequested(RuntimeError):
+        pass
+
+    class Gateway:
+        def close(self) -> None:
+            observed["closed"] = True
+
+    monkeypatch.setattr(tasks, "get_settings", Settings.for_test)
+    monkeypatch.setattr(tasks, "ApolloGateway", lambda settings: Gateway())
+    monkeypatch.setattr(
+        tasks,
+        "_enrichment_dependencies",
+        lambda settings: (None, None, None, None),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "execute_queued_enrichment_request",
+        lambda *args, **kwargs: DeferredEnrichment(retry_after_seconds=37),
+    )
+
+    def retry(**kwargs: object) -> None:
+        observed.update(kwargs)
+        raise RetryRequested
+
+    monkeypatch.setattr(enrich_request, "retry", retry)
+
+    with pytest.raises(RetryRequested):
+        enrich_request.run(str(uuid4()), str(uuid4()), str(uuid4()))
+
+    assert observed == {"closed": True, "countdown": 37}
 
 
 def test_maintenance_tasks_are_isolated_on_a_dedicated_worker_and_queue() -> None:

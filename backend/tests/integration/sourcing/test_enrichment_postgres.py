@@ -126,7 +126,7 @@ def test_0007_to_head_upgrade_downgrade_and_model_parity(owner_engine: Engine) -
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0011_sourcing_dispatch_recovery"
+            "0012_enrich_dispatch_recovery"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -266,6 +266,9 @@ def test_maintenance_role_can_only_erase_due_contacts(
         ("maintenance_claim_pending_sourcing_dispatches", "EXECUTE"),
         ("maintenance_complete_sourcing_dispatch", "EXECUTE"),
         ("maintenance_release_sourcing_dispatch", "EXECUTE"),
+        ("maintenance_claim_pending_enrichment_dispatches", "EXECUTE"),
+        ("maintenance_complete_enrichment_dispatch", "EXECUTE"),
+        ("maintenance_release_enrichment_dispatch", "EXECUTE"),
     }
 
 
@@ -973,15 +976,21 @@ def test_on_demand_and_poll_celery_entries_bind_tenant_before_forced_rls(
     )
     context = RequestContext(tenant_id=tenant_id, user_id=user_id, role=Role.OWNER)
     with Session(owner_engine, expire_on_commit=False) as session:
-        request, created = SourcingService(
-            session, b"test-key"
-        ).queue_on_demand_enrichment(
+        run_candidate = session.get(RunCandidate, run_candidate_id)
+        assert run_candidate is not None
+        run = session.get(SourcingRun, run_candidate.run_id)
+        assert run is not None
+        run.state = RunState.READY
+        run.current_stage = RunState.READY.value
+        run_candidate.enrichment_status = "unavailable"
+        session.commit()
+        outcome = SourcingService(session, b"test-key").queue_on_demand_enrichment(
             context,
             run_candidate_id,
             idempotency_key="celery-entry",
         )
-        assert created
-        request_id = request.id
+        assert outcome.claim_token is not None
+        request_id = outcome.request.id
         session.commit()
     api_engine = create_engine(API_DATABASE_URL)
     _patch_celery_entry_dependencies(
@@ -996,3 +1005,105 @@ def test_on_demand_and_poll_celery_entries_bind_tenant_before_forced_rls(
         assert request is not None and request.status == "completed"
         assert request.usage_reconciled_at is not None
     api_engine.dispose()
+
+
+def test_on_demand_lock_order_avoids_run_candidate_deadlock_and_replays(
+    owner_engine: Engine,
+) -> None:
+    tenant_id, user_id, run_id, run_candidate_id = _seed_celery_entry_run(
+        owner_engine, suffix="lock-order"
+    )
+    context = RequestContext(tenant_id=tenant_id, user_id=user_id, role=Role.OWNER)
+    with Session(owner_engine) as session:
+        run = session.get(SourcingRun, run_id)
+        run_candidate = session.get(RunCandidate, run_candidate_id)
+        assert run is not None and run_candidate is not None
+        run.state = RunState.READY
+        run.current_stage = RunState.READY.value
+        run_candidate.enrichment_status = "unavailable"
+        session.commit()
+
+    run_locked = threading.Event()
+    candidate_read = threading.Event()
+    automatic_complete = threading.Event()
+    outcomes: queue.Queue[object] = queue.Queue()
+
+    class SignallingSession(Session):
+        observed_candidate = False
+
+        def scalar(self, statement, *args, **kwargs):  # type: ignore[no-untyped-def]
+            result = super().scalar(statement, *args, **kwargs)
+            if not self.observed_candidate:
+                self.observed_candidate = True
+                candidate_read.set()
+                if not automatic_complete.wait(timeout=5):
+                    raise TimeoutError("automatic lock holder did not complete")
+            return result
+
+    def automatic_worker() -> None:
+        try:
+            with Session(owner_engine) as session:
+                session.execute(text("SET LOCAL lock_timeout = '2s'"))
+                locked_run = session.scalar(
+                    select(SourcingRun)
+                    .where(SourcingRun.id == run_id)
+                    .with_for_update()
+                )
+                assert locked_run is not None
+                run_locked.set()
+                assert candidate_read.wait(timeout=5)
+                locked_candidate = session.scalar(
+                    select(RunCandidate)
+                    .where(RunCandidate.id == run_candidate_id)
+                    .with_for_update()
+                )
+                assert locked_candidate is not None
+                locked_candidate.enrichment_status = "unavailable"
+                session.commit()
+                outcomes.put("automatic-complete")
+        except Exception as error:  # noqa: BLE001 - worker errors are asserted centrally
+            outcomes.put(error)
+        finally:
+            automatic_complete.set()
+
+    def on_demand_worker() -> None:
+        try:
+            assert run_locked.wait(timeout=5)
+            with SignallingSession(bind=owner_engine, expire_on_commit=False) as session:
+                outcome = SourcingService(
+                    session, b"test-key"
+                ).queue_on_demand_enrichment(
+                    context,
+                    run_candidate_id,
+                    idempotency_key="lock-order-replay",
+                )
+                session.commit()
+                outcomes.put((outcome.request.id, outcome.claim_token))
+        except Exception as error:  # noqa: BLE001 - worker errors are asserted centrally
+            outcomes.put(error)
+
+    threads = [
+        threading.Thread(target=automatic_worker),
+        threading.Thread(target=on_demand_worker),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=8)
+    assert all(not thread.is_alive() for thread in threads)
+    observed = [outcomes.get_nowait(), outcomes.get_nowait()]
+    assert not [item for item in observed if isinstance(item, BaseException)]
+    request_id, claim_token = next(
+        item for item in observed if isinstance(item, tuple)
+    )
+    assert claim_token is not None
+
+    with Session(owner_engine, expire_on_commit=False) as session:
+        replay = SourcingService(session, b"test-key").queue_on_demand_enrichment(
+            context,
+            run_candidate_id,
+            idempotency_key="lock-order-replay",
+        )
+        session.commit()
+    assert replay.request.id == request_id
+    assert replay.claim_token is None

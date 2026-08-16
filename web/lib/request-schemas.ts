@@ -74,3 +74,39 @@ export const scorecardDraftUpdateRequest = z
   .strict()
 
 export const emptyObjectRequest = z.object({}).strict()
+
+export const stageUpdateRequest = z
+  .object({
+    stage: z.enum(["New", "Reviewed", "Shortlisted", "Rejected"]),
+    reason_code: z
+      .enum([
+        "not_qualified",
+        "compensation_mismatch",
+        "location_mismatch",
+        "work_authorization",
+        "duplicate",
+        "other",
+      ])
+      .nullable()
+      .optional(),
+    note: z.string().trim().max(2_000).nullable().optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.stage === "Rejected"
+        ? Boolean(value.reason_code)
+        : value.reason_code == null && value.note == null,
+  )
+
+export const noteCreateRequest = z.object({ body: z.string().trim().min(1).max(5_000) }).strict()
+export const ownerUpdateRequest = z.object({ owner_user_id: z.uuid().nullable() }).strict()
+export const tagsUpdateRequest = z
+  .object({ tags: z.array(z.string().trim().min(1).max(80)).max(20) })
+  .strict()
+export const invitationCreateRequest = z
+  .object({ email: z.email(), role: z.enum(["admin", "recruiter"]) })
+  .strict()
+export const roleUpdateRequest = z
+  .object({ role: z.enum(["admin", "recruiter"]) })
+  .strict()

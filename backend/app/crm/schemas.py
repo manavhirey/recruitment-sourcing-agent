@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -47,10 +48,33 @@ class MaskedContact(BaseModel):
     expires_at: datetime
 
 
+class CandidateExperienceView(BaseModel):
+    title: str | None
+    company_name: str | None
+    start_date: str | None
+    end_date: str | None
+    provider: str
+    source_timestamp: datetime
+
+
+class CandidateProvenanceView(BaseModel):
+    field_name: str
+    provider: str
+    source_timestamp: datetime
+
+
+class MandatoryGapView(BaseModel):
+    key: str
+    label: str
+    state: Literal["failed", "unknown"]
+    summary: str
+
+
 class JobCandidateView(BaseModel):
     id: UUID
     job_id: UUID
     candidate_id: UUID
+    run_candidate_id: UUID | None = None
     full_name: str
     current_title: str | None
     current_company: str | None
@@ -58,7 +82,9 @@ class JobCandidateView(BaseModel):
     classification: str
     score: int
     score_json: dict[str, object] | None = None
+    mandatory_gaps: list[MandatoryGapView] = Field(default_factory=list)
     scorecard_version_id: UUID
+    scorecard_version: int | None = None
     scoring_version: str
     stage: CandidateStage
     owner_user_id: UUID | None
@@ -66,7 +92,12 @@ class JobCandidateView(BaseModel):
     rejection_note: str | None
     tags: list[str]
     has_contact: bool
+    enrichment_eligible: bool = False
+    estimated_enrichment_credits: int | None = Field(default=None, ge=1)
     contacts: list[MaskedContact] | None = None
+    experiences: list[CandidateExperienceView] | None = None
+    provenance: list[CandidateProvenanceView] | None = None
+    notes: list["NoteResponse"] | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -92,12 +123,8 @@ class TagsResponse(BaseModel):
 
 class ActivityResponse(BaseModel):
     id: UUID
-    job_candidate_id: UUID
-    actor_user_id: UUID
     action: str
-    payload: dict[str, object]
     created_at: datetime
-    updated_at: datetime
 
 
 class ActivityPage(BaseModel):

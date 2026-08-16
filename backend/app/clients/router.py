@@ -1,7 +1,7 @@
 from typing import Annotated, NoReturn
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.clients.models import ClientCompany
@@ -167,3 +167,24 @@ def grant_client_access(
     return ClientGrantResponse(
         client_id=grant.client_id, membership_id=grant.membership_id
     )
+
+
+@router.delete(
+    "/{client_id}/grants/{membership_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def revoke_client_access(
+    client_id: UUID,
+    membership_id: UUID,
+    context: Annotated[RequestContext, Depends(manager_context)],
+    session: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    idempotency_key: Annotated[str, Depends(get_idempotency_key)],
+) -> Response:
+    try:
+        _service(session, settings).revoke_access(
+            context, client_id, membership_id, idempotency_key
+        )
+    except ClientError as error:
+        _raise_client_error(error)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

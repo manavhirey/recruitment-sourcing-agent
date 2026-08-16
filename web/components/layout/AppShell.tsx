@@ -84,7 +84,7 @@ export function AppShell({
             <ul>
               {activeJobs.map((job) => (
                 <li key={job.id}>
-                  <Link href={`/jobs/${job.id}/scorecard`}>
+                  <Link href={`/jobs/${job.id}`}>
                     <span>{job.title}</span>
                     <small>{job.status.replaceAll("_", " ")}</small>
                   </Link>

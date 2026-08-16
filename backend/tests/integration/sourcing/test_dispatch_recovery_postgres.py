@@ -15,12 +15,18 @@ from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from alembic import command
+from app.candidates.models import Candidate
 from app.clients.models import ClientCompany
 from app.core.database import Base
 from app.identity.models import Tenant, User
+from app.identity.schemas import RequestContext, Role
 from app.jobs.models import Job, ScorecardVersion
-from app.sourcing.dispatch_recovery import recover_pending_dispatches
-from app.sourcing.models import SourcingRun
+from app.sourcing.dispatch_recovery import (
+    recover_pending_dispatches,
+    recover_pending_enrichment_dispatches,
+)
+from app.sourcing.models import EnrichmentRequest, RunCandidate, SourcingRun
+from app.sourcing.service import SourcingService
 from app.sourcing.state_machine import RunState
 
 OWNER_DATABASE_URL = os.getenv("TASK12_OWNER_DATABASE_URL")
@@ -149,6 +155,61 @@ def _seed_run(engine: Engine) -> SourcingRun:
         return run
 
 
+def _seed_pending_enrichment(engine: Engine) -> EnrichmentRequest:
+    run = _seed_run(engine)
+    with Session(engine, expire_on_commit=False) as session:
+        stored_run = session.get(SourcingRun, run.id)
+        assert stored_run is not None
+        stored_run.dispatch_pending = False
+        request = EnrichmentRequest(
+            tenant_id=run.tenant_id,
+            run_id=run.id,
+            provider="apollo",
+            candidate_ids=[str(uuid4())],
+            reservation_key=f"dispatch-recovery-{uuid4()}",
+            status="queued",
+            dispatch_pending=True,
+            dispatch_requested_by_user_id=run.started_by_user_id,
+        )
+        session.add(request)
+        session.commit()
+        return request
+
+
+def _seed_active_on_demand_request(
+    engine: Engine,
+) -> tuple[EnrichmentRequest, UUID, RequestContext]:
+    request = _seed_pending_enrichment(engine)
+    with Session(engine, expire_on_commit=False) as session:
+        run = session.get(SourcingRun, request.run_id)
+        assert run is not None
+        candidate = Candidate(
+            id=UUID(request.candidate_ids[0]),
+            tenant_id=request.tenant_id,
+            full_name="Dispatch Recovery Candidate",
+            normalized_name="dispatch recovery candidate",
+        )
+        session.add(candidate)
+        session.flush()
+        row = RunCandidate(
+            tenant_id=request.tenant_id,
+            run_id=run.id,
+            candidate_id=candidate.id,
+            scorecard_version_id=run.scorecard_version_id,
+            match_score=1,
+            classification="main",
+            enrichment_status="pending",
+        )
+        session.add(row)
+        session.commit()
+        context = RequestContext(
+            tenant_id=request.tenant_id,
+            user_id=run.started_by_user_id,
+            role=Role.OWNER,
+        )
+        return request, row.id, context
+
+
 def _claim_one() -> tuple[UUID, UUID, UUID, UUID, str]:
     assert MAINTENANCE_DATABASE_URL is not None
     engine = create_engine(MAINTENANCE_DATABASE_URL)
@@ -166,18 +227,38 @@ def _claim_one() -> tuple[UUID, UUID, UUID, UUID, str]:
         engine.dispose()
 
 
-def test_0011_upgrade_downgrade_upgrade_and_model_parity(
+def _claim_one_enrichment() -> tuple[UUID, UUID, UUID, UUID, str]:
+    assert MAINTENANCE_DATABASE_URL is not None
+    engine = create_engine(MAINTENANCE_DATABASE_URL)
+    try:
+        with Session(engine) as session:
+            row = session.execute(
+                text(
+                    "SELECT request_id, tenant_id, user_id, claim_token, "
+                    "dispatch_key FROM "
+                    "maintenance_claim_pending_enrichment_dispatches(1)"
+                )
+            ).one()
+            session.commit()
+            return tuple(row)  # type: ignore[return-value]
+    finally:
+        engine.dispose()
+
+
+def test_0012_upgrade_downgrade_upgrade_and_model_parity(
     owner_engine: Engine,
 ) -> None:
-    command.downgrade(_config(), "0010_privacy")
-    assert "dispatch_pending" not in {
-        column["name"] for column in inspect(owner_engine).get_columns("sourcing_runs")
+    command.downgrade(_config(), "0011_sourcing_dispatch_recovery")
+    enrichment_columns = {
+        column["name"]
+        for column in inspect(owner_engine).get_columns("enrichment_requests")
     }
+    assert "dispatch_pending" not in enrichment_columns
     command.upgrade(_config(), "head")
 
     with owner_engine.begin() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0011_sourcing_dispatch_recovery"
+            "0012_enrich_dispatch_recovery"
         )
         assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
 
@@ -264,6 +345,116 @@ def test_concurrent_claimers_receive_distinct_runs(owner_engine: Engine) -> None
     assert claimed == expected
 
 
+def test_enrichment_dispatch_functions_have_no_table_grants_and_api_cannot_call(
+    owner_engine: Engine,
+) -> None:
+    request = _seed_pending_enrichment(owner_engine)
+    claimed = _claim_one_enrichment()
+    assert claimed[0] == request.id
+    assert claimed[4] == f"enrichment-request-{request.id}"
+
+    with owner_engine.connect() as connection:
+        table_grants = connection.execute(
+            text(
+                "SELECT privilege_type FROM information_schema.role_table_grants "
+                "WHERE grantee = 'sourcing_maintenance' "
+                "AND table_name = 'enrichment_requests'"
+            )
+        ).all()
+        routines = set(
+            connection.scalars(
+                text(
+                    "SELECT routine_name FROM information_schema.role_routine_grants "
+                    "WHERE grantee = 'sourcing_maintenance' "
+                    "AND routine_name LIKE 'maintenance_%enrichment_dispatch%'"
+                )
+            )
+        )
+    assert table_grants == []
+    assert routines == {
+        "maintenance_claim_pending_enrichment_dispatches",
+        "maintenance_complete_enrichment_dispatch",
+        "maintenance_release_enrichment_dispatch",
+    }
+
+    assert API_DATABASE_URL is not None
+    api_engine = create_engine(API_DATABASE_URL)
+    with Session(api_engine) as session, pytest.raises(ProgrammingError):
+        session.execute(
+            text("SELECT * FROM maintenance_claim_pending_enrichment_dispatches(1)")
+        ).all()
+    api_engine.dispose()
+
+
+def test_concurrent_claimers_receive_distinct_enrichment_requests(
+    owner_engine: Engine,
+) -> None:
+    expected = {
+        _seed_pending_enrichment(owner_engine).id,
+        _seed_pending_enrichment(owner_engine).id,
+    }
+    barrier = threading.Barrier(2)
+    outcomes: queue.Queue[object] = queue.Queue()
+
+    def claim() -> None:
+        barrier.wait(timeout=5)
+        try:
+            outcomes.put(_claim_one_enrichment()[0])
+        except Exception as error:  # noqa: BLE001 - thread result is asserted
+            outcomes.put(error)
+
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    claimed = {outcomes.get_nowait(), outcomes.get_nowait()}
+    assert not any(isinstance(item, Exception) for item in claimed), claimed
+    assert claimed == expected
+
+
+def test_concurrent_browser_intents_bind_one_request_and_one_publisher(
+    owner_engine: Engine,
+) -> None:
+    request, run_candidate_id, context = _seed_active_on_demand_request(owner_engine)
+    barrier = threading.Barrier(2)
+    outcomes: queue.Queue[object] = queue.Queue()
+
+    def queue_intent(suffix: str) -> None:
+        try:
+            barrier.wait(timeout=5)
+            with Session(owner_engine, expire_on_commit=False) as session:
+                outcome = SourcingService(
+                    session, b"dispatch-recovery"
+                ).queue_on_demand_enrichment(
+                    context,
+                    run_candidate_id,
+                    idempotency_key=f"concurrent-browser-{suffix}",
+                )
+                session.commit()
+                outcomes.put((outcome.request.id, outcome.claim_token))
+        except Exception as error:  # noqa: BLE001 - thread result is asserted
+            outcomes.put(error)
+
+    threads = [
+        threading.Thread(target=queue_intent, args=(suffix,))
+        for suffix in ("first", "second")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    observed = [outcomes.get_nowait(), outcomes.get_nowait()]
+    assert not any(isinstance(item, Exception) for item in observed), observed
+    requests = [item for item in observed if isinstance(item, tuple)]
+    assert {item[0] for item in requests} == {request.id}
+    assert sum(item[1] is not None for item in requests) == 1
+
+
 def test_periodic_recovery_handles_no_client_retry_and_crash_after_publish(
     owner_engine: Engine,
 ) -> None:
@@ -292,6 +483,43 @@ def test_periodic_recovery_handles_no_client_retry_and_crash_after_publish(
     assert published == [f"sourcing-plan-{run.id}"] * 2
     with Session(owner_engine) as session:
         recovered = session.get(SourcingRun, run.id)
+        assert recovered is not None
+        assert recovered.dispatch_pending is False
+        assert recovered.dispatch_claimed_at is None
+        assert recovered.dispatch_claim_token is None
+
+
+def test_enrichment_periodic_recovery_handles_no_client_retry_and_crash(
+    owner_engine: Engine,
+) -> None:
+    assert MAINTENANCE_DATABASE_URL is not None
+    request = _seed_pending_enrichment(owner_engine)
+    first_claim = _claim_one_enrichment()
+    assert first_claim[0] == request.id
+    first_key = first_claim[4]
+
+    with owner_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE enrichment_requests SET dispatch_claimed_at = :stale "
+                "WHERE id = :request_id"
+            ),
+            {
+                "stale": datetime.now(UTC) - timedelta(minutes=6),
+                "request_id": request.id,
+            },
+        )
+
+    published: list[str] = [first_key]
+    result = recover_pending_enrichment_dispatches(
+        MAINTENANCE_DATABASE_URL,
+        lambda claim: published.append(claim.dispatch_key),
+    )
+
+    assert result.published == 1
+    assert published == [f"enrichment-request-{request.id}"] * 2
+    with Session(owner_engine) as session:
+        recovered = session.get(EnrichmentRequest, request.id)
         assert recovered is not None
         assert recovered.dispatch_pending is False
         assert recovered.dispatch_claimed_at is None

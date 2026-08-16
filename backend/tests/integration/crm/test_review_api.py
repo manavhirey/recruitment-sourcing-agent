@@ -4,11 +4,16 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.audit.models import AuditEvent
-from app.candidates.models import Candidate
+from app.candidates.models import (
+    Candidate,
+    CandidateExperience,
+    CandidateFieldProvenance,
+    SourceIdentity,
+)
 from app.crm.models import ActivityEvent, CandidateNote, CandidateStage, JobCandidate
 from app.crm.service import CrmService
 from app.identity.schemas import RequestContext, Role
-from app.jobs.models import Job, ScorecardVersion
+from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
 from app.sourcing.models import SourcingRun
 from app.sourcing.state_machine import RunState
 
@@ -74,6 +79,102 @@ def test_ranked_review_routes_apply_all_filters_and_stable_score_cursor(
         ]
 
 
+def test_near_match_list_exposes_only_safe_mandatory_gap_summaries(crm_api) -> None:
+    with Session(crm_api["engine"]) as session:
+        row = session.get(JobCandidate, crm_api["formula_row_id"])
+        assert row is not None
+        session.add_all(
+            (
+                ScorecardCriterionRecord(
+                    tenant_id=crm_api["tenant_id"],
+                    scorecard_version_id=row.scorecard_version_id,
+                    position=0,
+                    key="payments",
+                    label="Payments experience",
+                    kind="must_have",
+                    evidence_required=False,
+                    source_text="private job description text",
+                    inferred=False,
+                    recruiter_entered=False,
+                    lawful_requirement_confirmed=False,
+                ),
+                ScorecardCriterionRecord(
+                    tenant_id=crm_api["tenant_id"],
+                    scorecard_version_id=row.scorecard_version_id,
+                    position=1,
+                    key="work_eligibility",
+                    label="Work eligibility",
+                    kind="must_have",
+                    evidence_required=True,
+                    source_text="private eligibility text",
+                    inferred=False,
+                    recruiter_entered=False,
+                    lawful_requirement_confirmed=True,
+                ),
+            )
+        )
+        row.score_json = {
+            "total": 70,
+            "criteria": [
+                {
+                    "key": "payments",
+                    "label": "Payments experience",
+                    "state": "failed",
+                    "summary": "Missing required payments experience",
+                    "evidence": ["provider-private-evidence"],
+                    "source_refs": ["provider:private:1"],
+                },
+                {
+                    "key": "work_eligibility",
+                    "label": "Work eligibility",
+                    "state": "unknown",
+                    "summary": "Work eligibility is unknown",
+                    "evidence": [],
+                    "source_refs": [],
+                },
+                {
+                    "key": "optional_unknown",
+                    "label": "Optional unknown",
+                    "state": "unknown",
+                    "summary": "Optional evidence is unknown",
+                    "evidence": [],
+                    "source_refs": [],
+                },
+            ],
+            "failed_must_haves": ["payments"],
+            "unknown_keys": ["optional_unknown", "work_eligibility"],
+            "provider_body": {"secret": "never-return"},
+        }
+        session.commit()
+
+    response = crm_api["api"].get(
+        f"/api/v1/jobs/{crm_api['job_id']}/candidates",
+        headers=crm_api["headers"],
+        params={"classification": "near_match"},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["score_json"] is None
+    assert item["mandatory_gaps"] == [
+        {
+            "key": "payments",
+            "label": "Payments experience",
+            "state": "failed",
+            "summary": "Stored evidence does not support Payments experience.",
+        },
+        {
+            "key": "work_eligibility",
+            "label": "Work eligibility",
+            "state": "unknown",
+            "summary": "Evidence for Work eligibility is unknown.",
+        },
+    ]
+    assert "provider-private-evidence" not in response.text
+    assert "private job description text" not in response.text
+    assert "never-return" not in response.text
+
+
 def test_detail_masks_contact_and_hidden_resources_return_same_not_found(
     crm_api,
 ) -> None:
@@ -109,6 +210,151 @@ def test_detail_masks_contact_and_hidden_resources_return_same_not_found(
         == hidden_job.json()
         == {"detail": {"code": "job_candidate_not_found"}}
     )
+
+
+def test_detail_returns_normalized_experience_provenance_notes_and_run_candidate_id(
+    crm_api,
+) -> None:
+    observed_at = datetime(2026, 8, 10, tzinfo=UTC)
+    with Session(crm_api["engine"]) as session:
+        row = session.get(JobCandidate, crm_api["priya_row_id"])
+        assert row is not None
+        run = SourcingRun(
+            tenant_id=crm_api["tenant_id"],
+            job_id=row.job_id,
+            scorecard_version_id=row.scorecard_version_id,
+            started_by_user_id=crm_api["recruiter_id"],
+            state=RunState.READY,
+            current_stage=RunState.READY.value,
+        )
+        session.add(run)
+        session.flush()
+        row.latest_run_id = run.id
+        from app.sourcing.models import RunCandidate
+
+        run_candidate = RunCandidate(
+            tenant_id=crm_api["tenant_id"],
+            run_id=run.id,
+            candidate_id=row.candidate_id,
+            scorecard_version_id=row.scorecard_version_id,
+            match_score=row.score,
+            classification=row.classification,
+            scoring_version=row.scoring_version,
+            enrichment_status="available",
+        )
+        source = SourceIdentity(
+            tenant_id=crm_api["tenant_id"],
+            candidate_id=row.candidate_id,
+            provider="apollo",
+            provider_person_id="provider-private-id",
+            source_timestamp=observed_at,
+            confidence=0.9,
+        )
+        session.add_all((run_candidate, source))
+        session.flush()
+        session.add_all(
+            (
+                CandidateExperience(
+                    tenant_id=crm_api["tenant_id"],
+                    candidate_id=row.candidate_id,
+                    source_identity_id=source.id,
+                    position=0,
+                    title="Senior Product Manager",
+                    company_name="PayFlow",
+                    start_date="2021-01",
+                    end_date=None,
+                    provider="apollo",
+                    source_timestamp=observed_at,
+                    observed_value_hash="a" * 64,
+                    confidence=0.9,
+                ),
+                CandidateFieldProvenance(
+                    tenant_id=crm_api["tenant_id"],
+                    candidate_id=row.candidate_id,
+                    source_identity_id=source.id,
+                    field_name="current_title",
+                    provider="apollo",
+                    source_timestamp=observed_at,
+                    observed_value_hash="b" * 64,
+                    confidence=0.9,
+                    is_current=True,
+                ),
+                CandidateNote(
+                    tenant_id=crm_api["tenant_id"],
+                    job_candidate_id=row.id,
+                    actor_user_id=crm_api["recruiter_id"],
+                    body="Strong payments discovery examples.",
+                ),
+            )
+        )
+        session.commit()
+        run_candidate_id = run_candidate.id
+
+    response = crm_api["api"].get(
+        f"/api/v1/job-candidates/{crm_api['priya_row_id']}",
+        headers=crm_api["headers"],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_candidate_id"] == str(run_candidate_id)
+    assert payload["experiences"] == [
+        {
+            "title": "Senior Product Manager",
+            "company_name": "PayFlow",
+            "start_date": "2021-01",
+            "end_date": None,
+            "provider": "apollo",
+            "source_timestamp": observed_at.isoformat().replace("+00:00", "Z"),
+        }
+    ]
+    assert payload["provenance"] == [
+        {
+            "field_name": "current_title",
+            "provider": "apollo",
+            "source_timestamp": observed_at.isoformat().replace("+00:00", "Z"),
+        }
+    ]
+    assert payload["notes"][0]["body"] == "Strong payments discovery examples."
+    assert "provider-private-id" not in response.text
+    assert "observed_value_hash" not in response.text
+
+
+def test_activity_response_allowlists_actions_and_omits_stored_payloads(crm_api) -> None:
+    with Session(crm_api["engine"]) as session:
+        session.add_all(
+            (
+                ActivityEvent(
+                    tenant_id=crm_api["tenant_id"],
+                    job_candidate_id=crm_api["priya_row_id"],
+                    actor_user_id=crm_api["recruiter_id"],
+                    event_key="safe-action-with-private-payload",
+                    action="candidate.stage_changed",
+                    payload={"provider_error": "private-error", "token": "secret"},
+                ),
+                ActivityEvent(
+                    tenant_id=crm_api["tenant_id"],
+                    job_candidate_id=crm_api["priya_row_id"],
+                    actor_user_id=crm_api["recruiter_id"],
+                    event_key="private-action",
+                    action="provider.raw_response_received",
+                    payload={"body": "private-provider-body"},
+                ),
+            )
+        )
+        session.commit()
+
+    response = crm_api["api"].get(
+        f"/api/v1/job-candidates/{crm_api['priya_row_id']}/activity",
+        headers=crm_api["headers"],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["action"] == "candidate.stage_changed"
+    assert set(response.json()["items"][0]) == {"id", "action", "created_at"}
+    assert "provider.raw_response_received" not in response.text
+    assert "private-error" not in response.text
+    assert "private-provider-body" not in response.text
 
 
 def test_mutations_require_idempotency_replay_and_append_actor_activity(

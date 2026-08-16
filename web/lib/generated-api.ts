@@ -103,6 +103,23 @@ export interface paths {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/api/v1/clients/{client_id}/grants/{membership_id}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        readonly post?: never;
+        /** Revoke Client Access */
+        readonly delete: operations["revoke_client_access_api_v1_clients__client_id__grants__membership_id__delete"];
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/api/v1/clients/{client_id}/industries": {
         readonly parameters: {
             readonly query?: never;
@@ -376,6 +393,23 @@ export interface paths {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/api/v1/jobs/{job_id}/runs/latest": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Get Latest Run */
+        readonly get: operations["get_latest_run_api_v1_jobs__job_id__runs_latest_get"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/api/v1/jobs/{job_id}/scorecard/confirm": {
         readonly parameters: {
             readonly query?: never;
@@ -530,7 +564,7 @@ export interface paths {
         readonly patch?: never;
         readonly trace?: never;
     };
-    readonly "/api/v1/membership-invitations/{token}/claim": {
+    readonly "/api/v1/membership-invitations/claim": {
         readonly parameters: {
             readonly query?: never;
             readonly header?: never;
@@ -540,7 +574,7 @@ export interface paths {
         readonly get?: never;
         readonly put?: never;
         /** Claim Invitation */
-        readonly post: operations["claim_invitation_api_v1_membership_invitations__token__claim_post"];
+        readonly post: operations["claim_invitation_api_v1_membership_invitations_claim_post"];
         readonly delete?: never;
         readonly options?: never;
         readonly head?: never;
@@ -814,11 +848,6 @@ export interface components {
             /** Action */
             readonly action: string;
             /**
-             * Actor User Id
-             * Format: uuid
-             */
-            readonly actor_user_id: string;
-            /**
              * Created At
              * Format: date-time
              */
@@ -828,20 +857,6 @@ export interface components {
              * Format: uuid
              */
             readonly id: string;
-            /**
-             * Job Candidate Id
-             * Format: uuid
-             */
-            readonly job_candidate_id: string;
-            /** Payload */
-            readonly payload: {
-                readonly [key: string]: unknown;
-            };
-            /**
-             * Updated At
-             * Format: date-time
-             */
-            readonly updated_at: string;
         };
         /** CandidateDirectoryItem */
         readonly CandidateDirectoryItem: {
@@ -875,6 +890,24 @@ export interface components {
             /** Next Cursor */
             readonly next_cursor: string | null;
         };
+        /** CandidateExperienceView */
+        readonly CandidateExperienceView: {
+            /** Company Name */
+            readonly company_name: string | null;
+            /** End Date */
+            readonly end_date: string | null;
+            /** Provider */
+            readonly provider: string;
+            /**
+             * Source Timestamp
+             * Format: date-time
+             */
+            readonly source_timestamp: string;
+            /** Start Date */
+            readonly start_date: string | null;
+            /** Title */
+            readonly title: string | null;
+        };
         /** CandidateJobView */
         readonly CandidateJobView: {
             /** Classification */
@@ -899,6 +932,18 @@ export interface components {
              * Format: date-time
              */
             readonly updated_at: string;
+        };
+        /** CandidateProvenanceView */
+        readonly CandidateProvenanceView: {
+            /** Field Name */
+            readonly field_name: string;
+            /** Provider */
+            readonly provider: string;
+            /**
+             * Source Timestamp
+             * Format: date-time
+             */
+            readonly source_timestamp: string;
         };
         /**
          * CandidateStage
@@ -1122,6 +1167,15 @@ export interface components {
             readonly current_company: string | null;
             /** Current Title */
             readonly current_title: string | null;
+            /**
+             * Enrichment Eligible
+             * @default false
+             */
+            readonly enrichment_eligible: boolean;
+            /** Estimated Enrichment Credits */
+            readonly estimated_enrichment_credits?: number | null;
+            /** Experiences */
+            readonly experiences?: readonly components["schemas"]["CandidateExperienceView"][] | null;
             /** Full Name */
             readonly full_name: string;
             /** Has Contact */
@@ -1138,18 +1192,28 @@ export interface components {
             readonly job_id: string;
             /** Location */
             readonly location: string | null;
+            /** Mandatory Gaps */
+            readonly mandatory_gaps?: readonly components["schemas"]["MandatoryGapView"][];
+            /** Notes */
+            readonly notes?: readonly components["schemas"]["NoteResponse"][] | null;
             /** Owner User Id */
             readonly owner_user_id: string | null;
+            /** Provenance */
+            readonly provenance?: readonly components["schemas"]["CandidateProvenanceView"][] | null;
             /** Rejection Note */
             readonly rejection_note: string | null;
             /** Rejection Reason Code */
             readonly rejection_reason_code: string | null;
+            /** Run Candidate Id */
+            readonly run_candidate_id?: string | null;
             /** Score */
             readonly score: number;
             /** Score Json */
             readonly score_json?: {
                 readonly [key: string]: unknown;
             } | null;
+            /** Scorecard Version */
+            readonly scorecard_version?: number | null;
             /**
              * Scorecard Version Id
              * Format: uuid
@@ -1257,6 +1321,20 @@ export interface components {
             readonly status: string;
             /** Title */
             readonly title: string;
+        };
+        /** MandatoryGapView */
+        readonly MandatoryGapView: {
+            /** Key */
+            readonly key: string;
+            /** Label */
+            readonly label: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            readonly state: "failed" | "unknown";
+            /** Summary */
+            readonly summary: string;
         };
         /** MaskedContact */
         readonly MaskedContact: {
@@ -1488,29 +1566,18 @@ export interface components {
         readonly RunActivityResponse: {
             /** Action */
             readonly action: string;
-            /** Actor User Id */
-            readonly actor_user_id: string | null;
             /**
              * Created At
              * Format: date-time
              */
             readonly created_at: string;
             /**
-             * Entity Id
-             * Format: uuid
-             */
-            readonly entity_id: string;
-            /** Entity Type */
-            readonly entity_type: string;
-            /**
              * Id
              * Format: uuid
              */
             readonly id: string;
-            /** Payload */
-            readonly payload: {
-                readonly [key: string]: unknown;
-            };
+            /** Summary */
+            readonly summary: string | null;
         };
         /** RunResponse */
         readonly RunResponse: {
@@ -1531,10 +1598,14 @@ export interface components {
             readonly created_at: string;
             /** Current Stage */
             readonly current_stage: string;
+            /** Enriched Count */
+            readonly enriched_count: number;
             /** Error Code */
             readonly error_code: string | null;
             /** Error Message */
             readonly error_message: string | null;
+            /** Failed Count */
+            readonly failed_count: number;
             /**
              * Id
              * Format: uuid
@@ -1918,6 +1989,36 @@ export interface operations {
                 content: {
                     readonly "application/json": components["schemas"]["ClientGrantResponse"];
                 };
+            };
+            /** @description Validation Error */
+            readonly 422: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    readonly revoke_client_access_api_v1_clients__client_id__grants__membership_id__delete: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly client_id: string;
+                readonly membership_id: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Successful Response */
+            readonly 204: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             readonly 422: {
@@ -2505,6 +2606,37 @@ export interface operations {
             };
         };
     };
+    readonly get_latest_run_api_v1_jobs__job_id__runs_latest_get: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly job_id: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Successful Response */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["RunResponse"];
+                };
+            };
+            /** @description Validation Error */
+            readonly 422: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     readonly confirm_scorecard_api_v1_jobs__job_id__scorecard_confirm_post: {
         readonly parameters: {
             readonly query?: never;
@@ -2809,16 +2941,20 @@ export interface operations {
             };
         };
     };
-    readonly claim_invitation_api_v1_membership_invitations__token__claim_post: {
+    readonly claim_invitation_api_v1_membership_invitations_claim_post: {
         readonly parameters: {
             readonly query?: never;
             readonly header?: never;
-            readonly path: {
-                readonly token: string;
-            };
+            readonly path?: never;
             readonly cookie?: never;
         };
-        readonly requestBody?: never;
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": {
+                    readonly token: string;
+                };
+            };
+        };
         readonly responses: {
             /** @description Successful Response */
             readonly 200: {
@@ -2827,15 +2963,6 @@ export interface operations {
                 };
                 content: {
                     readonly "application/json": components["schemas"]["MembershipResponse"];
-                };
-            };
-            /** @description Validation Error */
-            readonly 422: {
-                headers: {
-                    readonly [name: string]: unknown;
-                };
-                content: {
-                    readonly "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

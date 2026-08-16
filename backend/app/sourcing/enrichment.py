@@ -99,6 +99,11 @@ class SubmittedEnrichment:
     capability_token: str = field(repr=False)
 
 
+@dataclass(frozen=True)
+class DeferredEnrichment:
+    retry_after_seconds: int
+
+
 def stable_top_candidate_ids(
     candidates: Iterable[tuple[UUID, int | None, str | None]], *, limit: int = 50
 ) -> list[UUID]:
@@ -341,7 +346,7 @@ def execute_queued_enrichment_request(
     snapshot_store: SnapshotStore,
     policy: RegionalContactPolicy,
     token_codec: CapabilityTokenCodec,
-) -> SubmittedEnrichment | None:
+) -> SubmittedEnrichment | DeferredEnrichment | None:
     if not callback_base_url.startswith("https://"):
         raise ValueError("callback base URL must use HTTPS")
     with _tenant_session(session_factory, context.tenant_id) as session:
@@ -358,6 +363,18 @@ def execute_queued_enrichment_request(
         if enrichment.status in ("pending", "completed", "failed", "cancelled"):
             return None
         if enrichment.status == "submitting":
+            deadline = enrichment.stage_deadline
+            if deadline is not None and deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=UTC)
+            remaining = (
+                (deadline - datetime.now(UTC)).total_seconds()
+                if deadline is not None
+                else 0
+            )
+            if remaining > 0:
+                return DeferredEnrichment(
+                    retry_after_seconds=max(1, int(remaining) + 1)
+                )
             enrichment.status = "failed"
             enrichment.error_code = "ambiguous_provider_submission"
             enrichment.completed_at = datetime.now(UTC)

@@ -1,7 +1,7 @@
 import { z } from "zod"
 import { describe, expect, it, vi } from "vitest"
 
-import { handleBffMutation } from "@/lib/bff"
+import { handleBffMutation, handleBffRead, handleBffStream } from "@/lib/bff"
 
 const tenantId = "00000000-0000-4000-8000-000000000001"
 
@@ -46,6 +46,7 @@ describe("BFF mutation boundary", () => {
     })
 
     expect(response.status).toBe(200)
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store")
     expect(callApi).toHaveBeenCalledWith(
       "/api/v1/clients",
       tenantId,
@@ -129,6 +130,79 @@ describe("BFF mutation boundary", () => {
     })
 
     expect(response.status).toBe(413)
+    expect(callApi).not.toHaveBeenCalled()
+  })
+})
+
+describe("BFF read and stream boundaries", () => {
+  it("reads only through the signed selected tenant and sets no-store", async () => {
+    const callApi = vi.fn().mockResolvedValue({ items: [], next_cursor: null })
+    const response = await handleBffRead({
+      path: "/api/v1/candidates?limit=25",
+      readTenant: async () => tenantId,
+      callApi,
+    })
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store")
+    expect(callApi).toHaveBeenCalledWith(
+      "/api/v1/candidates?limit=25",
+      tenantId,
+    )
+  })
+
+  it("streams CSV without buffering and forwards cancellation", async () => {
+    let upstreamCancelled = false
+    const upstream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new TextEncoder().encode("candidate_id,name\r\n"))
+      },
+      cancel() {
+        upstreamCancelled = true
+      },
+    })
+    const response = await handleBffStream(
+      new Request("https://sourcing.example.com/api/bff/jobs/job/export", {
+        headers: {
+          "Idempotency-Key": "export-intent",
+          Origin: "https://sourcing.example.com",
+          "Sec-Fetch-Site": "same-origin",
+        },
+      }),
+      {
+        appUrl: "https://sourcing.example.com",
+        path: "/api/v1/jobs/00000000-0000-4000-8000-000000000101/export.csv",
+        filename: "shortlist.csv",
+        readTenant: async () => tenantId,
+        callApi: vi.fn().mockResolvedValue(upstream),
+      },
+    )
+
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store")
+    expect(response.headers.get("Content-Type")).toBe("text/csv; charset=utf-8")
+    await response.body?.cancel()
+    expect(upstreamCancelled).toBe(true)
+  })
+
+  it("rejects cross-origin export and a missing stable intent key", async () => {
+    const callApi = vi.fn()
+    const response = await handleBffStream(
+      new Request("https://sourcing.example.com/api/bff/jobs/job/export", {
+        headers: {
+          Origin: "https://evil.example",
+          "Sec-Fetch-Site": "cross-site",
+        },
+      }),
+      {
+        appUrl: "https://sourcing.example.com",
+        path: "/api/v1/jobs/00000000-0000-4000-8000-000000000101/export.csv",
+        filename: "shortlist.csv",
+        readTenant: async () => tenantId,
+        callApi,
+      },
+    )
+
+    expect(response.status).toBe(403)
     expect(callApi).not.toHaveBeenCalled()
   })
 })

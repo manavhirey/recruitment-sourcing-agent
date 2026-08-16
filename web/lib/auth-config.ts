@@ -163,6 +163,7 @@ export function buildAuthOptions(
         id: "oidc",
         name: "Company identity",
         type: "oidc",
+        issuer: issuer.href,
         wellKnown: new URL(".well-known/openid-configuration", issuerBase).href,
         clientId: values.OIDC_CLIENT_ID,
         clientSecret: values.OIDC_CLIENT_SECRET,

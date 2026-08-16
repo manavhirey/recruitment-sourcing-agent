@@ -1,10 +1,11 @@
 import hashlib
+import threading
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.identity.models import (
     IdentityIdempotencyKey,
@@ -13,7 +14,7 @@ from app.identity.models import (
     User,
 )
 from app.identity.schemas import IdentityClaims, Role
-from app.identity.service import TenantService
+from app.identity.service import MembershipService, TenantService
 
 
 def test_tenant_row_policy_hides_other_tenant(session, tenant_factory) -> None:
@@ -180,3 +181,75 @@ def test_migration_owner_can_provision_through_forced_policies(owner_engine) -> 
             )
             connection.execute(text("DELETE FROM tenants WHERE slug = 'provisioned'"))
             connection.execute(text(f"DROP ROLE {migration_role}"))
+
+
+def test_concurrent_invites_leave_only_one_current_link(
+    owner_engine, owner_session: Session
+) -> None:
+    suffix = uuid4().hex
+    tenant = TenantService(owner_session).provision(
+        f"concurrent-invites-{suffix[:8]}",
+        IdentityClaims(
+            subject=f"oidc|concurrent-owner-{suffix}",
+            email="owner@concurrent.test",
+            name="Concurrent Owner",
+            email_verified=True,
+        ),
+    )
+    owner = owner_session.scalar(select(User).where(User.oidc_subject.endswith(suffix)))
+    assert owner is not None
+    tenant_id = tenant.id
+    owner_id = owner.id
+    owner_session.commit()
+
+    barrier = threading.Barrier(2)
+    failures: list[BaseException] = []
+    invitation_ids = []
+
+    class OverlappingMembershipService(MembershipService):
+        def _lock_invitation_email(
+            self, tenant_id: UUID, normalized_email: str
+        ) -> None:
+            barrier.wait(timeout=5)
+            super()._lock_invitation_email(tenant_id, normalized_email)
+
+    def issue_invitation(index: int) -> None:
+        factory = sessionmaker(bind=owner_engine, expire_on_commit=False)
+        try:
+            with factory.begin() as worker_session:
+                invitation, _ = OverlappingMembershipService(
+                    worker_session, b"invitation-key"
+                ).invite(
+                    tenant_id=tenant_id,
+                    intended_email="Recruiter@Concurrent.test",
+                    role=Role.RECRUITER if index == 0 else Role.ADMIN,
+                    created_by_user_id=owner_id,
+                    idempotency_key=f"concurrent-invite-{index}",
+                )
+                invitation_ids.append(invitation.id)
+        except Exception as error:  # noqa: BLE001 - worker errors are asserted centrally
+            failures.append(error)
+
+    threads = [
+        threading.Thread(target=issue_invitation, args=(index,)) for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert failures == []
+    assert len(invitation_ids) == 2
+    current_count = owner_session.scalar(
+        select(func.count())
+        .select_from(MembershipInvitation)
+        .where(
+            MembershipInvitation.tenant_id == tenant_id,
+            MembershipInvitation.intended_email == "recruiter@concurrent.test",
+            MembershipInvitation.claimed_at.is_(None),
+            MembershipInvitation.expires_at > datetime.now(UTC),
+        )
+    )
+
+    assert current_count == 1

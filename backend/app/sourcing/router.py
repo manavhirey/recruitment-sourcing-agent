@@ -23,10 +23,81 @@ from app.sourcing.schemas import (
     StartRunRequest,
 )
 from app.sourcing.service import SourcingError, SourcingService
+from app.sourcing.state_machine import RunState
 
 router = APIRouter(tags=["sourcing"])
 SourcingDispatcher = Callable[[UUID, UUID, UUID, str], None]
-EnrichmentDispatcher = Callable[[UUID, UUID, UUID], None]
+EnrichmentDispatcher = Callable[[UUID, UUID, UUID, str], None]
+
+_PUBLIC_RUN_ERRORS = {
+    "usage_budget_exhausted": "The configured sourcing usage budget was exhausted.",
+    "provider_search_failed": "The sourcing provider could not complete the search.",
+    "no_usable_results": "The provider returned no usable candidates.",
+}
+_PUBLIC_ACTIVITY_ACTIONS = frozenset(
+    {
+        "sourcing_run.started",
+        "sourcing_run.cancelled",
+        "sourcing_run.usage_budget_exhausted",
+        "sourcing_run.planned",
+        "sourcing_run.source_completed",
+        "sourcing_run.matched",
+        "sourcing_run.enrichment_applied",
+        "candidate.match_materialized",
+        "candidate.match_rescored",
+        "candidate.stage_changed",
+        "candidate.note_added",
+        "candidate.owner_changed",
+        "candidate.tags_changed",
+        "candidate.contact_revealed",
+        "candidate.enrichment_queued",
+        "candidate.shortlist_exported",
+    }
+)
+
+
+def _run_activity_summary(event: object) -> str | None:
+    action = getattr(event, "action", "")
+    payload = getattr(event, "payload", {})
+    if not isinstance(payload, dict):
+        return None
+
+    def count(name: str) -> int | None:
+        value = payload.get(name)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    state_value = payload.get("state")
+    state = state_value.replace("_", " ") if isinstance(state_value, str) and state_value in {item.value for item in RunState} else None
+    if action == "sourcing_run.planned":
+        query_count = count("query_count")
+        return f"{query_count} provider queries planned" if query_count is not None else None
+    if action == "sourcing_run.source_completed":
+        candidate_count = count("candidate_count")
+        return " · ".join(
+            value for value in (
+                f"{candidate_count} candidates sourced" if candidate_count is not None else None,
+                state,
+            ) if value
+        ) or None
+    if action == "sourcing_run.matched":
+        matched_count = count("matched_count")
+        return " · ".join(
+            value for value in (
+                f"{matched_count} candidates matched" if matched_count is not None else None,
+                state,
+            ) if value
+        ) or None
+    if action == "sourcing_run.enrichment_applied":
+        candidate_count = count("candidate_count")
+        source = payload.get("source")
+        delivery = source if source in {"webhook", "poll"} else None
+        return " · ".join(
+            value for value in (
+                f"{candidate_count} candidates enriched" if candidate_count is not None else None,
+                f"{delivery} delivery" if delivery else None,
+            ) if value
+        ) or None
+    return None
 
 
 def get_sourcing_dispatcher(request: Request) -> SourcingDispatcher:
@@ -55,6 +126,7 @@ def _raise_sourcing_error(error: SourcingError) -> NoReturn:
         "idempotency_conflict": status.HTTP_409_CONFLICT,
         "usage_reservation_conflict": status.HTTP_409_CONFLICT,
         "usage_reconciliation_conflict": status.HTTP_409_CONFLICT,
+        "enrichment_not_eligible": status.HTTP_409_CONFLICT,
     }.get(error.code, status.HTTP_400_BAD_REQUEST)
     raise HTTPException(status_code=status_code, detail={"code": error.code}) from error
 
@@ -62,6 +134,8 @@ def _raise_sourcing_error(error: SourcingError) -> NoReturn:
 def _run_response(
     service: SourcingService, context: RequestContext, run: SourcingRun
 ) -> RunResponse:
+    enriched_count, failed_count = service.result_counts(context, run.id)
+    public_error = _PUBLIC_RUN_ERRORS.get(run.error_code or "")
     return RunResponse(
         id=run.id,
         tenant_id=run.tenant_id,
@@ -71,10 +145,12 @@ def _run_response(
         current_stage=run.current_stage,
         candidate_count=run.candidate_count,
         matched_count=run.matched_count,
+        enriched_count=enriched_count,
+        failed_count=failed_count,
         cancellation_requested=run.cancellation_requested,
         budget_use=service.usage_totals(context, run.id),
-        error_code=run.error_code,
-        error_message=run.error_message,
+        error_code=run.error_code if public_error is not None else None,
+        error_message=public_error,
         created_at=_utc(run.created_at),
         started_at=_utc(run.started_at),
         completed_at=_utc(run.completed_at),
@@ -170,6 +246,21 @@ def get_run(
         _raise_sourcing_error(error)
 
 
+@router.get("/api/v1/jobs/{job_id}/runs/latest", response_model=RunResponse)
+def get_latest_run(
+    job_id: UUID,
+    context: Annotated[RequestContext, Depends(get_request_context)],
+    session: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> RunResponse:
+    service = _service(session, settings)
+    try:
+        run = service.latest_for_job(context, job_id)
+        return _run_response(service, context, run)
+    except SourcingError as error:
+        _raise_sourcing_error(error)
+
+
 @router.get(
     "/api/v1/runs/{run_id}/activity",
     response_model=list[RunActivityResponse],
@@ -189,13 +280,11 @@ def get_run_activity(
         RunActivityResponse(
             id=event.id,
             action=event.action,
-            entity_type=event.entity_type,
-            entity_id=event.entity_id,
-            actor_user_id=event.actor_user_id,
-            payload=event.payload,
+            summary=_run_activity_summary(event),
             created_at=_utc(event.created_at),
         )
         for event in events
+        if event.action in _PUBLIC_ACTIVITY_ACTIONS
     ]
 
 
@@ -249,11 +338,12 @@ def request_candidate_enrichment(
 ) -> EnrichmentRequestResponse:
     service = _service(session, settings)
     try:
-        enrichment, created = service.queue_on_demand_enrichment(
+        outcome = service.queue_on_demand_enrichment(
             context,
             run_candidate_id,
             idempotency_key=idempotency_key,
         )
+        enrichment = outcome.request
         response = EnrichmentRequestResponse(
             id=enrichment.id,
             run_id=enrichment.run_id,
@@ -262,6 +352,31 @@ def request_candidate_enrichment(
         session.commit()
     except SourcingError as error:
         _raise_sourcing_error(error)
-    if created:
-        dispatcher(enrichment.id, context.tenant_id, context.user_id)
+    if outcome.claim_token is not None:
+        requested_by = enrichment.dispatch_requested_by_user_id
+        if requested_by is None:  # pragma: no cover - protected by claim invariant
+            raise RuntimeError("claimed enrichment dispatch has no requester")
+        try:
+            dispatcher(
+                enrichment.id,
+                context.tenant_id,
+                requested_by,
+                f"enrichment-request-{enrichment.id}",
+            )
+        except Exception:
+            service.finish_enrichment_dispatch(
+                context,
+                enrichment.id,
+                outcome.claim_token,
+                published=False,
+            )
+            session.commit()
+            raise
+        service.finish_enrichment_dispatch(
+            context,
+            enrichment.id,
+            outcome.claim_token,
+            published=True,
+        )
+        session.commit()
     return response

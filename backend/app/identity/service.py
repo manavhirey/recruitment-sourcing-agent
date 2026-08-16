@@ -146,6 +146,24 @@ class MembershipService:
                 )
 
         issued_at = now or datetime.now(UTC)
+        self._lock_invitation_email(tenant_id, normalized_email)
+        active_membership = self._session.scalar(
+            select(Membership)
+            .join(User, User.id == Membership.user_id)
+            .where(
+                Membership.tenant_id == tenant_id,
+                User.email == normalized_email,
+                Membership.active.is_(True),
+            )
+            .with_for_update()
+        )
+        if active_membership is not None:
+            raise IdentityError("membership_already_active")
+        self._expire_pending_invitations(
+            tenant_id=tenant_id,
+            normalized_email=normalized_email,
+            invalidated_at=issued_at,
+        )
         bearer_token = (
             self._invitation_token(tenant_id, created_by_user_id, idempotency_key)
             if idempotency_key is not None
@@ -236,7 +254,7 @@ class MembershipService:
             select(Membership).where(
                 Membership.tenant_id == invitation.tenant_id,
                 Membership.user_id == user.id,
-            )
+            ).with_for_update()
         )
         if membership is None:
             membership = Membership(
@@ -245,6 +263,8 @@ class MembershipService:
                 role=invitation.role,
             )
             self._session.add(membership)
+        elif membership.active:
+            raise IdentityError("invitation_invalid")
         else:
             membership.role = invitation.role
             membership.active = True
@@ -279,6 +299,7 @@ class MembershipService:
             return MembershipResult.from_payload(idempotency_record.response_payload)
         if membership.role is Role.OWNER and role is not Role.OWNER:
             self._ensure_another_active_owner(membership)
+        self._invalidate_membership_invitations(membership)
         membership.role = role
         self._session.flush()
         result = MembershipResult.from_membership(membership)
@@ -307,6 +328,7 @@ class MembershipService:
             return MembershipResult.from_payload(idempotency_record.response_payload)
         if membership.role is Role.OWNER:
             self._ensure_another_active_owner(membership)
+        self._invalidate_membership_invitations(membership)
         membership.active = False
         self._session.flush()
         result = MembershipResult.from_membership(membership)
@@ -339,6 +361,51 @@ class MembershipService:
         )
         encoded_secret = base64.urlsafe_b64encode(secret).rstrip(b"=").decode()
         return f"{tenant_id}.{encoded_secret}"
+
+    def _lock_invitation_email(self, tenant_id: UUID, normalized_email: str) -> None:
+        if self._session.get_bind().dialect.name != "postgresql":
+            return
+        lock_hmac = self._namespaced_hmac(
+            "membership-invitation-email", f"{tenant_id}\0{normalized_email}"
+        )
+        lock_id = int.from_bytes(lock_hmac[:8], "big", signed=True)
+        self._session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_id)"),
+            {"lock_id": lock_id},
+        )
+
+    def _expire_pending_invitations(
+        self,
+        *,
+        tenant_id: UUID,
+        normalized_email: str,
+        invalidated_at: datetime,
+    ) -> None:
+        invitations = self._session.scalars(
+            select(MembershipInvitation)
+            .where(
+                MembershipInvitation.tenant_id == tenant_id,
+                MembershipInvitation.intended_email == normalized_email,
+                MembershipInvitation.claimed_at.is_(None),
+                MembershipInvitation.expires_at > invalidated_at,
+            )
+            .with_for_update()
+        ).all()
+        for invitation in invitations:
+            invitation.expires_at = invalidated_at
+
+    def _invalidate_membership_invitations(self, membership: Membership) -> None:
+        user = self._session.get(User, membership.user_id)
+        if user is None:
+            raise IdentityError("membership_user_missing")
+        normalized_email = normalize_email(user.email)
+        invalidated_at = datetime.now(UTC)
+        self._lock_invitation_email(membership.tenant_id, normalized_email)
+        self._expire_pending_invitations(
+            tenant_id=membership.tenant_id,
+            normalized_email=normalized_email,
+            invalidated_at=invalidated_at,
+        )
 
     def _membership_mutation_record(
         self,

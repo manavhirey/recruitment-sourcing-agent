@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation"
 
 import { AppShell } from "@/components/layout/AppShell"
+import { QueryProvider } from "@/components/layout/QueryProvider"
 import { ScorecardEditor } from "@/components/scorecards/ScorecardEditor"
 import type { ScorecardDraftResponse } from "@/lib/schemas"
 
@@ -51,57 +52,73 @@ const previewDraft: ScorecardDraftResponse = {
 export default async function DevelopmentPreview({
   searchParams,
 }: {
-  searchParams: Promise<{ view?: string }>
+  searchParams: Promise<{ view?: string; state?: string }>
 }) {
   if (process.env.NODE_ENV === "production" || process.env.ENABLE_DEV_PREVIEW !== "true") {
     notFound()
   }
-  const scorecard = (await searchParams).view === "scorecard"
+  const params = await searchParams
+  const scorecard = params.view === "scorecard"
+  const task13 = params.view === "task13"
+  const task13Directory = params.view === "task13-directory"
+  const task13Settings = params.view === "task13-settings"
+  const task13Preview = task13 || task13Directory || task13Settings
+    ? await import("@/components/dev/Task13Preview")
+    : null
+  const content = task13 && task13Preview
+    ? <task13Preview.Task13Preview startSourcing={params.state === "sourcing"} />
+    : task13Directory && task13Preview
+      ? <task13Preview.Task13DirectoryPreview />
+      : task13Settings && task13Preview
+        ? <task13Preview.Task13SettingsPreview role={params.state === "recruiter" ? "recruiter" : "owner"} />
+        : <div className="page-stack">
+          <header className="page-header">
+            <div>
+              <p className="eyebrow">Development preview</p>
+              <h1>{scorecard ? "Review scorecard" : "Jobs"}</h1>
+              <p>Deterministic, non-production visual QA data.</p>
+            </div>
+          </header>
+          {scorecard ? (
+            <ScorecardEditor
+              draft={previewDraft}
+              allowedIndustryCodes={["technology.fintech"]}
+            />
+          ) : (
+            <div className="empty-state">
+              <p className="eyebrow">Job pipeline</p>
+              <h2>Build a defensible shortlist from a clear brief.</h2>
+              <p>Review every inferred criterion before starting evidence-led sourcing.</p>
+              <a className="button button-primary" href="/dev-preview?view=scorecard">
+                Review preview scorecard
+              </a>
+            </div>
+          )}
+        </div>
   return (
-    <AppShell
-      agency={{ id: tenantId, name: "Northstar Search" }}
-      user={{ name: "Avery Stone", email: "avery@example.test" }}
-      role="owner"
-      tenantOptions={[
-        { id: tenantId, name: "Northstar Search" },
-        {
-          id: "00000000-0000-4000-8000-000000000002",
-          name: "Harbor Recruiting",
-        },
-      ]}
-      activeJobs={[
-        { id: jobId, title: "Senior Product Manager", status: "awaiting_scorecard" },
-        {
-          id: "00000000-0000-4000-8000-000000000102",
-          title: "Director of Partnerships",
-          status: "sourcing",
-        },
-      ]}
-    >
-      <div className="page-stack">
-        <header className="page-header">
-          <div>
-            <p className="eyebrow">Development preview</p>
-            <h1>{scorecard ? "Review scorecard" : "Jobs"}</h1>
-            <p>Deterministic, non-production visual QA data.</p>
-          </div>
-        </header>
-        {scorecard ? (
-          <ScorecardEditor
-            draft={previewDraft}
-            allowedIndustryCodes={["technology.fintech"]}
-          />
-        ) : (
-          <div className="empty-state">
-            <p className="eyebrow">Job pipeline</p>
-            <h2>Build a defensible shortlist from a clear brief.</h2>
-            <p>Review every inferred criterion before starting evidence-led sourcing.</p>
-            <a className="button button-primary" href="/dev-preview?view=scorecard">
-              Review preview scorecard
-            </a>
-          </div>
-        )}
-      </div>
-    </AppShell>
+    <QueryProvider>
+      <AppShell
+        agency={{ id: tenantId, name: "Northstar Search" }}
+        user={{ name: "Avery Stone", email: "avery@example.test" }}
+        role="owner"
+        tenantOptions={[
+          { id: tenantId, name: "Northstar Search" },
+          {
+            id: "00000000-0000-4000-8000-000000000002",
+            name: "Harbor Recruiting",
+          },
+        ]}
+        activeJobs={[
+          { id: jobId, title: "Senior Product Manager", status: "awaiting_scorecard" },
+          {
+            id: "00000000-0000-4000-8000-000000000102",
+            title: "Director of Partnerships",
+            status: "sourcing",
+          },
+        ]}
+      >
+        {content}
+      </AppShell>
+    </QueryProvider>
   )
 }

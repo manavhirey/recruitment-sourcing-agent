@@ -233,6 +233,53 @@ class ClientService:
         self._complete(record, result.to_payload())
         return result
 
+    def revoke_access(
+        self,
+        context: RequestContext,
+        client_id: UUID,
+        membership_id: UUID,
+        idempotency_key: str,
+    ) -> None:
+        self.get_authorized(context, client_id)
+        record = self._begin(
+            context,
+            f"revoke_client_access:{client_id}",
+            idempotency_key,
+            {"membership_id": str(membership_id)},
+        )
+        if record.response_payload is not None:
+            return
+        membership = self.session.scalar(
+            select(Membership)
+            .where(
+                Membership.id == membership_id,
+                Membership.tenant_id == context.tenant_id,
+                Membership.role == Role.RECRUITER,
+            )
+            .with_for_update()
+        )
+        if membership is None:
+            raise ClientError("recruiter_not_found")
+        grant = self.session.scalar(
+            select(ClientGrant).where(
+                ClientGrant.tenant_id == context.tenant_id,
+                ClientGrant.client_id == client_id,
+                ClientGrant.membership_id == membership_id,
+            )
+        )
+        if grant is not None:
+            self.session.delete(grant)
+        membership.allowed_client_ids = sorted(
+            value
+            for value in (membership.allowed_client_ids or [])
+            if value != str(client_id)
+        )
+        self.session.flush()
+        self._complete(
+            record,
+            {"client_id": str(client_id), "membership_id": str(membership_id)},
+        )
+
     def industries_for(self, client: ClientCompany) -> list[str]:
         return sorted(
             self.session.scalars(

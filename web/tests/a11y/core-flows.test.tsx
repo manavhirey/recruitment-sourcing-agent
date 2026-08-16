@@ -2,10 +2,14 @@ import { render } from "@testing-library/react"
 import axe from "axe-core"
 
 import { ClientManager } from "@/components/clients/ClientManager"
+import { ReviewWorkspace } from "@/components/candidates/ReviewWorkspace"
 import { JobIntakeForm } from "@/components/jobs/JobIntakeForm"
+import { AgencyAlerts } from "@/components/layout/AgencyAlerts"
 import { AppShell } from "@/components/layout/AppShell"
 import { ScorecardEditor } from "@/components/scorecards/ScorecardEditor"
 import { authorizedClientsFixture, scorecardDraftFixture } from "@/tests/fixtures"
+import { priyaCandidateFixture } from "@/tests/review-fixtures"
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 
 async function expectNoAxeViolations(container: HTMLElement) {
   const result = await axe.run(container, {
@@ -54,6 +58,28 @@ describe("core flow accessibility", () => {
         <h1>Clients</h1>
         <ClientManager clients={authorizedClientsFixture} role="admin" />
       </main>,
+    )
+
+    await expectNoAxeViolations(container)
+  })
+
+  it("keeps the evidence workspace and tenant alerts free of axe violations", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { container } = render(
+      <QueryClientProvider client={client}>
+        <main>
+          <h1>Senior Product Manager</h1>
+          <AgencyAlerts alerts={[]} />
+          <ReviewWorkspace
+            jobId={priyaCandidateFixture.job_id}
+            runId="00000000-0000-4000-8000-000000000301"
+            initialCandidates={{ items: [priyaCandidateFixture], next_cursor: null }}
+            initialSelectedCandidate={priyaCandidateFixture}
+            initialNearMatches={{ items: [], next_cursor: null }}
+            immutableScorecard={null}
+          />
+        </main>
+      </QueryClientProvider>,
     )
 
     await expectNoAxeViolations(container)

@@ -80,7 +80,7 @@ def test_0009_upgrade_downgrade_and_model_parity(owner_engine: Engine) -> None:
     with owner_engine.begin() as connection:
         _grant_api(connection)
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0011_sourcing_dispatch_recovery"
+            "0012_enrich_dispatch_recovery"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -580,14 +580,26 @@ def test_postgres_api_reveal_and_streaming_export_preserve_replay_and_redaction(
             )
             == 1
         )
-        assert (
-            session.scalar(
-                select(func.count())
-                .select_from(AuditEvent)
-                .where(AuditEvent.action == "candidate.shortlist_exported")
-            )
-            == 1
+        audit_counts = dict(
+            session.execute(
+                select(AuditEvent.action, func.count())
+                .where(
+                    AuditEvent.action.in_(
+                        (
+                            "candidate.shortlist_export_started",
+                            "candidate.contact_exported",
+                            "candidate.shortlist_export_completed",
+                        )
+                    )
+                )
+                .group_by(AuditEvent.action)
+            ).all()
         )
+        assert audit_counts == {
+            "candidate.shortlist_export_started": 1,
+            "candidate.contact_exported": 1,
+            "candidate.shortlist_export_completed": 1,
+        }
     api_engine.dispose()
 
 

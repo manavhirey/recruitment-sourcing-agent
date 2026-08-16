@@ -1,5 +1,6 @@
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import TypeVar
 from uuid import UUID
 
 from sqlalchemy import create_engine, text
@@ -7,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_maintenance_settings
 from app.maintenance_worker import celery_app
+
+Claim = TypeVar("Claim")
 
 
 @dataclass(frozen=True)
@@ -24,12 +27,21 @@ class RecoveryResult:
     failed: int
 
 
-def recover_claimed_dispatches(
-    claims: Iterable[DispatchClaim],
+@dataclass(frozen=True)
+class EnrichmentDispatchClaim:
+    request_id: UUID
+    tenant_id: UUID
+    user_id: UUID
+    claim_token: UUID
+    dispatch_key: str
+
+
+def recover_claimed_dispatches[Claim](
+    claims: Iterable[Claim],
     *,
-    publish: Callable[[DispatchClaim], None],
-    complete: Callable[[DispatchClaim], None],
-    release: Callable[[DispatchClaim], None],
+    publish: Callable[[Claim], None],
+    complete: Callable[[Claim], None],
+    release: Callable[[Claim], None],
 ) -> RecoveryResult:
     published = 0
     failed = 0
@@ -95,6 +107,64 @@ def recover_pending_dispatches(
     )
 
 
+def _enrichment_claims(
+    session: Session, *, batch_size: int
+) -> list[EnrichmentDispatchClaim]:
+    rows = session.execute(
+        text(
+            "SELECT request_id, tenant_id, user_id, claim_token, dispatch_key "
+            "FROM maintenance_claim_pending_enrichment_dispatches(:batch_size)"
+        ),
+        {"batch_size": batch_size},
+    ).all()
+    return [EnrichmentDispatchClaim(*row) for row in rows]
+
+
+def _finish_enrichment_claim(
+    database_url: str,
+    claim: EnrichmentDispatchClaim,
+    function: str,
+) -> None:
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with Session(engine) as session:
+            session.scalar(
+                text(f"SELECT {function}(:request_id, :claim_token)"),
+                {
+                    "request_id": claim.request_id,
+                    "claim_token": claim.claim_token,
+                },
+            )
+            session.commit()
+    finally:
+        engine.dispose()
+
+
+def recover_pending_enrichment_dispatches(
+    database_url: str,
+    publish: Callable[[EnrichmentDispatchClaim], None],
+    *,
+    batch_size: int = 100,
+) -> RecoveryResult:
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with Session(engine) as session:
+            claims = _enrichment_claims(session, batch_size=batch_size)
+            session.commit()
+    finally:
+        engine.dispose()
+    return recover_claimed_dispatches(
+        claims,
+        publish=publish,
+        complete=lambda claim: _finish_enrichment_claim(
+            database_url, claim, "maintenance_complete_enrichment_dispatch"
+        ),
+        release=lambda claim: _finish_enrichment_claim(
+            database_url, claim, "maintenance_release_enrichment_dispatch"
+        ),
+    )
+
+
 def _publish_sourcing_plan(claim: DispatchClaim) -> None:
     celery_app.send_task(
         "sourcing.plan_run",
@@ -108,10 +178,26 @@ def _publish_sourcing_plan(claim: DispatchClaim) -> None:
     )
 
 
+def _publish_enrichment_request(claim: EnrichmentDispatchClaim) -> None:
+    celery_app.send_task(
+        "sourcing.enrich_request",
+        args=(
+            str(claim.request_id),
+            str(claim.tenant_id),
+            str(claim.user_id),
+        ),
+        task_id=claim.dispatch_key,
+    )
+
+
 @celery_app.task(name="maintenance.recover_sourcing_dispatches", shared=False)
 def recover_sourcing_dispatches() -> None:
     settings = get_maintenance_settings()
     recover_pending_dispatches(
         settings.maintenance_database_url,
         _publish_sourcing_plan,
+    )
+    recover_pending_enrichment_dispatches(
+        settings.maintenance_database_url,
+        _publish_enrichment_request,
     )

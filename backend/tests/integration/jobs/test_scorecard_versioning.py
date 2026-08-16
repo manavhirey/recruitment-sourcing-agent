@@ -233,6 +233,44 @@ def test_draft_update_cannot_invent_extraction_source_to_bypass_lawful_review(
         )
 
 
+def test_unchanged_extracted_criterion_keeps_server_owned_provenance(
+    job_service: JobService,
+    draft_job,
+    owner_context: RequestContext,
+) -> None:
+    extracted = ScorecardDraft(
+        target_titles=["Product Manager"],
+        criteria=[
+            ScorecardCriterion(
+                key="payments",
+                label="Payments experience",
+                kind=CriterionKind.MUST_HAVE,
+                source_text="payments experience",
+            )
+        ],
+        seniority=["manager"],
+        minimum_years=5,
+        maximum_years=12,
+        locations=["India"],
+        industry_code="technology.fintech",
+        suggested_adjacent_industries=[],
+        uncertainties=[],
+    )
+    draft_job.draft_payload = extracted.model_dump(mode="json")
+
+    saved = job_service.update_draft(
+        owner_context,
+        draft_job.id,
+        extracted,
+        expected_revision=1,
+        idempotency_key="keep-unchanged-extraction-provenance",
+    )
+
+    criterion = saved.draft.criteria[0]
+    assert criterion.source_text == "payments experience"
+    assert criterion.recruiter_entered is False
+
+
 def test_persisted_inference_approval_survives_reload_and_confirmation(
     job_service: JobService,
     draft_job,

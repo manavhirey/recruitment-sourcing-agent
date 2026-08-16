@@ -29,7 +29,7 @@ if False:  # pragma: no cover - imported only for static typing
     from app.providers.snapshots import SnapshotStore
 
 SourcingDispatcher = Callable[[UUID, UUID, UUID, str], None]
-EnrichmentDispatcher = Callable[[UUID, UUID, UUID], None]
+EnrichmentDispatcher = Callable[[UUID, UUID, UUID, str], None]
 PrivacyDispatcher = Callable[[UUID, UUID], None]
 
 
@@ -45,11 +45,14 @@ def _dispatch_sourcing_run(
 
 
 def _dispatch_enrichment_request(
-    request_id: UUID, tenant_id: UUID, user_id: UUID
+    request_id: UUID, tenant_id: UUID, user_id: UUID, dispatch_key: str
 ) -> None:
     from app.sourcing.tasks import enrich_request
 
-    enrich_request.delay(str(request_id), str(tenant_id), str(user_id))
+    enrich_request.apply_async(
+        args=(str(request_id), str(tenant_id), str(user_id)),
+        task_id=dispatch_key,
+    )
 
 
 def _dispatch_privacy_request(request_id: UUID, tenant_id: UUID) -> None:

@@ -63,6 +63,17 @@ class InvitationResponse(BaseModel):
     expires_at: datetime
 
 
+class InvitationClaim(BaseModel):
+    token: str = Field(
+        min_length=80,
+        max_length=80,
+        pattern=(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+            r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\.[A-Za-z0-9_-]{43}$"
+        ),
+    )
+
+
 class RoleUpdate(BaseModel):
     role: Role
 

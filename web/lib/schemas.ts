@@ -15,6 +15,15 @@ export type ScorecardDraft = components["schemas"]["ScorecardDraft"]
 export type ScorecardCriterion = components["schemas"]["ScorecardCriterion"]
 export type ConfirmedScorecard = components["schemas"]["ConfirmedScorecard"]
 export type SourcingRun = components["schemas"]["RunResponse"]
+export type JobCandidate = components["schemas"]["JobCandidateView"]
+export type JobCandidatePage = components["schemas"]["JobCandidatePage"]
+export type CandidateDirectoryPage = components["schemas"]["CandidateDirectoryPage"]
+export type CandidateJob = components["schemas"]["CandidateJobView"]
+export type CandidateActivityPage = components["schemas"]["ActivityPage"]
+export type RunActivity = components["schemas"]["RunActivityResponse"]
+export type Notification = components["schemas"]["NotificationResponse"]
+export type Invitation = components["schemas"]["InvitationResponse"]
+export type MaskedContact = components["schemas"]["MaskedContact"]
 
 export const jobIntakeSchema = z.object({
   clientId: z.uuid({ error: "Select a client" }),

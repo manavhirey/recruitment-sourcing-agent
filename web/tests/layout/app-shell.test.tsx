@@ -45,6 +45,10 @@ describe("AppShell", () => {
     expect(screen.getByRole("complementary", { name: "Active jobs" })).toHaveTextContent(
       "Senior Product Manager",
     )
+    expect(screen.getByRole("link", { name: /Senior Product Manager/ })).toHaveAttribute(
+      "href",
+      "/jobs/00000000-0000-4000-8000-000000000301",
+    )
     expect(screen.getByText("Northstar Search")).toBeVisible()
     expect(container.innerHTML).not.toContain("must-never-render")
     expect(container.querySelector("main h1")).toHaveTextContent("Jobs")
