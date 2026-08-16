@@ -13,7 +13,10 @@ def utc_now() -> datetime:
 
 class ClientCompany(Base):
     __tablename__ = "client_companies"
-    __table_args__ = (UniqueConstraint("tenant_id", "normalized_name"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_client_companies_tenant_id_id"),
+        UniqueConstraint("tenant_id", "normalized_name"),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     tenant_id: Mapped[UUID] = mapped_column(

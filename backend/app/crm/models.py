@@ -146,6 +146,18 @@ class AcceptanceSnapshot(Base):
             ("sourcing_runs.tenant_id", "sourcing_runs.id"),
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            ("tenant_id", "client_id"),
+            ("client_companies.tenant_id", "client_companies.id"),
+            name="fk_crm_acceptance_snapshots_tenant_client",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "scorecard_version_id"),
+            ("scorecard_versions.tenant_id", "scorecard_versions.id"),
+            name="fk_crm_acceptance_snapshots_tenant_scorecard",
+            ondelete="RESTRICT",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -154,16 +166,8 @@ class AcceptanceSnapshot(Base):
     )
     job_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
     run_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
-    client_id: Mapped[UUID] = mapped_column(
-        ForeignKey("client_companies.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    scorecard_version_id: Mapped[UUID] = mapped_column(
-        ForeignKey("scorecard_versions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
+    client_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    scorecard_version_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
     market: Mapped[str] = mapped_column(String(16), nullable=False)
     scoring_version: Mapped[str] = mapped_column(String(64), nullable=False)
     finalized_by_user_id: Mapped[UUID] = mapped_column(
@@ -200,6 +204,18 @@ class AcceptanceCohort(Base):
             ("sourcing_runs.tenant_id", "sourcing_runs.id"),
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            ("tenant_id", "client_id"),
+            ("client_companies.tenant_id", "client_companies.id"),
+            name="fk_crm_acceptance_cohorts_tenant_client",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "scorecard_version_id"),
+            ("scorecard_versions.tenant_id", "scorecard_versions.id"),
+            name="fk_crm_acceptance_cohorts_tenant_scorecard",
+            ondelete="RESTRICT",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -208,16 +224,8 @@ class AcceptanceCohort(Base):
     )
     job_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
     run_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
-    client_id: Mapped[UUID] = mapped_column(
-        ForeignKey("client_companies.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    scorecard_version_id: Mapped[UUID] = mapped_column(
-        ForeignKey("scorecard_versions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
+    client_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    scorecard_version_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
     market: Mapped[str] = mapped_column(String(16), nullable=False)
     scoring_version: Mapped[str] = mapped_column(String(64), nullable=False)
     candidate_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)

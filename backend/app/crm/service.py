@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1722,33 +1723,173 @@ def capture_acceptance_cohort(
     return cohort
 
 
-def _acceptance_market(job: Job, scorecard: ScorecardVersion) -> str:
-    location = " ".join((job.location or "", *scorecard.locations)).casefold()
-    if any(
-        marker in location
-        for marker in (
+_MARKET_TERMS = {
+    "IN": frozenset(
+        {
             "india",
-            "bengaluru",
-            "bangalore",
-            "mumbai",
+            "andhra pradesh",
+            "arunachal pradesh",
+            "assam",
+            "bihar",
+            "chhattisgarh",
             "delhi",
-            "hyderabad",
-            "pune",
-            "chennai",
-        )
-    ):
-        return "IN"
-    if any(
-        marker in location
-        for marker in (
+            "goa",
+            "gujarat",
+            "haryana",
+            "himachal pradesh",
+            "jharkhand",
+            "karnataka",
+            "kerala",
+            "madhya pradesh",
+            "maharashtra",
+            "manipur",
+            "meghalaya",
+            "mizoram",
+            "nagaland",
+            "odisha",
+            "punjab",
+            "rajasthan",
+            "sikkim",
+            "tamil nadu",
+            "telangana",
+            "tripura",
+            "uttar pradesh",
+            "uttarakhand",
+            "west bengal",
+        }
+    ),
+    "US": frozenset(
+        {
             "united states",
-            " usa",
-            " us",
-            "new york",
-            "san francisco",
+            "united states of america",
+            "usa",
+            "alabama",
+            "alaska",
+            "arizona",
+            "arkansas",
             "california",
+            "colorado",
+            "connecticut",
+            "delaware",
+            "district of columbia",
+            "florida",
+            "georgia",
+            "hawaii",
+            "idaho",
+            "illinois",
+            "indiana",
+            "iowa",
+            "kansas",
+            "kentucky",
+            "louisiana",
+            "maine",
+            "maryland",
+            "massachusetts",
+            "michigan",
+            "minnesota",
+            "mississippi",
+            "missouri",
+            "montana",
+            "nebraska",
+            "nevada",
+            "new hampshire",
+            "new jersey",
+            "new mexico",
+            "new york",
+            "north carolina",
+            "north dakota",
+            "ohio",
+            "oklahoma",
+            "oregon",
+            "pennsylvania",
+            "rhode island",
+            "south carolina",
+            "south dakota",
+            "tennessee",
             "texas",
-        )
+            "utah",
+            "vermont",
+            "virginia",
+            "washington",
+            "west virginia",
+            "wisconsin",
+            "wyoming",
+        }
+    ),
+}
+_US_REGION_CODES = frozenset(
+    {
+        "AL",
+        "AK",
+        "AZ",
+        "AR",
+        "CA",
+        "CO",
+        "CT",
+        "DE",
+        "DC",
+        "FL",
+        "GA",
+        "HI",
+        "ID",
+        "IL",
+        "IN",
+        "IA",
+        "KS",
+        "KY",
+        "LA",
+        "ME",
+        "MD",
+        "MA",
+        "MI",
+        "MN",
+        "MS",
+        "MO",
+        "MT",
+        "NE",
+        "NV",
+        "NH",
+        "NJ",
+        "NM",
+        "NY",
+        "NC",
+        "ND",
+        "OH",
+        "OK",
+        "OR",
+        "PA",
+        "RI",
+        "SC",
+        "SD",
+        "TN",
+        "TX",
+        "UT",
+        "VT",
+        "VA",
+        "WA",
+        "WV",
+        "WI",
+        "WY",
+    }
+)
+
+
+def _acceptance_market(job: Job, scorecard: ScorecardVersion) -> str:
+    locations = (job.location or "", *scorecard.locations)
+    normalized_locations = [
+        " ".join(re.sub(r"[^a-z0-9]+", " ", value.casefold()).split())
+        for value in locations
+    ]
+    for market, terms in _MARKET_TERMS.items():
+        if any(
+            any(f" {term} " in f" {location} " for term in terms)
+            for location in normalized_locations
+        ):
+            return market
+    if any(
+        value.rstrip(".,").split()[-1] in _US_REGION_CODES
+        for value in locations
+        if value.strip()
     ):
         return "US"
     return "unknown"

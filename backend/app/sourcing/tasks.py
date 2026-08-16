@@ -761,11 +761,24 @@ def _mark_enrichment_provider_disabled(run_id: UUID, context: RequestContext) ->
 def _mark_enrichment_request_provider_disabled(
     request_id: UUID, context: RequestContext
 ) -> None:
+    with database_session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        request = session.scalar(
+            select(EnrichmentRequest).where(
+                EnrichmentRequest.id == request_id,
+                EnrichmentRequest.tenant_id == context.tenant_id,
+            )
+        )
+        charge_reserved = bool(
+            request is not None and request.provider_request_id is not None
+        )
+        session.rollback()
     _fail_request(
         database_session_factory,
         context,
         request_id,
         error_code="provider_connector_disabled",
+        charge_reserved=charge_reserved,
     )
 
 
@@ -1131,7 +1144,7 @@ def poll_enrichment_result(
     cipher, snapshots, _, codec = _enrichment_dependencies(settings)
     gateway = ApolloGateway(settings)
     try:
-        retry_after = poll_enrichment_request(
+        poll_result = poll_enrichment_request(
             database_session_factory,
             UUID(request_id),
             context,
@@ -1140,7 +1153,6 @@ def poll_enrichment_result(
             snapshot_store=snapshots,
             contact_cipher=cipher,
         )
-        _record_provider_outcome("enrichment_poll", "success")
     except ProviderAuthenticationError:
         disable_provider(database_session_factory, "apollo", "authentication_error")
         _record_provider_outcome("enrichment_poll", "authentication_error")
@@ -1153,7 +1165,12 @@ def poll_enrichment_result(
         return
     finally:
         gateway.close()
-    if retry_after is not None:
+    if isinstance(poll_result, FailedEnrichment):
+        _record_provider_outcome("enrichment_poll", "provider_error")
+    elif isinstance(poll_result, int):
+        _record_provider_outcome("enrichment_poll", "retry_scheduled")
         poll_enrichment_result.apply_async(
-            args=(request_id, tenant_id, user_id), countdown=retry_after
+            args=(request_id, tenant_id, user_id), countdown=poll_result
         )
+    else:
+        _record_provider_outcome("enrichment_poll", "success")

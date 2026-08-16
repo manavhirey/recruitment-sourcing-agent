@@ -48,8 +48,8 @@ def test_test_settings_supply_all_required_secrets() -> None:
     )
     assert settings.identity_hmac_key_version == "v1"
     assert SchedulerSettings(
-        _env_file=None, redis_url="redis://broker/0"
-    ).model_dump() == {"redis_url": "redis://broker/0"}
+        _env_file=None, environment="test", redis_url="redis://broker/0"
+    ).model_dump() == {"environment": "test", "redis_url": "redis://broker/0"}
 
 
 def _production_runtime_payload() -> dict[str, object]:
@@ -59,6 +59,7 @@ def _production_runtime_payload() -> dict[str, object]:
         database_url=(
             "postgresql+psycopg://sourcing_api:"
             "api-password-with-32-random-characters@db.internal:5432/sourcing"
+            "?sslmode=verify-full"
         ),
         redis_url=(
             "rediss://:redis-password-with-32-random-characters@redis.internal:6379/0"
@@ -96,6 +97,7 @@ def _production_maintenance_payload() -> dict[str, object]:
         maintenance_database_url=(
             "postgresql+psycopg://sourcing_maintenance:"
             "maintenance-password-with-32-random@db.internal:5432/sourcing"
+            "?sslmode=verify-full"
         ),
         redis_url=(
             "rediss://:maintenance-redis-password-32-random@redis.internal:6379/0"
@@ -108,19 +110,97 @@ def _production_maintenance_payload() -> dict[str, object]:
     return payload
 
 
+def _production_lifecycle_payload() -> dict[str, object]:
+    return {
+        "environment": "production",
+        "object_store_endpoint": "https://objects.internal",
+        "object_store_lifecycle_admin_access_key_id": (
+            "lifecycle-access-identity-2026"
+        ),
+        "object_store_lifecycle_admin_secret_access_key": (
+            "lifecycle-secret-with-32-random-characters"
+        ),
+    }
+
+
+def _production_scheduler_payload() -> dict[str, object]:
+    return {
+        "environment": "production",
+        "redis_url": (
+            "rediss://:scheduler-redis-password-32-random@redis.internal:6379/0"
+        ),
+    }
+
+
+def _production_migration_payload() -> dict[str, object]:
+    suffix = "@db.internal:5432/sourcing?sslmode=verify-full"
+    return {
+        "environment": "production",
+        "database_url": (
+            "postgresql+psycopg://sourcing_api:api-password-with-32-random" + suffix
+        ),
+        "migration_database_url": (
+            "postgresql+psycopg://sourcing_migration:"
+            "migration-password-with-32-random" + suffix
+        ),
+        "maintenance_database_url": (
+            "postgresql+psycopg://sourcing_maintenance:"
+            "maintenance-password-with-32-random" + suffix
+        ),
+    }
+
+
 @pytest.mark.parametrize(
     ("model", "payload"),
     [
         (Settings, _production_runtime_payload()),
         (WorkerSettings, _production_worker_payload()),
         (MaintenanceSettings, _production_maintenance_payload()),
+        (LifecycleAdminSettings, _production_lifecycle_payload()),
+        (SchedulerSettings, _production_scheduler_payload()),
+        (MigrationSettings, _production_migration_payload()),
     ],
 )
 def test_production_settings_accept_strong_distinct_secure_configuration(
-    model: type[Settings] | type[WorkerSettings] | type[MaintenanceSettings],
+    model: type[
+        Settings
+        | WorkerSettings
+        | MaintenanceSettings
+        | LifecycleAdminSettings
+        | SchedulerSettings
+        | MigrationSettings
+    ],
     payload: dict[str, object],
 ) -> None:
     model(_env_file=None, **payload)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (Settings, _production_runtime_payload()),
+        (WorkerSettings, _production_worker_payload()),
+        (MaintenanceSettings, _production_maintenance_payload()),
+        (LifecycleAdminSettings, _production_lifecycle_payload()),
+        (SchedulerSettings, _production_scheduler_payload()),
+        (MigrationSettings, _production_migration_payload()),
+    ],
+)
+def test_environment_is_a_fail_closed_enum(
+    model: object, payload: dict[str, object]
+) -> None:
+    payload["environment"] = "prod"
+
+    with pytest.raises(ValidationError, match="environment"):
+        model(_env_file=None, **payload)  # type: ignore[operator]
+
+
+def test_production_database_requires_tls() -> None:
+    payload = _production_runtime_payload()
+    payload["database_url"] = str(payload["database_url"]).split("?", 1)[0]
+
+    with pytest.raises(ValidationError, match="TLS"):
+        Settings(_env_file=None, **payload)
 
 
 @pytest.mark.parametrize(
@@ -166,10 +246,38 @@ def test_production_settings_accept_strong_distinct_secure_configuration(
             "redis_url",
             "redis://redis.internal:6379/0",
         ),
+        (
+            LifecycleAdminSettings,
+            _production_lifecycle_payload(),
+            "object_store_endpoint",
+            "http://objects.internal",
+        ),
+        (
+            SchedulerSettings,
+            _production_scheduler_payload(),
+            "redis_url",
+            "redis://redis.internal:6379/0",
+        ),
+        (
+            MigrationSettings,
+            _production_migration_payload(),
+            "migration_database_url",
+            (
+                "postgresql+psycopg://sourcing_migration:"
+                "migration-password-with-32-random@db.internal:5432/sourcing"
+            ),
+        ),
     ],
 )
 def test_production_settings_reject_weak_reused_placeholder_or_insecure_values(
-    model: type[Settings] | type[WorkerSettings] | type[MaintenanceSettings],
+    model: type[
+        Settings
+        | WorkerSettings
+        | MaintenanceSettings
+        | LifecycleAdminSettings
+        | SchedulerSettings
+        | MigrationSettings
+    ],
     payload: dict[str, object],
     field: str,
     unsafe_value: str,
@@ -180,6 +288,18 @@ def test_production_settings_reject_weak_reused_placeholder_or_insecure_values(
         model(_env_file=None, **payload)
 
     assert unsafe_value not in str(caught.value)
+
+
+def test_production_migration_database_credentials_are_distinct() -> None:
+    payload = _production_migration_payload()
+    api_password = make_url(str(payload["database_url"])).password
+    payload["migration_database_url"] = (
+        "postgresql+psycopg://sourcing_migration:"
+        f"{api_password}@db.internal:5432/sourcing?sslmode=verify-full"
+    )
+
+    with pytest.raises(ValidationError, match="credentials must be distinct"):
+        MigrationSettings(_env_file=None, **payload)
 
 
 def test_object_store_capability_settings_expose_only_their_own_credentials() -> None:
@@ -583,7 +703,10 @@ def test_compose_processes_receive_only_their_required_capabilities() -> None:
     assert "AUTH_SECRET" in services["web"]["environment"]
     for data_service in ("postgres", "redis", "minio", "prometheus"):
         assert "ports" not in services[data_service]
-    assert services["scheduler"]["environment"] == {"REDIS_URL": "${COMPOSE_REDIS_URL}"}
+    assert services["scheduler"]["environment"] == {
+        "ENVIRONMENT": "${ENVIRONMENT:-production}",
+        "REDIS_URL": "${COMPOSE_REDIS_URL}",
+    }
     assert services["api"]["environment"]["DATABASE_URL"] == ("${COMPOSE_DATABASE_URL}")
     assert services["api"]["environment"]["OBJECT_STORE_ENDPOINT"] == (
         "${COMPOSE_OBJECT_STORE_ENDPOINT}"
@@ -628,6 +751,9 @@ def test_rendered_compose_preserves_capability_and_port_isolation() -> None:
         "OBJECT_STORE_WRITER_SECRET_ACCESS_KEY"
         not in services["maintenance-worker"]["environment"]
     )
-    assert set(services["scheduler"]["environment"]) == {"REDIS_URL"}
+    assert set(services["scheduler"]["environment"]) == {
+        "ENVIRONMENT",
+        "REDIS_URL",
+    }
     for service_name in ("postgres", "redis", "minio", "prometheus"):
         assert "ports" not in services[service_name]

@@ -489,7 +489,7 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
             owner_user_id=crm_api["recruiter_id"],
             title="Acceptance Cohort",
             job_description="Measure review acceptance.",
-            location="New York, United States",
+            location="Boston, MA",
         )
         session.add(job)
         session.flush()
@@ -501,7 +501,7 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
             seniority=[],
             minimum_years=None,
             maximum_years=None,
-            locations=["New York, United States"],
+            locations=["Boston, MA"],
             industry_code="technology.fintech",
             suggested_adjacent_industries=[],
             uncertainties=[],

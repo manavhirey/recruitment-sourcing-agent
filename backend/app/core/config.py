@@ -5,6 +5,7 @@ import hmac
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
@@ -21,6 +22,7 @@ _PLACEHOLDER_MARKERS = (
     "sample",
     "test-",
 )
+Environment = Literal["development", "test", "production"]
 
 
 def _secret_value(value: SecretStr) -> str:
@@ -66,6 +68,8 @@ def _require_production_database_url(name: str, value: str) -> None:
         marker in host for marker in ("example", "placeholder", ".invalid")
     ):
         raise ValueError(f"{name} must not use a placeholder host")
+    if parsed.query.get("sslmode") not in {"require", "verify-ca", "verify-full"}:
+        raise ValueError(f"{name} must require PostgreSQL TLS")
     password = parsed.password or ""
     if len(password) < 24 or any(
         marker in password.casefold() for marker in _PLACEHOLDER_MARKERS
@@ -137,7 +141,7 @@ class Settings(BaseSettings):
         env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
     )
 
-    environment: str = "development"
+    environment: Environment = "development"
     database_url: str
     redis_url: str
     object_store_endpoint: str
@@ -171,7 +175,7 @@ class Settings(BaseSettings):
         _require_key_version(
             "identity_hmac_key_version", self.identity_hmac_key_version
         )
-        if self.environment.casefold() == "production":
+        if self.environment == "production":
             _require_production_database_url("database_url", self.database_url)
             _require_production_redis_url(self.redis_url)
             _require_secure_url(
@@ -233,7 +237,7 @@ class WorkerSettings(BaseSettings):
         env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
     )
 
-    environment: str = "development"
+    environment: Environment = "development"
     database_url: str
     redis_url: str
     object_store_endpoint: str
@@ -265,7 +269,7 @@ class WorkerSettings(BaseSettings):
         _require_key_version(
             "identity_hmac_key_version", self.identity_hmac_key_version
         )
-        if self.environment.casefold() == "production":
+        if self.environment == "production":
             _require_production_database_url("database_url", self.database_url)
             _require_production_redis_url(self.redis_url)
             _require_secure_url(
@@ -319,7 +323,14 @@ class SchedulerSettings(BaseSettings):
         env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
     )
 
+    environment: Environment = "development"
     redis_url: str
+
+    @model_validator(mode="after")
+    def require_secure_production_broker(self) -> "SchedulerSettings":
+        if self.environment == "production":
+            _require_production_redis_url(self.redis_url)
+        return self
 
 
 class MaintenanceSettings(BaseSettings):
@@ -327,7 +338,7 @@ class MaintenanceSettings(BaseSettings):
         env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
     )
 
-    environment: str = "development"
+    environment: Environment = "development"
     maintenance_database_url: str
     redis_url: str
     object_store_endpoint: str
@@ -350,7 +361,7 @@ class MaintenanceSettings(BaseSettings):
                 "object_store_lifecycle_admin_access_key_id",
             ),
         )
-        if self.environment.casefold() == "production":
+        if self.environment == "production":
             _require_production_database_url(
                 "maintenance_database_url", self.maintenance_database_url
             )
@@ -397,6 +408,7 @@ class LifecycleAdminSettings(BaseSettings):
         env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
     )
 
+    environment: Environment = "development"
     object_store_endpoint: str
     object_store_bucket: str = "provider-snapshots"
     object_store_lifecycle_admin_access_key_id: SecretStr
@@ -411,11 +423,31 @@ class LifecycleAdminSettings(BaseSettings):
                 "object_store_delete_access_key_id",
             ),
         )
+        if self.environment == "production":
+            _require_secure_url(
+                "object_store_endpoint",
+                self.object_store_endpoint,
+                schemes={"https"},
+            )
+            _require_production_secrets(
+                self.environment,
+                {
+                    "object_store_lifecycle_admin_access_key_id": (
+                        self.object_store_lifecycle_admin_access_key_id,
+                        16,
+                    ),
+                    "object_store_lifecycle_admin_secret_access_key": (
+                        self.object_store_lifecycle_admin_secret_access_key,
+                        32,
+                    ),
+                },
+            )
         return self
 
     @classmethod
     def for_test(cls) -> "LifecycleAdminSettings":
         return cls(
+            environment="test",
             object_store_endpoint="http://localhost:9000",
             object_store_lifecycle_admin_access_key_id="test-lifecycle-key",
             object_store_lifecycle_admin_secret_access_key="test-lifecycle-secret",
@@ -427,6 +459,7 @@ class MigrationSettings(BaseSettings):
         env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
     )
 
+    environment: Environment = "development"
     database_url: str
     migration_database_url: str
     maintenance_database_url: str
@@ -445,6 +478,17 @@ class MigrationSettings(BaseSettings):
             raise ValueError(
                 "API, migration, and maintenance database roles must be distinct"
             )
+        if self.environment == "production":
+            database_urls = {
+                "database_url": self.database_url,
+                "migration_database_url": self.migration_database_url,
+                "maintenance_database_url": self.maintenance_database_url,
+            }
+            for name, value in database_urls.items():
+                _require_production_database_url(name, value)
+            passwords = {make_url(value).password for value in database_urls.values()}
+            if None in passwords or len(passwords) != len(database_urls):
+                raise ValueError("production database credentials must be distinct")
         return self
 
 

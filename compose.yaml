@@ -112,6 +112,7 @@ services:
     profiles: ["application"]
     build: { context: ./backend }
     environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       REDIS_URL: ${COMPOSE_REDIS_URL}
     command: ["celery", "-A", "app.scheduler.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
     depends_on:

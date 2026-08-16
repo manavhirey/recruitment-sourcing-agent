@@ -40,6 +40,7 @@ from app.sourcing.webhooks import (
 _MAX_ENRICHMENT_LIMIT = 50
 _MAX_BATCH_SIZE = 10
 _MAX_PROVIDER_RATE_LIMIT_ATTEMPTS = 6
+_MAX_PROVIDER_POLL_ATTEMPTS = 6
 _STAGE_DEADLINE = timedelta(minutes=5)
 
 
@@ -223,13 +224,14 @@ def enqueue_top_enrichment(
             )
         )
 
-    for (
+    prepared_request_ids = tuple(batch[3] for batch in prepared_batches)
+    for batch_index, (
         records,
         reveal_personal,
         reveal_phone,
         enrichment_id,
         capability_token,
-    ) in prepared_batches:
+    ) in enumerate(prepared_batches):
         if not _request_dispatchable(session_factory, context, enrichment_id):
             continue
         candidate_ids = tuple(record[0] for record in records)
@@ -245,12 +247,13 @@ def enqueue_top_enrichment(
                 reveal_phone_number=reveal_phone,
             )
         except (ProviderAuthenticationError, ProviderPermissionError):
-            _fail_request(
+            _abort_prepared_requests(
                 session_factory,
                 context,
-                enrichment_id,
-                error_code="provider_enrichment_failed",
+                prepared_request_ids,
+                failed_index=batch_index,
             )
+            _finalize_if_terminal(session_factory, context, run_id)
             raise
         except ProviderRateLimited as error:
             submissions.append(
@@ -312,7 +315,7 @@ def poll_enrichment_request(
     token_codec: CapabilityTokenCodec,
     snapshot_store: SnapshotStore,
     contact_cipher: ContactCipher,
-) -> int | None:
+) -> int | FailedEnrichment | None:
     with _tenant_session(session_factory, context.tenant_id) as session:
         enrichment = session.scalar(
             select(EnrichmentRequest).where(
@@ -325,6 +328,7 @@ def poll_enrichment_request(
         if enrichment.status in ("completed", "failed", "cancelled"):
             return None
         provider_request_id = enrichment.provider_request_id
+        run_id = enrichment.run_id
     if provider_request_id is None:
         _fail_request(
             session_factory,
@@ -335,6 +339,30 @@ def poll_enrichment_request(
         return None
     try:
         result = gateway.poll_enrichment(provider_request_id)
+    except (ProviderAuthenticationError, ProviderPermissionError):
+        _fail_request(
+            session_factory,
+            context,
+            request_id,
+            error_code="provider_poll_authorization_failed",
+            charge_reserved=True,
+        )
+        _finalize_if_terminal(session_factory, context, run_id)
+        raise
+    except ProviderRateLimited as error:
+        return _defer_poll_request(
+            session_factory,
+            context,
+            request_id,
+            retry_after=max(1, error.retry_after or 1),
+        )
+    except ProviderTemporaryError:
+        return _defer_poll_request(
+            session_factory,
+            context,
+            request_id,
+            retry_after=1,
+        )
     except ProviderError:
         _fail_request(
             session_factory,
@@ -343,18 +371,15 @@ def poll_enrichment_request(
             error_code="provider_poll_failed",
             charge_reserved=True,
         )
-        _finalize_if_terminal(session_factory, context, enrichment.run_id)
-        return None
+        _finalize_if_terminal(session_factory, context, run_id)
+        return FailedEnrichment(request_id=request_id)
     if isinstance(result, EnrichmentPending):
-        with _tenant_session(session_factory, context.tenant_id) as session:
-            enrichment = session.get(EnrichmentRequest, request_id)
-            if enrichment is not None and enrichment.tenant_id == context.tenant_id:
-                enrichment.retry_count += 1
-                enrichment.poll_after = datetime.now(UTC) + timedelta(
-                    seconds=result.retry_after_seconds
-                )
-                session.commit()
-        return result.retry_after_seconds
+        return _defer_poll_request(
+            session_factory,
+            context,
+            request_id,
+            retry_after=result.retry_after_seconds,
+        )
     with _tenant_session(session_factory, context.tenant_id) as session:
         enrichment = session.scalar(
             select(EnrichmentRequest)
@@ -434,16 +459,27 @@ def execute_queued_enrichment_request(
         if run.cancellation_requested or run.state is RunState.CANCELLED:
             enrichment.status = "cancelled"
             enrichment.completed_at = datetime.now(UTC)
+            _reconcile_receipt_usage(
+                session,
+                enrichment,
+                context,
+                {"enrichments": 0, "estimated_credits": 0},
+            )
             session.commit()
             return None
         candidate_ids = tuple(UUID(value) for value in enrichment.candidate_ids)
         records = _provider_candidates(session_factory, context, candidate_ids)
         if not records:
-            enrichment.status = "failed"
-            enrichment.error_code = "provider_identity_missing"
-            enrichment.completed_at = datetime.now(UTC)
+            run_id = enrichment.run_id
+            _mark_request_failed(
+                session,
+                enrichment,
+                context,
+                error_code="provider_identity_missing",
+                charge_reserved=False,
+            )
             session.commit()
-            _finalize_if_terminal(session_factory, context, enrichment.run_id)
+            _finalize_if_terminal(session_factory, context, run_id)
             return None
         flags = [policy.reveal_flags(record[2]) for record in records]
         reveal_personal = all(value[0] for value in flags)
@@ -861,6 +897,27 @@ def _reconcile_receipt_usage(
     enrichment.usage_reconciled_at = datetime.now(UTC)
 
 
+def _abort_prepared_requests(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    request_ids: Sequence[UUID],
+    *,
+    failed_index: int,
+) -> None:
+    for index, request_id in enumerate(request_ids):
+        _fail_request(
+            session_factory,
+            context,
+            request_id,
+            error_code=(
+                "provider_enrichment_failed"
+                if index == failed_index
+                else "provider_dispatch_aborted"
+            ),
+            charge_reserved=index < failed_index,
+        )
+
+
 def _fail_request(
     session_factory: sessionmaker[Session],
     context: RequestContext,
@@ -936,6 +993,44 @@ def _mark_request_failed(
         provider_request_id=provider_request_id,
     )
     enrichment.usage_reconciled_at = datetime.now(UTC)
+
+
+def _defer_poll_request(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    request_id: UUID,
+    *,
+    retry_after: int,
+) -> int | FailedEnrichment:
+    terminal_run_id: UUID | None = None
+    with _tenant_session(session_factory, context.tenant_id) as session:
+        enrichment = session.scalar(
+            select(EnrichmentRequest)
+            .where(
+                EnrichmentRequest.id == request_id,
+                EnrichmentRequest.tenant_id == context.tenant_id,
+            )
+            .with_for_update()
+        )
+        if enrichment is None:
+            raise LookupError("enrichment request not found")
+        enrichment.retry_count += 1
+        if enrichment.retry_count >= _MAX_PROVIDER_POLL_ATTEMPTS:
+            _mark_request_failed(
+                session,
+                enrichment,
+                context,
+                error_code="provider_poll_retry_exhausted",
+                charge_reserved=True,
+            )
+            terminal_run_id = enrichment.run_id
+        else:
+            enrichment.poll_after = datetime.now(UTC) + timedelta(seconds=retry_after)
+        session.commit()
+    if terminal_run_id is not None:
+        _finalize_if_terminal(session_factory, context, terminal_run_id)
+        return FailedEnrichment(request_id=request_id)
+    return retry_after
 
 
 def _defer_rate_limited_request(

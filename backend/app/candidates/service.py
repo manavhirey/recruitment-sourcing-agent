@@ -122,23 +122,29 @@ class CandidateService:
             timestamp,
             confidence,
         )
-        self._observe_fields(
-            candidate, identity, provider_person, timestamp, confidence, accepted_url
-        )
-        self._observe_fact_lists(
-            candidate,
-            identity,
-            provider_person,
-            timestamp,
-            confidence,
-        )
-        self._observe_experiences(
-            candidate,
-            identity,
-            provider_person.experiences,
-            timestamp,
-            confidence,
-        )
+        if not decision.conflict_candidate_ids:
+            self._observe_fields(
+                candidate,
+                identity,
+                provider_person,
+                timestamp,
+                confidence,
+                accepted_url,
+            )
+            self._observe_fact_lists(
+                candidate,
+                identity,
+                provider_person,
+                timestamp,
+                confidence,
+            )
+            self._observe_experiences(
+                candidate,
+                identity,
+                provider_person.experiences,
+                timestamp,
+                confidence,
+            )
         suggestion_candidate_ids = tuple(
             dict.fromkeys(
                 (*decision.conflict_candidate_ids, *decision.fuzzy_candidate_ids)

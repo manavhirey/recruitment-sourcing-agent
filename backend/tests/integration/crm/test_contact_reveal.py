@@ -64,6 +64,10 @@ def test_commit_failure_emits_no_success_for_ordinary_mutation(
 def test_commit_failure_emits_no_revealed_plaintext(
     crm_api, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    captured: list[dict[str, object]] = []
+    crm_api["api"].app.state.telemetry = Telemetry(
+        hmac_key=b"telemetry-test-key", sink=captured.append
+    )
     headers = {
         **crm_api["headers"],
         "Idempotency-Key": "commit-failure-contact-reveal",
@@ -76,6 +80,7 @@ def test_commit_failure_emits_no_revealed_plaintext(
 
     assert response.status_code == 500
     assert "priya@example.test" not in response.text
+    assert [event for event in captured if event["event"] == "contact_revealed"] == []
 
 
 def test_reveal_updates_legitimate_use_audits_once_and_never_caches_plaintext(

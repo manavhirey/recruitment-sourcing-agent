@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 from app.audit.models import AuditEvent
 from app.candidates.models import (
     Candidate,
+    CandidateExperience,
     CandidateFieldProvenance,
     DuplicateSuggestion,
     SourceIdentity,
@@ -20,7 +21,7 @@ from app.clients.models import ClientCompany  # noqa: F401
 from app.core.database import Base
 from app.identity.models import Tenant
 from app.identity.schemas import RequestContext, Role
-from app.providers.base import ProviderPerson
+from app.providers.base import ProviderExperience, ProviderPerson
 
 
 @pytest.fixture
@@ -149,6 +150,19 @@ def test_conflicting_profile_url_is_quarantined_without_aborting_ingestion(
         provider_person_factory(
             provider_person_id="provider-match",
             full_name="Provider Match",
+            current_title="Original Title",
+            current_company="Original Company",
+            location="Original Location",
+            skills=("original skill",),
+            industry_codes=("original-industry",),
+            experiences=(
+                ProviderExperience(
+                    title="Original Role",
+                    company_name="Original Employer",
+                    start_date="2020-01",
+                    end_date=None,
+                ),
+            ),
             linkedin_url="https://www.linkedin.com/in/provider-match",
         ),
         source_timestamp=observed_at,
@@ -168,6 +182,19 @@ def test_conflicting_profile_url_is_quarantined_without_aborting_ingestion(
         provider_person_factory(
             provider_person_id="provider-match",
             full_name="Incoming Private Name",
+            current_title="Incoming Private Title",
+            current_company="Incoming Private Company",
+            location="Incoming Private Location",
+            skills=("incoming private skill",),
+            industry_codes=("incoming-private-industry",),
+            experiences=(
+                ProviderExperience(
+                    title="Incoming Private Role",
+                    company_name="Incoming Private Employer",
+                    start_date="2025-01",
+                    end_date=None,
+                ),
+            ),
             linkedin_url="https://www.linkedin.com/in/url-match?trk=private",
         ),
         source_timestamp=observed_at + timedelta(days=1),
@@ -206,6 +233,21 @@ def test_conflicting_profile_url_is_quarantined_without_aborting_ingestion(
     assert provider_candidate.normalized_profile_url == (
         "https://www.linkedin.com/in/provider-match"
     )
+    assert provider_candidate.full_name == "Provider Match"
+    assert provider_candidate.current_title == "Original Title"
+    assert provider_candidate.current_company == "Original Company"
+    assert provider_candidate.location == "Original Location"
+    assert provider_candidate.normalized_skills == ["original skill"]
+    assert provider_candidate.industry_codes == ["original-industry"]
+    experiences = candidate_session.scalars(
+        select(CandidateExperience).where(
+            CandidateExperience.tenant_id == context.tenant_id,
+            CandidateExperience.candidate_id == provider_match.candidate_id,
+        )
+    ).all()
+    assert [(item.title, item.company_name) for item in experiences] == [
+        ("Original Role", "Original Employer")
+    ]
     suggestion = candidate_session.get(
         DuplicateSuggestion, conflict.duplicate_suggestion_id
     )

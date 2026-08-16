@@ -138,7 +138,7 @@ def test_0007_to_head_upgrade_downgrade_and_model_parity(owner_engine: Engine) -
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0014_final_review_contracts"
+            "0015_tenant_acceptance_fks"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)

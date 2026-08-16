@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.candidates.models import Candidate, ContactPoint
 from app.core.config import Settings, derive_identity_hmac_key
-from app.core.database import get_db
+from app.core.database import defer_until_after_commit, get_db
 from app.crm.exports import export_shortlist_csv
 from app.crm.models import CandidateStage, JobCandidate
 from app.crm.schemas import (
@@ -445,12 +445,19 @@ def reveal_contact(
         _raise_crm_error(error)
     contact = session.get(ContactPoint, contact_point_id)
     if contact is not None:
-        request.app.state.telemetry.emit(
-            "contact_revealed",
-            tenant_id=context.tenant_id,
-            user_id=context.user_id,
-            candidate_id=contact.candidate_id,
-            outcome="success",
+        telemetry = request.app.state.telemetry
+        tenant_id = context.tenant_id
+        user_id = context.user_id
+        candidate_id = contact.candidate_id
+        defer_until_after_commit(
+            request,
+            lambda: telemetry.emit(
+                "contact_revealed",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                candidate_id=candidate_id,
+                outcome="success",
+            ),
         )
     return ContactRevealResponse(id=contact_point_id, value=value)
 

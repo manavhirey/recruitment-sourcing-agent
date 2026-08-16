@@ -81,11 +81,31 @@ def test_0009_upgrade_downgrade_and_model_parity(owner_engine: Engine) -> None:
     with owner_engine.begin() as connection:
         _grant_api(connection)
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0014_final_review_contracts"
+            "0015_tenant_acceptance_fks"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
             == []
+        )
+
+
+def test_acceptance_dimensions_use_tenant_composite_foreign_keys(
+    owner_engine: Engine,
+) -> None:
+    database = inspect(owner_engine)
+    for table_name in ("crm_acceptance_cohorts", "crm_acceptance_snapshots"):
+        foreign_keys = database.get_foreign_keys(table_name)
+        assert any(
+            key["constrained_columns"] == ["tenant_id", "client_id"]
+            and key["referred_table"] == "client_companies"
+            and key["referred_columns"] == ["tenant_id", "id"]
+            for key in foreign_keys
+        )
+        assert any(
+            key["constrained_columns"] == ["tenant_id", "scorecard_version_id"]
+            and key["referred_table"] == "scorecard_versions"
+            and key["referred_columns"] == ["tenant_id", "id"]
+            for key in foreign_keys
         )
 
 

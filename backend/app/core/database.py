@@ -1,4 +1,5 @@
-from collections.abc import Generator
+import logging
+from collections.abc import Callable, Generator
 
 from fastapi import Request
 from sqlalchemy import create_engine
@@ -16,6 +17,13 @@ class Base(DeclarativeBase):
 engine = create_engine(get_settings().database_url, pool_pre_ping=True)
 session_factory = sessionmaker(bind=engine, expire_on_commit=False)
 _REQUEST_SESSION_KEY = "sourcing.database_session"
+_AFTER_COMMIT_CALLBACKS_KEY = "sourcing.after_commit_callbacks"
+logger = logging.getLogger("sourcing.database")
+
+
+def defer_until_after_commit(request: Request, callback: Callable[[], None]) -> None:
+    callbacks = request.scope.setdefault(_AFTER_COMMIT_CALLBACKS_KEY, [])
+    callbacks.append(callback)
 
 
 class TransactionBoundaryMiddleware:
@@ -44,8 +52,16 @@ class TransactionBoundaryMiddleware:
                         )
                         await run_in_threadpool(action)
                     except Exception:
+                        scope.pop(_AFTER_COMMIT_CALLBACKS_KEY, None)
                         await run_in_threadpool(session.rollback)
                         raise
+                callbacks = scope.pop(_AFTER_COMMIT_CALLBACKS_KEY, ())
+                if message["status"] < 400:
+                    for callback in callbacks:
+                        try:
+                            await run_in_threadpool(callback)
+                        except Exception:
+                            logger.exception("post_commit_callback_failed")
                 finished = True
             await send(message)
 

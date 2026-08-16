@@ -513,6 +513,59 @@ def test_terminal_enrichment_failure_is_not_reported_as_success(
     assert observed == [("people_enrichment", "provider_error")]
 
 
+@pytest.mark.parametrize(
+    ("poll_result", "expected_outcome", "expected_countdown"),
+    [
+        (17, "retry_scheduled", 17),
+        (FailedEnrichment(request_id=uuid4()), "provider_error", None),
+        (None, "success", None),
+    ],
+)
+def test_poll_wrapper_reports_persisted_outcome_accurately(
+    monkeypatch: pytest.MonkeyPatch,
+    poll_result: int | FailedEnrichment | None,
+    expected_outcome: str,
+    expected_countdown: int | None,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class Gateway:
+        def close(self) -> None:
+            observed["closed"] = True
+
+    monkeypatch.setattr(tasks, "get_worker_settings", WorkerSettings.for_test)
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: True)
+    monkeypatch.setattr(tasks, "ApolloGateway", lambda settings: Gateway())
+    monkeypatch.setattr(
+        tasks,
+        "_enrichment_dependencies",
+        lambda settings: (None, None, None, None),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "poll_enrichment_request",
+        lambda *args, **kwargs: poll_result,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_record_provider_outcome",
+        lambda endpoint, outcome: observed.update(outcome=(endpoint, outcome)),
+    )
+    monkeypatch.setattr(
+        poll_enrichment_result,
+        "apply_async",
+        lambda *, args, countdown: observed.update(
+            scheduled_args=args, countdown=countdown
+        ),
+    )
+
+    poll_enrichment_result.run(str(uuid4()), str(uuid4()), str(uuid4()))
+
+    assert observed["closed"] is True
+    assert observed["outcome"] == ("enrichment_poll", expected_outcome)
+    assert observed.get("countdown") == expected_countdown
+
+
 def test_maintenance_tasks_are_isolated_on_a_dedicated_worker_and_queue() -> None:
     assert celery_app.conf.beat_schedule == {}
     assert "maintenance.reconcile_expired_snapshots" in maintenance_celery_app.tasks
