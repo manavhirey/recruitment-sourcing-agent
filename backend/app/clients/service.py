@@ -140,6 +140,14 @@ class ClientService:
             adjacent_industry_code
         ):
             raise ClientError("industry_code_invalid")
+        industry_assigned = self.session.scalar(
+            select(ClientIndustry.id).where(
+                ClientIndustry.client_id == client_id,
+                ClientIndustry.industry_code == industry_code,
+            )
+        )
+        if industry_assigned is None:
+            raise ClientError("client_industry_not_assigned")
         if not self.taxonomy.is_adjacent(industry_code, adjacent_industry_code):
             raise ClientError("industry_adjacency_invalid")
         record = self._begin(

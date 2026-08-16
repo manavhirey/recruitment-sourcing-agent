@@ -50,6 +50,7 @@ def _raise_client_error(error: ClientError) -> NoReturn:
         "recruiter_not_found": status.HTTP_404_NOT_FOUND,
         "client_name_invalid": status.HTTP_400_BAD_REQUEST,
         "industry_code_invalid": status.HTTP_400_BAD_REQUEST,
+        "client_industry_not_assigned": status.HTTP_400_BAD_REQUEST,
         "industry_adjacency_invalid": status.HTTP_400_BAD_REQUEST,
         "idempotency_key_invalid": status.HTTP_400_BAD_REQUEST,
         "idempotency_conflict": status.HTTP_409_CONFLICT,

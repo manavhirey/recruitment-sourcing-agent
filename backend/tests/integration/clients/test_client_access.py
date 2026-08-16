@@ -184,3 +184,36 @@ def test_owner_grant_allows_recruiter_to_read_only_granted_client(
 
     assert visible.status_code == 200
     assert not_visible.status_code == 404
+
+
+def test_owner_cannot_approve_adjacency_from_unassigned_industry(
+    client_access_api: dict[str, Any],
+) -> None:
+    headers = {
+        "Authorization": "Bearer signed-token",
+        "X-Tenant-ID": str(client_access_api["tenant_id"]),
+    }
+    client_access_api["verifier"].claims = IdentityClaims(
+        subject="oidc|owner",
+        email="owner@agency.test",
+        name="Owner",
+        email_verified=True,
+    )
+    created = client_access_api["api"].post(
+        "/api/v1/clients",
+        headers={**headers, "Idempotency-Key": "create-healthcare-client"},
+        json={"name": "Healthcare Client", "industry_codes": ["healthcare"]},
+    )
+    assert created.status_code == 201
+
+    approval = client_access_api["api"].put(
+        f"/api/v1/clients/{created.json()['id']}/adjacent-industries",
+        headers={**headers, "Idempotency-Key": "approve-unassigned-adjacency"},
+        json={
+            "industry_code": "financial_services.banking",
+            "adjacent_industry_code": "technology.fintech",
+        },
+    )
+
+    assert approval.status_code == 400
+    assert approval.json() == {"detail": {"code": "client_industry_not_assigned"}}

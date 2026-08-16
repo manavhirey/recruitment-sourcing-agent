@@ -43,6 +43,9 @@ class ClientIndustry(Base):
     taxonomy_version: Mapped[str] = mapped_column(
         String(32), nullable=False, default="v1"
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
 
 
 class ClientAdjacentIndustry(Base):

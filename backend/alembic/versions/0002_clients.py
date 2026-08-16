@@ -51,6 +51,7 @@ def upgrade() -> None:
         sa.Column("client_id", uuid, nullable=False),
         sa.Column("industry_code", sa.String(length=128), nullable=False),
         sa.Column("taxonomy_version", sa.String(length=32), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(["tenant_id"], ["tenants.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(
             ["client_id"], ["client_companies.id"], ondelete="CASCADE"
