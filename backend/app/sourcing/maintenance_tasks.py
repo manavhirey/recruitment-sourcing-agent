@@ -33,9 +33,9 @@ def _run_snapshot_reconciliation(settings: MaintenanceSettings) -> None:
     client = boto3.client(
         "s3",
         endpoint_url=settings.object_store_endpoint,
-        aws_access_key_id=settings.object_store_admin_access_key_id.get_secret_value(),
+        aws_access_key_id=settings.object_store_delete_access_key_id.get_secret_value(),
         aws_secret_access_key=(
-            settings.object_store_admin_secret_access_key.get_secret_value()
+            settings.object_store_delete_secret_access_key.get_secret_value()
         ),
     )
     engine = create_engine(settings.maintenance_database_url, pool_pre_ping=True)

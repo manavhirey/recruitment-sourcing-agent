@@ -720,7 +720,16 @@ def _enrichment_dependencies(settings: Any):
         settings.suppression_hmac_key.get_secret_value().encode(),
     )
     snapshots = SnapshotStore(
-        boto3.client("s3", endpoint_url=settings.object_store_endpoint),
+        boto3.client(
+            "s3",
+            endpoint_url=settings.object_store_endpoint,
+            aws_access_key_id=(
+                settings.object_store_writer_access_key_id.get_secret_value()
+            ),
+            aws_secret_access_key=(
+                settings.object_store_writer_secret_access_key.get_secret_value()
+            ),
+        ),
         settings.object_store_bucket,
         settings.contact_encryption_key.get_secret_value(),
     )

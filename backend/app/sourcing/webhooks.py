@@ -167,7 +167,16 @@ def _snapshot_store(request: Request) -> SnapshotStore:
 
         settings: Settings = request.app.state.settings
         store = SnapshotStore(
-            boto3.client("s3", endpoint_url=settings.object_store_endpoint),
+            boto3.client(
+                "s3",
+                endpoint_url=settings.object_store_endpoint,
+                aws_access_key_id=(
+                    settings.object_store_writer_access_key_id.get_secret_value()
+                ),
+                aws_secret_access_key=(
+                    settings.object_store_writer_secret_access_key.get_secret_value()
+                ),
+            ),
             settings.object_store_bucket,
             settings.contact_encryption_key.get_secret_value(),
         )
@@ -212,6 +221,16 @@ async def apollo_webhook(
         forwarded_for=request.headers.get("x-forwarded-for"),
         trusted_proxies=trusted,
     )
+    allowed = await run_in_threadpool(
+        _limiter(request).allow,
+        source,
+        datetime.now(UTC).timestamp(),
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "webhook_rate_limited"},
+        )
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -265,12 +284,6 @@ def _process_webhook_delivery(
     settings: Settings,
     source: str,
 ) -> None:
-    limiter = _limiter(request)
-    if not limiter.allow(source, datetime.now(UTC).timestamp()):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={"code": "webhook_rate_limited"},
-        )
     codec = CapabilityTokenCodec(settings.webhook_hmac_key.get_secret_value().encode())
     try:
         apply_capability_payload(

@@ -2,13 +2,15 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Self
 from uuid import uuid4
 
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from app.core.config import Settings
+from app.core.config import LifecycleAdminSettings, Settings
 from app.maintenance_worker import celery_app as maintenance_celery_app
+from app.providers import snapshot_lifecycle_cli
 from app.providers.base import (
     ProviderAuthenticationError,
     ProviderRateLimited,
@@ -161,14 +163,107 @@ def test_maintenance_tasks_use_only_narrow_maintenance_database_url(
 def test_provider_runtime_dependency_setup_has_no_bucket_admin_side_effect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    received: dict[str, object] = {}
+
     class RuntimeObjectStore:
         def put_bucket_lifecycle_configuration(self, **kwargs: object) -> None:
             del kwargs
             raise AssertionError("provider runtime attempted bucket administration")
 
-    monkeypatch.setattr("boto3.client", lambda *args, **kwargs: RuntimeObjectStore())
+    def build_client(*args: object, **kwargs: object) -> RuntimeObjectStore:
+        del args
+        received.update(kwargs)
+        return RuntimeObjectStore()
 
-    tasks._enrichment_dependencies(Settings.for_test())
+    monkeypatch.setattr("boto3.client", build_client)
+
+    settings = Settings.for_test()
+    tasks._enrichment_dependencies(settings)
+
+    assert received["aws_access_key_id"] == "test-writer-key"
+    assert received["aws_secret_access_key"] == "test-writer-secret"
+
+
+def test_daily_maintenance_worker_uses_delete_only_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: dict[str, object] = {}
+
+    class DeleteOnlyObjectStore:
+        def delete_object(self, **kwargs: object) -> None:
+            del kwargs
+
+    class EmptySession:
+        def __init__(self, engine: object) -> None:
+            del engine
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(all=list)
+
+        def commit(self) -> None:
+            return None
+
+    class Engine:
+        def dispose(self) -> None:
+            return None
+
+    def build_client(*args: object, **kwargs: object) -> DeleteOnlyObjectStore:
+        del args
+        received.update(kwargs)
+        return DeleteOnlyObjectStore()
+
+    monkeypatch.setattr("boto3.client", build_client)
+    monkeypatch.setattr(
+        maintenance_tasks, "create_engine", lambda *args, **kwargs: Engine()
+    )
+    monkeypatch.setattr(maintenance_tasks, "Session", EmptySession)
+
+    maintenance_tasks._run_snapshot_reconciliation(
+        maintenance_tasks.MaintenanceSettings.for_test()
+    )
+
+    assert received["aws_access_key_id"] == "test-delete-key"
+    assert received["aws_secret_access_key"] == "test-delete-secret"
+    assert not hasattr(DeleteOnlyObjectStore(), "put_bucket_lifecycle_configuration")
+
+
+def test_one_shot_lifecycle_cli_uses_only_bucket_admin_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: dict[str, object] = {}
+    configured: list[tuple[object, str]] = []
+    client = object()
+
+    def build_client(*args: object, **kwargs: object) -> object:
+        del args
+        received.update(kwargs)
+        return client
+
+    settings = LifecycleAdminSettings.for_test()
+    monkeypatch.setattr("boto3.client", build_client)
+    monkeypatch.setattr(
+        snapshot_lifecycle_cli,
+        "get_lifecycle_admin_settings",
+        lambda: settings,
+    )
+    monkeypatch.setattr(
+        snapshot_lifecycle_cli,
+        "configure_snapshot_lifecycle",
+        lambda value, bucket: configured.append((value, bucket)),
+    )
+
+    snapshot_lifecycle_cli.main()
+
+    assert received["aws_access_key_id"] == "test-lifecycle-key"
+    assert received["aws_secret_access_key"] == "test-lifecycle-secret"
+    assert configured == [(client, settings.object_store_bucket)]
 
 
 def test_provider_retry_uses_reset_time_or_exponential_jitter() -> None:

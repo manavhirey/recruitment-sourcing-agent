@@ -7,18 +7,21 @@ import threading
 import time
 from collections.abc import Generator
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
 import httpx
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from redis import Redis
 from redis.exceptions import RedisError
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
+from starlette.requests import Request
 
 from app.candidates.contacts import ContactCipher
 from app.candidates.models import Candidate, ContactPoint, SourceIdentity
@@ -456,6 +459,52 @@ def test_webhook_rejects_oversized_body_before_payload_processing(
         assert session.scalar(select(func.count()).select_from(WebhookDelivery)) == 0
 
 
+def test_rate_limited_webhook_does_not_consume_or_parse_request_body() -> None:
+    received = 0
+
+    class RejectAllLimiter:
+        def allow(self, source: str, now: float) -> bool:
+            del source, now
+            return False
+
+    async def receive() -> dict[str, object]:
+        nonlocal received
+        received += 1
+        return {
+            "type": "http.request",
+            "body": b"this is deliberately not JSON",
+            "more_body": False,
+        }
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(webhook_rate_limiter=RejectAllLimiter())
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/webhooks/apollo/token",
+            "headers": [],
+            "client": ("198.51.100.9", 443),
+            "app": app,
+        },
+        receive,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(
+            webhooks_module.apollo_webhook(
+                "unused-token",
+                request,
+                None,  # type: ignore[arg-type]
+                Settings.for_test(),
+            )
+        )
+
+    assert caught.value.status_code == 429
+    assert received == 0
+
+
 def test_blocked_sync_webhook_dependency_does_not_stall_event_loop(
     webhook_scenario: dict[str, Any], apollo_phone_payload: dict[str, object]
 ) -> None:
@@ -471,6 +520,54 @@ def test_blocked_sync_webhook_dependency_does_not_stall_event_loop(
     app = scenario["api"].app
     app.state.webhook_rate_limiter = BlockingLimiter()
     probe_path = f"/event-loop-probe-{uuid4()}"
+
+    @app.get(probe_path)
+    async def event_loop_probe() -> dict[str, str]:
+        return {"status": "responsive"}
+
+    async def exercise() -> tuple[float, int, int]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            started_at = time.monotonic()
+            webhook = asyncio.create_task(
+                client.post(
+                    f"/webhooks/apollo/{scenario['token']}",
+                    json=apollo_phone_payload,
+                )
+            )
+            await asyncio.sleep(0.05)
+            probe = await client.get(probe_path)
+            elapsed = time.monotonic() - started_at
+            release.set()
+            webhook_response = await webhook
+            return elapsed, probe.status_code, webhook_response.status_code
+
+    elapsed, probe_status, webhook_status = asyncio.run(exercise())
+
+    assert probe_status == 200
+    assert webhook_status == 202
+    assert elapsed < 0.3
+
+
+def test_blocked_webhook_application_does_not_stall_event_loop(
+    webhook_scenario: dict[str, Any],
+    apollo_phone_payload: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = webhook_scenario
+    release = threading.Event()
+
+    def blocked_application(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        release.wait(timeout=0.75)
+
+    monkeypatch.setattr(
+        webhooks_module, "_process_webhook_delivery", blocked_application
+    )
+    app = scenario["api"].app
+    probe_path = f"/event-loop-application-probe-{uuid4()}"
 
     @app.get(probe_path)
     async def event_loop_probe() -> dict[str, str]:

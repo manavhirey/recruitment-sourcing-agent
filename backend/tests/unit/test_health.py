@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -8,7 +9,12 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy.engine import make_url
 
-from app.core.config import MaintenanceSettings, MigrationSettings, Settings
+from app.core.config import (
+    LifecycleAdminSettings,
+    MaintenanceSettings,
+    MigrationSettings,
+    Settings,
+)
 from app.main import create_app
 
 
@@ -18,7 +24,75 @@ def test_test_settings_supply_all_required_secrets() -> None:
     assert make_url(settings.database_url).username == "sourcing_api_test"
     assert not hasattr(settings, "migration_database_url")
     assert not hasattr(settings, "maintenance_database_url")
-    assert not hasattr(settings, "object_store_admin_secret_access_key")
+    assert not hasattr(settings, "object_store_delete_secret_access_key")
+    assert not hasattr(settings, "object_store_lifecycle_admin_secret_access_key")
+
+
+def test_object_store_capability_settings_expose_only_their_own_credentials() -> None:
+    runtime = Settings.for_test()
+    maintenance = MaintenanceSettings.for_test()
+    lifecycle = LifecycleAdminSettings.for_test()
+
+    assert hasattr(runtime, "object_store_writer_secret_access_key")
+    assert not hasattr(runtime, "object_store_delete_secret_access_key")
+    assert not hasattr(runtime, "object_store_lifecycle_admin_secret_access_key")
+    assert hasattr(maintenance, "object_store_delete_secret_access_key")
+    assert not hasattr(maintenance, "object_store_writer_secret_access_key")
+    assert not hasattr(maintenance, "object_store_lifecycle_admin_secret_access_key")
+    assert hasattr(lifecycle, "object_store_lifecycle_admin_secret_access_key")
+    assert not hasattr(lifecycle, "object_store_writer_secret_access_key")
+    assert not hasattr(lifecycle, "object_store_delete_secret_access_key")
+
+
+def test_object_store_access_key_identities_must_be_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OBJECT_STORE_DELETE_ACCESS_KEY_ID", "shared-key")
+    monkeypatch.setenv("OBJECT_STORE_LIFECYCLE_ADMIN_ACCESS_KEY_ID", "lifecycle-key")
+    payload = Settings.for_test().model_dump()
+    payload["object_store_writer_access_key_id"] = "shared-key"
+
+    with pytest.raises(ValidationError, match="object-store access-key identities"):
+        Settings(_env_file=None, **payload)
+
+
+def test_clean_process_capability_settings_are_disjoint() -> None:
+    backend_root = Path(__file__).resolve().parents[2]
+    capabilities = (
+        ("Settings", "OBJECT_STORE_WRITER_SECRET_ACCESS_KEY"),
+        ("MaintenanceSettings", "OBJECT_STORE_DELETE_SECRET_ACCESS_KEY"),
+        (
+            "LifecycleAdminSettings",
+            "OBJECT_STORE_LIFECYCLE_ADMIN_SECRET_ACCESS_KEY",
+        ),
+    )
+    secret_names = {secret for _, secret in capabilities}
+    for model_name, own_secret in capabilities:
+        probe_environment = os.environ.copy()
+        for secret_name in secret_names:
+            probe_environment.pop(secret_name, None)
+        probe_environment[own_secret] = "process-specific-secret"
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from app.core.config import LifecycleAdminSettings, "
+                    "MaintenanceSettings, Settings; "
+                    f"settings={model_name}(); "
+                    f"assert '{own_secret.lower()}' in settings.model_fields; "
+                    f"assert not set({sorted(secret.lower() for secret in secret_names - {own_secret})!r}) "
+                    ".intersection(settings.model_fields)"
+                ),
+            ],
+            cwd=backend_root,
+            env=probe_environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert probe.returncode == 0, probe.stderr
 
 
 def test_runtime_settings_do_not_require_schema_owner_credentials(
@@ -54,8 +128,8 @@ def test_maintenance_database_url_is_required_only_by_maintenance_settings(
             _env_file=None,
             redis_url="redis://localhost/15",
             object_store_endpoint="http://localhost:9000",
-            object_store_admin_access_key_id="admin",
-            object_store_admin_secret_access_key="secret",
+            object_store_delete_access_key_id="delete",
+            object_store_delete_secret_access_key="secret",
         )
 
     assert not hasattr(Settings.for_test(), "maintenance_database_url")
@@ -94,6 +168,12 @@ MIGRATION_DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/sou
 MAINTENANCE_DATABASE_URL=postgresql+psycopg://sourcing_maintenance:maintenance-password@localhost:5432/sourcing
 REDIS_URL=redis://localhost:6379/0
 OBJECT_STORE_ENDPOINT=http://localhost:9000
+OBJECT_STORE_WRITER_ACCESS_KEY_ID=writer-key
+OBJECT_STORE_WRITER_SECRET_ACCESS_KEY=writer-secret
+OBJECT_STORE_DELETE_ACCESS_KEY_ID=delete-key
+OBJECT_STORE_DELETE_SECRET_ACCESS_KEY=delete-secret
+OBJECT_STORE_LIFECYCLE_ADMIN_ACCESS_KEY_ID=lifecycle-key
+OBJECT_STORE_LIFECYCLE_ADMIN_SECRET_ACCESS_KEY=lifecycle-secret
 OIDC_ISSUER=https://issuer.example.com/
 OIDC_AUDIENCE=sourcing-api
 OPENAI_API_KEY=development-openai-key
