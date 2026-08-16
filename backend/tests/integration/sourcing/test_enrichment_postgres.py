@@ -66,6 +66,7 @@ _TENANT_TABLES = (
     "candidate_contact_points",
     "candidate_contact_retention_tombstones",
     "enrichment_requests",
+    "enrichment_retry_dispatches",
     "enrichment_webhook_deliveries",
     "provider_snapshot_references",
 )
@@ -126,7 +127,14 @@ def owner_engine() -> Generator[Engine, None, None]:
 def test_0007_to_head_upgrade_downgrade_and_model_parity(owner_engine: Engine) -> None:
     command.downgrade(_config(), "0006_contacts_enrichment")
     tables = set(inspect(owner_engine).get_table_names())
-    assert set(_TENANT_TABLES) - {"candidate_contact_retention_tombstones"} <= tables
+    assert (
+        set(_TENANT_TABLES)
+        - {
+            "candidate_contact_retention_tombstones",
+            "enrichment_retry_dispatches",
+        }
+        <= tables
+    )
     assert "candidate_contact_retention_tombstones" not in tables
     request_columns = {
         column["name"]
@@ -138,7 +146,7 @@ def test_0007_to_head_upgrade_downgrade_and_model_parity(owner_engine: Engine) -
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0015_tenant_acceptance_fks"
+            "0016_enrichment_retry_dispatch"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -282,6 +290,9 @@ def test_maintenance_role_can_only_erase_due_contacts(
         ("maintenance_claim_pending_enrichment_dispatches", "EXECUTE"),
         ("maintenance_complete_enrichment_dispatch", "EXECUTE"),
         ("maintenance_release_enrichment_dispatch", "EXECUTE"),
+        ("maintenance_claim_pending_enrichment_retries", "EXECUTE"),
+        ("maintenance_complete_enrichment_retry_publish", "EXECUTE"),
+        ("maintenance_release_enrichment_retry_publish", "EXECUTE"),
     }
 
 

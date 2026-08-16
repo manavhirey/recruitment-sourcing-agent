@@ -28,6 +28,19 @@ def _enrichment_claim() -> dispatch_recovery.EnrichmentDispatchClaim:
     )
 
 
+def _enrichment_retry_claim() -> dispatch_recovery.EnrichmentRetryDispatchClaim:
+    run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    return dispatch_recovery.EnrichmentRetryDispatchClaim(
+        tenant_id=tenant_id,
+        run_id=run_id,
+        generation=3,
+        user_id=user_id,
+        candidate_limit=50,
+        dispatch_key=f"enrich-run-retry:{run_id}:3",
+        claim_token=uuid4(),
+    )
+
+
 def test_recovery_acknowledges_only_after_broker_publish() -> None:
     claim = _claim()
     events: list[str] = []
@@ -106,6 +119,52 @@ def test_enrichment_recovery_publishes_the_persisted_identity_once_before_ack() 
     assert result == dispatch_recovery.RecoveryResult(published=1, failed=0)
 
 
+def test_enrichment_retry_recovery_publishes_generation_before_ack() -> None:
+    claim = _enrichment_retry_claim()
+    events: list[str] = []
+
+    result = dispatch_recovery.recover_claimed_dispatches(
+        [claim],
+        publish=lambda item: events.append(f"publish:{item.dispatch_key}"),
+        complete=lambda item: events.append(f"complete:{item.dispatch_key}"),
+        release=lambda item: events.append(f"release:{item.dispatch_key}"),
+    )
+
+    assert events == [
+        f"publish:{claim.dispatch_key}",
+        f"complete:{claim.dispatch_key}",
+    ]
+    assert result == dispatch_recovery.RecoveryResult(published=1, failed=0)
+
+
+def test_enrichment_retry_publisher_uses_persisted_generation_and_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim = _enrichment_retry_claim()
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        dispatch_recovery.celery_app,
+        "send_task",
+        lambda name, *, args, task_id: observed.update(
+            name=name, args=args, task_id=task_id
+        ),
+    )
+
+    dispatch_recovery._publish_enrichment_retry(claim)
+
+    assert observed == {
+        "name": "sourcing.enrich_run",
+        "args": (
+            str(claim.run_id),
+            str(claim.tenant_id),
+            str(claim.user_id),
+            claim.candidate_limit,
+            claim.generation,
+        ),
+        "task_id": claim.dispatch_key,
+    }
+
+
 def test_periodic_task_uses_only_maintenance_database_capability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -130,6 +189,14 @@ def test_periodic_task_uses_only_maintenance_database_capability(
             enrichment_publish=publish,
         ),
     )
+    monkeypatch.setattr(
+        dispatch_recovery,
+        "recover_pending_enrichment_retries",
+        lambda database_url, publish: observed.update(
+            retry_database_url=database_url,
+            retry_publish=publish,
+        ),
+    )
 
     dispatch_recovery.recover_sourcing_dispatches.run()
 
@@ -137,3 +204,5 @@ def test_periodic_task_uses_only_maintenance_database_capability(
     assert callable(observed["publish"])
     assert observed["enrichment_database_url"] == settings.maintenance_database_url
     assert callable(observed["enrichment_publish"])
+    assert observed["retry_database_url"] == settings.maintenance_database_url
+    assert callable(observed["retry_publish"])

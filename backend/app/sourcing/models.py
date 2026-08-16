@@ -271,6 +271,74 @@ class EnrichmentRequest(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class EnrichmentRetryDispatch(Base):
+    __tablename__ = "enrichment_retry_dispatches"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'published', 'claimed', 'completed')",
+            name="ck_enrichment_retry_dispatches_status",
+        ),
+        CheckConstraint(
+            "generation > 0", name="ck_enrichment_retry_dispatches_generation"
+        ),
+        CheckConstraint(
+            "candidate_limit >= 0 AND candidate_limit <= 50",
+            name="ck_enrichment_retry_dispatches_candidate_limit",
+        ),
+        CheckConstraint(
+            "(claim_token IS NULL) = (claimed_at IS NULL)",
+            name="ck_enrichment_retry_dispatches_claim_pair",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'claimed') OR claim_token IS NULL",
+            name="ck_enrichment_retry_dispatches_claim_status",
+        ),
+        CheckConstraint(
+            "status <> 'claimed' OR claim_token IS NOT NULL",
+            name="ck_enrichment_retry_dispatches_claimed_token",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "run_id"),
+            ("sourcing_runs.tenant_id", "sourcing_runs.id"),
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "task_id",
+            name="uq_enrichment_retry_dispatches_tenant_task_id",
+        ),
+        Index(
+            "ix_enrichment_retry_dispatches_status_not_before",
+            "status",
+            "not_before",
+        ),
+    )
+
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    run_id: Mapped[UUID] = mapped_column(primary_key=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    state_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    task_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    candidate_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    not_before: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    claim_token: Mapped[UUID | None] = mapped_column()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
 class WebhookDelivery(Base):
     __tablename__ = "enrichment_webhook_deliveries"
     __table_args__ = (

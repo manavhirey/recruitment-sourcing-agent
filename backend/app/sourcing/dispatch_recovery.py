@@ -36,6 +36,17 @@ class EnrichmentDispatchClaim:
     dispatch_key: str
 
 
+@dataclass(frozen=True)
+class EnrichmentRetryDispatchClaim:
+    tenant_id: UUID
+    run_id: UUID
+    generation: int
+    user_id: UUID
+    candidate_limit: int
+    dispatch_key: str
+    claim_token: UUID
+
+
 def recover_claimed_dispatches[Claim](
     claims: Iterable[Claim],
     *,
@@ -165,6 +176,73 @@ def recover_pending_enrichment_dispatches(
     )
 
 
+def _enrichment_retry_claims(
+    session: Session, *, batch_size: int
+) -> list[EnrichmentRetryDispatchClaim]:
+    rows = session.execute(
+        text(
+            "SELECT tenant_id, run_id, generation, user_id, candidate_limit, "
+            "task_id, claim_token "
+            "FROM maintenance_claim_pending_enrichment_retries(:batch_size)"
+        ),
+        {"batch_size": batch_size},
+    ).all()
+    return [EnrichmentRetryDispatchClaim(*row) for row in rows]
+
+
+def _finish_enrichment_retry_claim(
+    database_url: str,
+    claim: EnrichmentRetryDispatchClaim,
+    function: str,
+) -> None:
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with Session(engine) as session:
+            session.scalar(
+                text(
+                    f"SELECT {function}(:tenant_id, :run_id, :generation, :claim_token)"
+                ),
+                {
+                    "tenant_id": claim.tenant_id,
+                    "run_id": claim.run_id,
+                    "generation": claim.generation,
+                    "claim_token": claim.claim_token,
+                },
+            )
+            session.commit()
+    finally:
+        engine.dispose()
+
+
+def recover_pending_enrichment_retries(
+    database_url: str,
+    publish: Callable[[EnrichmentRetryDispatchClaim], None],
+    *,
+    batch_size: int = 100,
+) -> RecoveryResult:
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with Session(engine) as session:
+            claims = _enrichment_retry_claims(session, batch_size=batch_size)
+            session.commit()
+    finally:
+        engine.dispose()
+    return recover_claimed_dispatches(
+        claims,
+        publish=publish,
+        complete=lambda claim: _finish_enrichment_retry_claim(
+            database_url,
+            claim,
+            "maintenance_complete_enrichment_retry_publish",
+        ),
+        release=lambda claim: _finish_enrichment_retry_claim(
+            database_url,
+            claim,
+            "maintenance_release_enrichment_retry_publish",
+        ),
+    )
+
+
 def _publish_sourcing_plan(claim: DispatchClaim) -> None:
     celery_app.send_task(
         "sourcing.plan_run",
@@ -190,6 +268,20 @@ def _publish_enrichment_request(claim: EnrichmentDispatchClaim) -> None:
     )
 
 
+def _publish_enrichment_retry(claim: EnrichmentRetryDispatchClaim) -> None:
+    celery_app.send_task(
+        "sourcing.enrich_run",
+        args=(
+            str(claim.run_id),
+            str(claim.tenant_id),
+            str(claim.user_id),
+            claim.candidate_limit,
+            claim.generation,
+        ),
+        task_id=claim.dispatch_key,
+    )
+
+
 @celery_app.task(name="maintenance.recover_sourcing_dispatches", shared=False)
 def recover_sourcing_dispatches() -> None:
     settings = get_maintenance_settings()
@@ -200,4 +292,8 @@ def recover_sourcing_dispatches() -> None:
     recover_pending_enrichment_dispatches(
         settings.maintenance_database_url,
         _publish_enrichment_request,
+    )
+    recover_pending_enrichment_retries(
+        settings.maintenance_database_url,
+        _publish_enrichment_retry,
     )

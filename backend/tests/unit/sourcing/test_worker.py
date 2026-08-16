@@ -1,6 +1,8 @@
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Self
@@ -37,6 +39,15 @@ from app.sourcing.tasks import (
     source_run,
 )
 from app.worker import celery_app
+
+
+def _allow_enrichment_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    @contextmanager
+    def acquired(*args: object):
+        yield True
+
+    monkeypatch.setattr(tasks, "_enrichment_execution_lock", acquired)
+    monkeypatch.setattr(tasks, "_has_active_enrichment_retry", lambda *args: False)
 
 
 def test_clean_worker_process_registers_sourcing_tasks() -> None:
@@ -248,6 +259,7 @@ def test_disabled_connector_marks_enrichment_partial_without_provider_call(
 ) -> None:
     run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
     observed: list[str] = []
+    _allow_enrichment_run(monkeypatch)
     monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: False)
     monkeypatch.setattr(
         tasks,
@@ -341,6 +353,8 @@ def test_enrichment_authz_failures_disable_platform_before_future_calls(
     reason: str,
 ) -> None:
     observed: list[object] = []
+    if task is enrich_run:
+        _allow_enrichment_run(monkeypatch)
 
     class Gateway:
         def close(self) -> None:
@@ -429,6 +443,16 @@ def test_exhausted_batch_schedules_one_fresh_run_delivery_for_later_batches(
 ) -> None:
     observed: dict[str, object] = {}
     run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    schedule = tasks.EnrichmentRetrySchedule(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        candidate_limit=50,
+        generation=7,
+        task_id=f"enrich-run-retry:{run_id}:7",
+        not_before=datetime.now(UTC),
+    )
+    _allow_enrichment_run(monkeypatch)
 
     class Gateway:
         def close(self) -> None:
@@ -458,8 +482,70 @@ def test_exhausted_batch_schedules_one_fresh_run_delivery_for_later_batches(
 
     monkeypatch.setattr(
         tasks,
-        "_enrichment_retry_dispatch_key",
-        lambda *args: "enrich-run-retry:stable-state",
+        "_stage_enrichment_retry",
+        lambda *args, **kwargs: observed.update(staged=kwargs) or schedule,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_publish_enrichment_retry",
+        lambda *args: observed.update(published=args[-1]) or True,
+    )
+
+    enrich_run.run(str(run_id), str(tenant_id), str(user_id))
+
+    assert observed == {
+        "closed": True,
+        "outcome": ("people_enrichment", "retry_scheduled"),
+        "staged": {
+            "candidate_limit": 50,
+            "retry_after": 23,
+            "current_generation": None,
+            "current_claim_token": None,
+        },
+        "published": schedule,
+    }
+
+
+def test_stale_retry_generation_is_a_noop_before_provider_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[str] = []
+    _allow_enrichment_run(monkeypatch)
+    monkeypatch.setattr(
+        tasks,
+        "_claim_enrichment_retry_delivery",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "is_provider_enabled",
+        lambda *args: observed.append("provider_checked") or True,
+    )
+
+    enrich_run.run(str(uuid4()), str(uuid4()), str(uuid4()), 50, 7)
+
+    assert observed == []
+
+
+def test_retry_publisher_carries_generation_and_marks_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    schedule = tasks.EnrichmentRetrySchedule(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        candidate_limit=37,
+        generation=4,
+        task_id=f"enrich-run-retry:{run_id}:4",
+        not_before=datetime.now(UTC),
+    )
+    claim_token = uuid4()
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        tasks,
+        "_claim_retry_publish",
+        lambda *args: claim_token,
     )
     monkeypatch.setattr(
         enrich_run,
@@ -469,22 +555,53 @@ def test_exhausted_batch_schedules_one_fresh_run_delivery_for_later_batches(
         ),
     )
     monkeypatch.setattr(
-        enrich_run,
-        "retry",
-        lambda **kwargs: pytest.fail("durable deferrals must not consume task retries"),
+        tasks,
+        "_finish_retry_publish",
+        lambda *args, **kwargs: observed.update(finished=(args[-1], kwargs)) or True,
     )
 
-    enrich_run.run(str(run_id), str(tenant_id), str(user_id))
-
+    assert tasks._publish_enrichment_retry(object(), object(), schedule) is True  # type: ignore[arg-type]
     assert observed == {
-        "closed": True,
-        "outcome": ("people_enrichment", "retry_scheduled"),
         "scheduled": (
-            (str(run_id), str(tenant_id), str(user_id), 50),
-            23,
-            "enrich-run-retry:stable-state",
+            (str(run_id), str(tenant_id), str(user_id), 37, 4),
+            0,
+            schedule.task_id,
         ),
+        "finished": (claim_token, {"published": True}),
     }
+
+
+def test_retry_publisher_releases_claim_when_broker_publish_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    schedule = tasks.EnrichmentRetrySchedule(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        candidate_limit=50,
+        generation=2,
+        task_id=f"enrich-run-retry:{run_id}:2",
+        not_before=datetime.now(UTC),
+    )
+    claim_token = uuid4()
+    finished: list[tuple[object, dict[str, object]]] = []
+
+    def fail_publish(**kwargs: object) -> None:
+        raise ConnectionError("broker unavailable")
+
+    monkeypatch.setattr(tasks, "_claim_retry_publish", lambda *args: claim_token)
+    monkeypatch.setattr(enrich_run, "apply_async", fail_publish)
+    monkeypatch.setattr(
+        tasks,
+        "_finish_retry_publish",
+        lambda *args, **kwargs: finished.append((args[-1], kwargs)) or True,
+    )
+
+    with pytest.raises(ConnectionError, match="broker unavailable"):
+        tasks._publish_enrichment_retry(object(), object(), schedule)  # type: ignore[arg-type]
+
+    assert finished == [(claim_token, {"published": False})]
 
 
 @pytest.mark.parametrize(
@@ -501,6 +618,8 @@ def test_terminal_enrichment_failure_is_not_reported_as_success(
 ) -> None:
     observed: list[tuple[str, str]] = []
     request_id = uuid4()
+    if task is enrich_run:
+        _allow_enrichment_run(monkeypatch)
 
     class Gateway:
         def close(self) -> None:

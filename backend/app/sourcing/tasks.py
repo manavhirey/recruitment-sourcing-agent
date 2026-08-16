@@ -3,12 +3,13 @@ import random
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import asdict
-from datetime import UTC, datetime
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -45,6 +46,7 @@ from app.sourcing.enrichment import (
 )
 from app.sourcing.models import (
     EnrichmentRequest,
+    EnrichmentRetryDispatch,
     RunCandidate,
     RunCheckpoint,
     SourcingRun,
@@ -59,12 +61,30 @@ _MAX_RUN_CANDIDATES = 300
 _MATCH_BATCH_SIZE = 100
 _LOCAL_LOCKS: dict[str, threading.Lock] = {}
 _LOCAL_LOCKS_GUARD = threading.Lock()
+_ENRICHMENT_RETRY_CLAIM_LEASE = timedelta(minutes=15)
 
 
 class SearchGateway(Protocol):
     def search(self, query: ProviderQuery, page: int) -> SearchPage: ...
 
     def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class EnrichmentRetrySchedule:
+    run_id: UUID
+    tenant_id: UUID
+    user_id: UUID
+    candidate_limit: int
+    generation: int
+    task_id: str
+    not_before: datetime
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _provider_retry_countdown(
@@ -814,29 +834,75 @@ def _run_is_enrich_eligible(
     return eligible
 
 
-def _enrichment_retry_dispatch_key(
+@contextmanager
+def _enrichment_execution_lock(
     session_factory: sessionmaker[Session],
+    tenant_id: UUID,
     run_id: UUID,
+) -> Iterator[bool]:
+    lock_key = f"enrichment:{tenant_id}:{run_id}"
+    with session_factory() as probe_session:
+        bind = probe_session.get_bind()
+    if bind.dialect.name == "postgresql":
+        if not isinstance(bind, Engine):
+            raise TypeError("enrichment execution lock requires an engine bind")
+        lock_id = int.from_bytes(
+            hashlib.sha256(lock_key.encode()).digest()[:8],
+            "big",
+            signed=True,
+        )
+        with bind.connect() as lock_connection:
+            acquired = bool(
+                lock_connection.scalar(
+                    text("SELECT pg_try_advisory_lock(:lock_id)"),
+                    {"lock_id": lock_id},
+                )
+            )
+            lock_connection.commit()
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    lock_connection.execute(
+                        text("SELECT pg_advisory_unlock(:lock_id)"),
+                        {"lock_id": lock_id},
+                    )
+                    lock_connection.commit()
+        return
+
+    with _LOCAL_LOCKS_GUARD:
+        local_lock = _LOCAL_LOCKS.setdefault(lock_key, threading.Lock())
+    acquired = local_lock.acquire(blocking=False)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            local_lock.release()
+            with _LOCAL_LOCKS_GUARD:
+                if not local_lock.locked():
+                    _LOCAL_LOCKS.pop(lock_key, None)
+
+
+def _retry_state_fingerprint(
+    session: Session,
     context: RequestContext,
+    run_id: UUID,
 ) -> str:
-    with session_factory() as session:
-        _apply_tenant_context(session, context.tenant_id)
-        states = session.execute(
-            select(
-                EnrichmentRequest.id,
-                EnrichmentRequest.status,
-                EnrichmentRequest.retry_count,
-                EnrichmentRequest.poll_after,
-                EnrichmentRequest.stage_deadline,
-            )
-            .where(
-                EnrichmentRequest.tenant_id == context.tenant_id,
-                EnrichmentRequest.run_id == run_id,
-                EnrichmentRequest.status.in_(("queued", "submitting")),
-            )
-            .order_by(EnrichmentRequest.id)
-        ).all()
-        session.rollback()
+    states = session.execute(
+        select(
+            EnrichmentRequest.id,
+            EnrichmentRequest.status,
+            EnrichmentRequest.retry_count,
+            EnrichmentRequest.poll_after,
+            EnrichmentRequest.stage_deadline,
+        )
+        .where(
+            EnrichmentRequest.tenant_id == context.tenant_id,
+            EnrichmentRequest.run_id == run_id,
+            EnrichmentRequest.status.in_(("queued", "submitting")),
+        )
+        .order_by(EnrichmentRequest.id)
+    ).all()
     fingerprint = "\0".join(
         ":".join(
             (
@@ -849,8 +915,326 @@ def _enrichment_retry_dispatch_key(
         )
         for request_id, status, retry_count, poll_after, stage_deadline in states
     )
-    digest = hashlib.sha256(fingerprint.encode()).hexdigest()[:24]
-    return f"enrich-run-retry:{run_id}:{digest}"
+    return hashlib.sha256(fingerprint.encode()).hexdigest()
+
+
+def _retry_schedule(row: EnrichmentRetryDispatch) -> EnrichmentRetrySchedule:
+    return EnrichmentRetrySchedule(
+        run_id=row.run_id,
+        tenant_id=row.tenant_id,
+        user_id=row.requested_by_user_id,
+        candidate_limit=row.candidate_limit,
+        generation=row.generation,
+        task_id=row.task_id,
+        not_before=_utc(row.not_before),
+    )
+
+
+def _stage_enrichment_retry(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    run_id: UUID,
+    *,
+    candidate_limit: int,
+    retry_after: int,
+    current_generation: int | None,
+    current_claim_token: UUID | None,
+) -> EnrichmentRetrySchedule | None:
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        row = session.scalar(
+            select(EnrichmentRetryDispatch)
+            .where(
+                EnrichmentRetryDispatch.tenant_id == context.tenant_id,
+                EnrichmentRetryDispatch.run_id == run_id,
+            )
+            .with_for_update()
+        )
+        fingerprint = _retry_state_fingerprint(session, context, run_id)
+        if current_generation is None:
+            if (
+                row is not None
+                and row.status in ("pending", "published")
+                and row.state_fingerprint == fingerprint
+            ):
+                schedule = _retry_schedule(row)
+                session.rollback()
+                return schedule
+        elif (
+            row is None
+            or row.generation != current_generation
+            or row.status != "claimed"
+            or row.claim_token != current_claim_token
+        ):
+            session.rollback()
+            return None
+        generation = (row.generation if row is not None else 0) + 1
+        now = datetime.now(UTC)
+        if row is None:
+            row = EnrichmentRetryDispatch(
+                tenant_id=context.tenant_id,
+                run_id=run_id,
+                generation=generation,
+                status="pending",
+                state_fingerprint=fingerprint,
+                task_id=f"enrich-run-retry:{run_id}:{generation}",
+                requested_by_user_id=context.user_id,
+                candidate_limit=candidate_limit,
+                not_before=now + timedelta(seconds=max(1, retry_after)),
+            )
+            session.add(row)
+        else:
+            row.generation = generation
+            row.status = "pending"
+            row.state_fingerprint = fingerprint
+            row.task_id = f"enrich-run-retry:{run_id}:{generation}"
+            row.requested_by_user_id = context.user_id
+            row.candidate_limit = candidate_limit
+            row.not_before = now + timedelta(seconds=max(1, retry_after))
+            row.claim_token = None
+            row.claimed_at = None
+        session.commit()
+        return _retry_schedule(row)
+
+
+def _claim_retry_publish(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    schedule: EnrichmentRetrySchedule,
+) -> UUID | None:
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        row = session.scalar(
+            select(EnrichmentRetryDispatch)
+            .where(
+                EnrichmentRetryDispatch.tenant_id == context.tenant_id,
+                EnrichmentRetryDispatch.run_id == schedule.run_id,
+            )
+            .with_for_update()
+        )
+        if (
+            row is None
+            or row.generation != schedule.generation
+            or row.status != "pending"
+        ):
+            session.rollback()
+            return None
+        claimed_at = _utc(row.claimed_at) if row.claimed_at is not None else None
+        if claimed_at is not None and claimed_at >= (
+            datetime.now(UTC) - _ENRICHMENT_RETRY_CLAIM_LEASE
+        ):
+            session.rollback()
+            return None
+        claim_token = uuid4()
+        row.claim_token = claim_token
+        row.claimed_at = datetime.now(UTC)
+        session.commit()
+        return claim_token
+
+
+def _finish_retry_publish(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    schedule: EnrichmentRetrySchedule,
+    claim_token: UUID,
+    *,
+    published: bool,
+) -> bool:
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        row = session.scalar(
+            select(EnrichmentRetryDispatch)
+            .where(
+                EnrichmentRetryDispatch.tenant_id == context.tenant_id,
+                EnrichmentRetryDispatch.run_id == schedule.run_id,
+            )
+            .with_for_update()
+        )
+        if (
+            row is None
+            or row.generation != schedule.generation
+            or row.status != "pending"
+            or row.claim_token != claim_token
+        ):
+            session.rollback()
+            return False
+        if published:
+            row.status = "published"
+        row.claim_token = None
+        row.claimed_at = None
+        session.commit()
+        return True
+
+
+def _publish_enrichment_retry(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    schedule: EnrichmentRetrySchedule,
+) -> bool:
+    claim_token = _claim_retry_publish(session_factory, context, schedule)
+    if claim_token is None:
+        return False
+    countdown = max(
+        0,
+        int((schedule.not_before - datetime.now(UTC)).total_seconds() + 0.999999),
+    )
+    try:
+        enrich_run.apply_async(
+            args=(
+                str(schedule.run_id),
+                str(schedule.tenant_id),
+                str(schedule.user_id),
+                schedule.candidate_limit,
+                schedule.generation,
+            ),
+            countdown=countdown,
+            task_id=schedule.task_id,
+        )
+    except Exception:
+        _finish_retry_publish(
+            session_factory,
+            context,
+            schedule,
+            claim_token,
+            published=False,
+        )
+        raise
+    _finish_retry_publish(
+        session_factory,
+        context,
+        schedule,
+        claim_token,
+        published=True,
+    )
+    return True
+
+
+def _claim_enrichment_retry_delivery(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    run_id: UUID,
+    generation: int,
+    candidate_limit: int,
+) -> UUID | None:
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        row = session.scalar(
+            select(EnrichmentRetryDispatch)
+            .where(
+                EnrichmentRetryDispatch.tenant_id == context.tenant_id,
+                EnrichmentRetryDispatch.run_id == run_id,
+            )
+            .with_for_update()
+        )
+        if (
+            row is None
+            or row.generation != generation
+            or row.requested_by_user_id != context.user_id
+            or row.candidate_limit != candidate_limit
+            or _utc(row.not_before) > datetime.now(UTC)
+        ):
+            session.rollback()
+            return None
+        claimed_at = _utc(row.claimed_at) if row.claimed_at is not None else None
+        claim_expired = claimed_at is None or claimed_at < (
+            datetime.now(UTC) - _ENRICHMENT_RETRY_CLAIM_LEASE
+        )
+        if row.status not in ("pending", "published") and not (
+            row.status == "claimed" and claim_expired
+        ):
+            session.rollback()
+            return None
+        claim_token = uuid4()
+        row.status = "claimed"
+        row.claim_token = claim_token
+        row.claimed_at = datetime.now(UTC)
+        session.commit()
+        return claim_token
+
+
+def _has_active_enrichment_retry(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    run_id: UUID,
+) -> bool:
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        status = session.scalar(
+            select(EnrichmentRetryDispatch.status).where(
+                EnrichmentRetryDispatch.tenant_id == context.tenant_id,
+                EnrichmentRetryDispatch.run_id == run_id,
+            )
+        )
+        session.rollback()
+    return status in ("pending", "published", "claimed")
+
+
+def _complete_enrichment_retry_delivery(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    run_id: UUID,
+    generation: int | None,
+    claim_token: UUID | None,
+) -> bool:
+    if generation is None:
+        return True
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        row = session.scalar(
+            select(EnrichmentRetryDispatch)
+            .where(
+                EnrichmentRetryDispatch.tenant_id == context.tenant_id,
+                EnrichmentRetryDispatch.run_id == run_id,
+            )
+            .with_for_update()
+        )
+        if (
+            row is None
+            or row.generation != generation
+            or row.status != "claimed"
+            or row.claim_token != claim_token
+        ):
+            session.rollback()
+            return False
+        row.status = "completed"
+        row.claim_token = None
+        row.claimed_at = None
+        session.commit()
+        return True
+
+
+def _release_enrichment_retry_delivery(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    run_id: UUID,
+    generation: int | None,
+    claim_token: UUID | None,
+) -> bool:
+    if generation is None:
+        return True
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        row = session.scalar(
+            select(EnrichmentRetryDispatch)
+            .where(
+                EnrichmentRetryDispatch.tenant_id == context.tenant_id,
+                EnrichmentRetryDispatch.run_id == run_id,
+            )
+            .with_for_update()
+        )
+        if (
+            row is None
+            or row.generation != generation
+            or row.status != "claimed"
+            or row.claim_token != claim_token
+        ):
+            session.rollback()
+            return False
+        row.status = "published"
+        row.claim_token = None
+        row.claimed_at = None
+        session.commit()
+        return True
 
 
 def _enrichment_dependencies(settings: Any):
@@ -1030,79 +1414,151 @@ def enrich_run(
     tenant_id: str,
     user_id: str,
     limit: int = 50,
+    retry_generation: int | None = None,
 ) -> None:
     context = _context(tenant_id, user_id)
-    if not is_provider_enabled(database_session_factory, "apollo"):
-        _record_provider_outcome("people_enrichment", "connector_disabled")
-        _mark_enrichment_provider_disabled(UUID(run_id), context)
-        return
-    settings = get_worker_settings()
-    cipher, snapshots, policy, codec = _enrichment_dependencies(settings)
-    gateway = ApolloGateway(settings)
-    try:
-        submissions = enqueue_top_enrichment(
-            UUID(run_id),
-            limit,
-            session_factory=database_session_factory,
-            context=context,
-            gateway=gateway,
-            callback_base_url=settings.webhook_base_url,
-            contact_cipher=cipher,
-            snapshot_store=snapshots,
-            policy=policy,
-            token_codec=codec,
-            on_budget_exhausted=_record_budget_exhaustion,
-        )
-    except ProviderAuthenticationError:
-        disable_provider(database_session_factory, "apollo", "authentication_error")
-        _record_provider_outcome("people_enrichment", "authentication_error")
-        _mark_enrichment_provider_disabled(UUID(run_id), context)
-        return
-    except ProviderPermissionError:
-        disable_provider(database_session_factory, "apollo", "permission_error")
-        _record_provider_outcome("people_enrichment", "permission_error")
-        _mark_enrichment_provider_disabled(UUID(run_id), context)
-        return
-    finally:
-        gateway.close()
-    retry_delays: list[int] = []
-    provider_failed = False
-    for submission in submissions:
-        if isinstance(submission, DeferredEnrichment):
-            retry_delays.append(submission.retry_after_seconds)
-            continue
-        if isinstance(submission, FailedEnrichment):
-            provider_failed = True
-            continue
-        with database_session_factory() as session:
-            _apply_tenant_context(session, context.tenant_id)
-            request = session.get(EnrichmentRequest, submission.request_id)
-            should_poll = request is not None and request.status == "pending"
-        if should_poll:
-            poll_enrichment_result.apply_async(
-                args=(
-                    str(submission.request_id),
-                    tenant_id,
-                    user_id,
-                ),
-                countdown=300,
-            )
-    if retry_delays:
-        _record_provider_outcome("people_enrichment", "retry_scheduled")
-        delay = min(retry_delays)
-        enrich_run.apply_async(
-            args=(run_id, tenant_id, user_id, limit),
-            countdown=delay,
-            task_id=_enrichment_retry_dispatch_key(
+    parsed_run_id = UUID(run_id)
+    claim_token: UUID | None = None
+    with _enrichment_execution_lock(
+        database_session_factory,
+        context.tenant_id,
+        parsed_run_id,
+    ) as acquired:
+        if not acquired:
+            return
+        if retry_generation is None:
+            if _has_active_enrichment_retry(
+                database_session_factory, context, parsed_run_id
+            ):
+                return
+        else:
+            claim_token = _claim_enrichment_retry_delivery(
                 database_session_factory,
-                UUID(run_id),
                 context,
-            ),
-        )
-        return
-    _record_provider_outcome(
-        "people_enrichment", "provider_error" if provider_failed else "success"
-    )
+                parsed_run_id,
+                retry_generation,
+                limit,
+            )
+            if claim_token is None:
+                return
+        try:
+            if not is_provider_enabled(database_session_factory, "apollo"):
+                _record_provider_outcome("people_enrichment", "connector_disabled")
+                _mark_enrichment_provider_disabled(parsed_run_id, context)
+                _complete_enrichment_retry_delivery(
+                    database_session_factory,
+                    context,
+                    parsed_run_id,
+                    retry_generation,
+                    claim_token,
+                )
+                return
+            settings = get_worker_settings()
+            cipher, snapshots, policy, codec = _enrichment_dependencies(settings)
+            gateway = ApolloGateway(settings)
+            try:
+                submissions = enqueue_top_enrichment(
+                    parsed_run_id,
+                    limit,
+                    session_factory=database_session_factory,
+                    context=context,
+                    gateway=gateway,
+                    callback_base_url=settings.webhook_base_url,
+                    contact_cipher=cipher,
+                    snapshot_store=snapshots,
+                    policy=policy,
+                    token_codec=codec,
+                    on_budget_exhausted=_record_budget_exhaustion,
+                )
+            except ProviderAuthenticationError:
+                disable_provider(
+                    database_session_factory, "apollo", "authentication_error"
+                )
+                _record_provider_outcome("people_enrichment", "authentication_error")
+                _mark_enrichment_provider_disabled(parsed_run_id, context)
+                _complete_enrichment_retry_delivery(
+                    database_session_factory,
+                    context,
+                    parsed_run_id,
+                    retry_generation,
+                    claim_token,
+                )
+                return
+            except ProviderPermissionError:
+                disable_provider(database_session_factory, "apollo", "permission_error")
+                _record_provider_outcome("people_enrichment", "permission_error")
+                _mark_enrichment_provider_disabled(parsed_run_id, context)
+                _complete_enrichment_retry_delivery(
+                    database_session_factory,
+                    context,
+                    parsed_run_id,
+                    retry_generation,
+                    claim_token,
+                )
+                return
+            finally:
+                gateway.close()
+            retry_delays: list[int] = []
+            provider_failed = False
+            for submission in submissions:
+                if isinstance(submission, DeferredEnrichment):
+                    retry_delays.append(submission.retry_after_seconds)
+                    continue
+                if isinstance(submission, FailedEnrichment):
+                    provider_failed = True
+                    continue
+                with database_session_factory() as session:
+                    _apply_tenant_context(session, context.tenant_id)
+                    request = session.get(EnrichmentRequest, submission.request_id)
+                    should_poll = request is not None and request.status == "pending"
+                if should_poll:
+                    poll_enrichment_result.apply_async(
+                        args=(
+                            str(submission.request_id),
+                            tenant_id,
+                            user_id,
+                        ),
+                        countdown=300,
+                    )
+            if retry_delays:
+                schedule = _stage_enrichment_retry(
+                    database_session_factory,
+                    context,
+                    parsed_run_id,
+                    candidate_limit=limit,
+                    retry_after=min(retry_delays),
+                    current_generation=retry_generation,
+                    current_claim_token=claim_token,
+                )
+                if schedule is None:
+                    return
+                _record_provider_outcome("people_enrichment", "retry_scheduled")
+                _publish_enrichment_retry(
+                    database_session_factory,
+                    context,
+                    schedule,
+                )
+                return
+            _complete_enrichment_retry_delivery(
+                database_session_factory,
+                context,
+                parsed_run_id,
+                retry_generation,
+                claim_token,
+            )
+            _record_provider_outcome(
+                "people_enrichment",
+                "provider_error" if provider_failed else "success",
+            )
+        except OperationalError:
+            _release_enrichment_retry_delivery(
+                database_session_factory,
+                context,
+                parsed_run_id,
+                retry_generation,
+                claim_token,
+            )
+            raise
 
 
 @celery_app.task(

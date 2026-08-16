@@ -3,6 +3,7 @@ import queue
 import threading
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -21,11 +22,19 @@ from app.core.database import Base
 from app.identity.models import Tenant, User
 from app.identity.schemas import RequestContext, Role
 from app.jobs.models import Job, ScorecardVersion
+from app.sourcing import tasks
 from app.sourcing.dispatch_recovery import (
     recover_pending_dispatches,
     recover_pending_enrichment_dispatches,
+    recover_pending_enrichment_retries,
 )
-from app.sourcing.models import EnrichmentRequest, RunCandidate, SourcingRun
+from app.sourcing.enrichment import DeferredEnrichment
+from app.sourcing.models import (
+    EnrichmentRequest,
+    EnrichmentRetryDispatch,
+    RunCandidate,
+    SourcingRun,
+)
 from app.sourcing.service import SourcingService
 from app.sourcing.state_machine import RunState
 
@@ -76,6 +85,16 @@ def _cleanup(engine: Engine) -> None:
         )
 
 
+def _grant_api_test_access(engine: Engine) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "GRANT SELECT, INSERT, UPDATE, DELETE "
+                "ON enrichment_retry_dispatches TO sourcing_api_test"
+            )
+        )
+
+
 @pytest.fixture(scope="module")
 def owner_engine() -> Generator[Engine, None, None]:
     assert OWNER_DATABASE_URL is not None
@@ -96,6 +115,7 @@ def owner_engine() -> Generator[Engine, None, None]:
             )
         )
     command.upgrade(_config(), "head")
+    _grant_api_test_access(engine)
     _cleanup(engine)
     try:
         yield engine
@@ -182,6 +202,33 @@ def _seed_pending_enrichment(engine: Engine) -> EnrichmentRequest:
         return request
 
 
+def _seed_enrichment_retry(
+    engine: Engine,
+    *,
+    status: str = "pending",
+    generation: int = 1,
+    claimed_at: datetime | None = None,
+) -> EnrichmentRetryDispatch:
+    run = _seed_run(engine)
+    with Session(engine, expire_on_commit=False) as session:
+        retry = EnrichmentRetryDispatch(
+            tenant_id=run.tenant_id,
+            run_id=run.id,
+            generation=generation,
+            status=status,
+            state_fingerprint="0" * 64,
+            task_id=f"enrich-run-retry:{run.id}:{generation}",
+            requested_by_user_id=run.started_by_user_id,
+            candidate_limit=50,
+            not_before=datetime.now(UTC) - timedelta(minutes=1),
+            claim_token=uuid4() if claimed_at is not None else None,
+            claimed_at=claimed_at,
+        )
+        session.add(retry)
+        session.commit()
+        return retry
+
+
 def _seed_active_on_demand_request(
     engine: Engine,
 ) -> tuple[EnrichmentRequest, UUID, RequestContext]:
@@ -251,6 +298,58 @@ def _claim_one_enrichment() -> tuple[UUID, UUID, UUID, UUID, str]:
         engine.dispose()
 
 
+def _claim_one_enrichment_retry() -> tuple[object, ...] | None:
+    assert MAINTENANCE_DATABASE_URL is not None
+    engine = create_engine(MAINTENANCE_DATABASE_URL)
+    try:
+        with Session(engine) as session:
+            row = session.execute(
+                text(
+                    "SELECT tenant_id, run_id, generation, user_id, "
+                    "candidate_limit, task_id, claim_token FROM "
+                    "maintenance_claim_pending_enrichment_retries(1)"
+                )
+            ).one_or_none()
+            session.commit()
+            return tuple(row) if row is not None else None
+    finally:
+        engine.dispose()
+
+
+def _complete_enrichment_retry_claim(claim: tuple[object, ...]) -> None:
+    assert MAINTENANCE_DATABASE_URL is not None
+    engine = create_engine(MAINTENANCE_DATABASE_URL)
+    try:
+        with Session(engine) as session:
+            completed = session.scalar(
+                text(
+                    "SELECT maintenance_complete_enrichment_retry_publish("
+                    ":tenant_id, :run_id, :generation, :claim_token)"
+                ),
+                {
+                    "tenant_id": claim[0],
+                    "run_id": claim[1],
+                    "generation": claim[2],
+                    "claim_token": claim[6],
+                },
+            )
+            session.commit()
+            assert completed is True
+    finally:
+        engine.dispose()
+
+
+def _terminalize_enrichment_retry(engine: Engine, run_id: UUID) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE enrichment_retry_dispatches SET status = 'completed' "
+                "WHERE run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+
+
 def test_0012_upgrade_downgrade_upgrade_and_model_parity(
     owner_engine: Engine,
 ) -> None:
@@ -261,10 +360,29 @@ def test_0012_upgrade_downgrade_upgrade_and_model_parity(
     }
     assert "dispatch_pending" not in enrichment_columns
     command.upgrade(_config(), "head")
+    _grant_api_test_access(owner_engine)
 
     with owner_engine.begin() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0015_tenant_acceptance_fks"
+            "0016_enrichment_retry_dispatch"
+        )
+        assert (
+            compare_metadata(MigrationContext.configure(connection), Base.metadata)
+            == []
+        )
+
+
+def test_0016_upgrade_downgrade_upgrade_and_model_parity(
+    owner_engine: Engine,
+) -> None:
+    command.downgrade(_config(), "0015_tenant_acceptance_fks")
+    assert "enrichment_retry_dispatches" not in inspect(owner_engine).get_table_names()
+    command.upgrade(_config(), "head")
+    _grant_api_test_access(owner_engine)
+
+    with owner_engine.begin() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0016_enrichment_retry_dispatch"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -533,3 +651,291 @@ def test_enrichment_periodic_recovery_handles_no_client_retry_and_crash(
         assert recovered.dispatch_pending is False
         assert recovered.dispatch_claimed_at is None
         assert recovered.dispatch_claim_token is None
+
+
+def test_enrichment_retry_functions_cross_rls_without_table_grants(
+    owner_engine: Engine,
+) -> None:
+    first = _seed_enrichment_retry(owner_engine)
+    second = _seed_enrichment_retry(owner_engine)
+
+    assert API_DATABASE_URL is not None
+    api_engine = create_engine(API_DATABASE_URL)
+    with Session(api_engine) as session:
+        session.execute(
+            text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+            {"tenant_id": str(first.tenant_id)},
+        )
+        visible = session.scalars(
+            text("SELECT run_id FROM enrichment_retry_dispatches")
+        ).all()
+        session.rollback()
+    assert visible == [first.run_id]
+
+    with owner_engine.connect() as connection:
+        rls = connection.execute(
+            text(
+                "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
+                "WHERE relname = 'enrichment_retry_dispatches'"
+            )
+        ).one()
+        table_grants = connection.execute(
+            text(
+                "SELECT privilege_type FROM information_schema.role_table_grants "
+                "WHERE grantee = 'sourcing_maintenance' "
+                "AND table_name = 'enrichment_retry_dispatches'"
+            )
+        ).all()
+        routines = set(
+            connection.scalars(
+                text(
+                    "SELECT routine_name FROM "
+                    "information_schema.role_routine_grants "
+                    "WHERE grantee = 'sourcing_maintenance' "
+                    "AND routine_name LIKE 'maintenance_%enrichment_retr%'"
+                )
+            )
+        )
+    assert rls == (True, True)
+    assert table_grants == []
+    assert routines == {
+        "maintenance_claim_pending_enrichment_retries",
+        "maintenance_complete_enrichment_retry_publish",
+        "maintenance_release_enrichment_retry_publish",
+    }
+
+    with Session(api_engine) as session, pytest.raises(ProgrammingError):
+        session.execute(
+            text("SELECT * FROM maintenance_claim_pending_enrichment_retries(1)")
+        ).all()
+    api_engine.dispose()
+
+    with owner_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE enrichment_retry_dispatches SET status = 'completed' "
+                "WHERE run_id IN (:first_run, :second_run)"
+            ),
+            {"first_run": first.run_id, "second_run": second.run_id},
+        )
+
+
+def test_concurrent_retry_publishers_claim_one_generation_once(
+    owner_engine: Engine,
+) -> None:
+    retry = _seed_enrichment_retry(owner_engine)
+    barrier = threading.Barrier(2)
+    outcomes: queue.Queue[object] = queue.Queue()
+
+    def claim() -> None:
+        barrier.wait(timeout=5)
+        try:
+            outcomes.put(_claim_one_enrichment_retry())
+        except Exception as error:  # noqa: BLE001 - thread result is asserted
+            outcomes.put(error)
+
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    claimed = [outcomes.get_nowait(), outcomes.get_nowait()]
+    assert not any(isinstance(item, Exception) for item in claimed), claimed
+    claims = [item for item in claimed if isinstance(item, tuple)]
+    assert len(claims) == 1
+    assert claims[0][1] == retry.run_id
+    assert sum(item is None for item in claimed) == 1
+    _complete_enrichment_retry_claim(claims[0])
+    _terminalize_enrichment_retry(owner_engine, retry.run_id)
+
+
+def test_expired_retry_delivery_claim_is_reclaimed(
+    owner_engine: Engine,
+) -> None:
+    retry = _seed_enrichment_retry(
+        owner_engine,
+        status="claimed",
+        claimed_at=datetime.now(UTC) - timedelta(minutes=16),
+    )
+
+    claim = _claim_one_enrichment_retry()
+
+    assert claim is not None
+    assert claim[1] == retry.run_id
+    assert claim[6] != retry.claim_token
+    _complete_enrichment_retry_claim(claim)
+    _terminalize_enrichment_retry(owner_engine, retry.run_id)
+
+
+@pytest.mark.parametrize("initial_status", ["pending", "published"])
+def test_periodic_recovery_publishes_committed_retry_without_client_activity(
+    owner_engine: Engine,
+    initial_status: str,
+) -> None:
+    assert MAINTENANCE_DATABASE_URL is not None
+    retry = _seed_enrichment_retry(owner_engine, status=initial_status)
+    published: list[object] = []
+
+    result = recover_pending_enrichment_retries(
+        MAINTENANCE_DATABASE_URL,
+        published.append,
+    )
+
+    assert result.published == 1
+    assert result.failed == 0
+    assert len(published) == 1
+    claim = published[0]
+    assert claim.run_id == retry.run_id
+    assert claim.generation == retry.generation
+    assert claim.dispatch_key == retry.task_id
+    with Session(owner_engine) as session:
+        recovered = session.get(
+            EnrichmentRetryDispatch,
+            (retry.tenant_id, retry.run_id),
+        )
+        assert recovered is not None
+        assert recovered.status == "published"
+        assert recovered.claim_token is None
+        assert recovered.claimed_at is None
+    _terminalize_enrichment_retry(owner_engine, retry.run_id)
+
+
+def test_duplicate_generation_is_serialized_across_rate_limit_pause(
+    owner_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retry = _seed_enrichment_retry(owner_engine, status="published")
+    provider_entered = threading.Event()
+    release_provider = threading.Event()
+    provider_calls: list[UUID] = []
+    published: list[object] = []
+    outcomes: queue.Queue[object] = queue.Queue()
+
+    class Gateway:
+        def close(self) -> None:
+            return None
+
+    def rate_limited(*args: object, **kwargs: object) -> list[DeferredEnrichment]:
+        provider_calls.append(retry.run_id)
+        provider_entered.set()
+        assert release_provider.wait(timeout=5)
+        return [DeferredEnrichment(retry_after_seconds=30)]
+
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: True)
+    monkeypatch.setattr(
+        tasks,
+        "get_worker_settings",
+        lambda: SimpleNamespace(webhook_base_url="https://callback.test"),
+    )
+    monkeypatch.setattr(tasks, "_enrichment_dependencies", lambda *args: (None,) * 4)
+    monkeypatch.setattr(tasks, "ApolloGateway", lambda *args: Gateway())
+    monkeypatch.setattr(tasks, "enqueue_top_enrichment", rate_limited)
+    monkeypatch.setattr(
+        tasks,
+        "_publish_enrichment_retry",
+        lambda *args: published.append(args[-1]) or True,
+    )
+    monkeypatch.setattr(tasks, "_record_provider_outcome", lambda *args: None)
+
+    with owner_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE enrichment_retry_dispatches SET not_before = :not_before "
+                "WHERE tenant_id = :tenant_id AND run_id = :run_id"
+            ),
+            {
+                "not_before": datetime.now(UTC) + timedelta(minutes=1),
+                "tenant_id": retry.tenant_id,
+                "run_id": retry.run_id,
+            },
+        )
+    tasks.enrich_run.run(
+        str(retry.run_id),
+        str(retry.tenant_id),
+        str(retry.requested_by_user_id),
+        retry.candidate_limit,
+        retry.generation,
+    )
+    assert provider_calls == []
+    with owner_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE enrichment_retry_dispatches SET not_before = :not_before "
+                "WHERE tenant_id = :tenant_id AND run_id = :run_id"
+            ),
+            {
+                "not_before": datetime.now(UTC) - timedelta(seconds=1),
+                "tenant_id": retry.tenant_id,
+                "run_id": retry.run_id,
+            },
+        )
+    tasks.enrich_run.run(
+        str(retry.run_id),
+        str(retry.tenant_id),
+        str(uuid4()),
+        retry.candidate_limit,
+        retry.generation,
+    )
+    tasks.enrich_run.run(
+        str(retry.run_id),
+        str(retry.tenant_id),
+        str(retry.requested_by_user_id),
+        retry.candidate_limit - 1,
+        retry.generation,
+    )
+    assert provider_calls == []
+
+    def deliver() -> None:
+        try:
+            tasks.enrich_run.run(
+                str(retry.run_id),
+                str(retry.tenant_id),
+                str(retry.requested_by_user_id),
+                retry.candidate_limit,
+                retry.generation,
+            )
+            outcomes.put(None)
+        except Exception as error:  # noqa: BLE001 - thread result is asserted
+            outcomes.put(error)
+
+    first = threading.Thread(target=deliver)
+    first.start()
+    assert provider_entered.wait(timeout=5)
+    duplicate = threading.Thread(target=deliver)
+    duplicate.start()
+    duplicate.join(timeout=10)
+    assert not duplicate.is_alive()
+    release_provider.set()
+    first.join(timeout=10)
+    assert not first.is_alive()
+
+    observed = [outcomes.get_nowait(), outcomes.get_nowait()]
+    assert not any(isinstance(item, Exception) for item in observed), observed
+    assert provider_calls == [retry.run_id]
+    assert len(published) == 1
+    next_schedule = published[0]
+    assert next_schedule.generation == retry.generation + 1
+    assert next_schedule.task_id == (
+        f"enrich-run-retry:{retry.run_id}:{retry.generation + 1}"
+    )
+    with Session(owner_engine) as session:
+        stored = session.get(
+            EnrichmentRetryDispatch,
+            (retry.tenant_id, retry.run_id),
+        )
+        assert stored is not None
+        assert stored.status == "pending"
+        assert stored.generation == retry.generation + 1
+        assert stored.claim_token is None
+
+    tasks.enrich_run.run(
+        str(retry.run_id),
+        str(retry.tenant_id),
+        str(retry.requested_by_user_id),
+        retry.candidate_limit,
+        retry.generation,
+    )
+    assert provider_calls == [retry.run_id]
+    assert len(published) == 1
