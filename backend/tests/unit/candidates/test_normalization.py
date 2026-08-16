@@ -15,5 +15,9 @@ def test_profile_url_normalization_canonicalizes_host_and_fragment() -> None:
     )
 
 
+def test_profile_url_normalization_rejects_malformed_port() -> None:
+    assert normalize_profile_url("https://www.linkedin.com:notaport/in/priya") is None
+
+
 def test_text_normalization_is_unicode_and_whitespace_stable() -> None:
     assert normalize_text("  PRIYA\u00a0  Sharma  ") == "priya sharma"

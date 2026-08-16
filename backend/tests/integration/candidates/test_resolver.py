@@ -77,6 +77,25 @@ def test_same_provider_id_reuses_candidate(
     assert second.created is False
 
 
+def test_same_provider_id_reuses_candidate_when_optional_url_is_malformed(
+    candidate_service: CandidateService,
+    context: RequestContext,
+    provider_person_factory,
+) -> None:
+    first = candidate_service.ingest(context, provider_person_factory())
+
+    second = candidate_service.ingest(
+        context,
+        provider_person_factory(
+            linkedin_url="https://www.linkedin.com:notaport/in/priya"
+        ),
+    )
+
+    assert second.candidate_id == first.candidate_id
+    assert second.created is False
+    assert second.matched_by == "provider_id"
+
+
 def test_cross_provider_profile_url_reuses_candidate_and_retains_source_identity(
     candidate_session: Session,
     candidate_service: CandidateService,

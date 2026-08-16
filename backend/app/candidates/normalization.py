@@ -13,11 +13,15 @@ def normalize_text(value: str | None) -> str | None:
 def normalize_profile_url(value: str | None) -> str | None:
     if value is None or not value.strip():
         return None
-    parsed = urlsplit(value.strip())
-    if not parsed.hostname:
+    try:
+        parsed = urlsplit(value.strip())
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
         return None
-    host = parsed.hostname.casefold()
-    port = parsed.port
+    if not hostname:
+        return None
+    host = hostname.casefold()
     netloc = host if port in (None, 80, 443) else f"{host}:{port}"
     path = "/" + "/".join(
         segment for segment in unquote(parsed.path).split("/") if segment
