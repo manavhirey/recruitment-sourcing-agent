@@ -25,7 +25,7 @@ from app.sourcing.schemas import (
 from app.sourcing.service import SourcingError, SourcingService
 
 router = APIRouter(tags=["sourcing"])
-SourcingDispatcher = Callable[[UUID, UUID, UUID], None]
+SourcingDispatcher = Callable[[UUID, UUID, UUID, str], None]
 EnrichmentDispatcher = Callable[[UUID, UUID, UUID], None]
 
 
@@ -50,6 +50,7 @@ def _raise_sourcing_error(error: SourcingError) -> NoReturn:
         "enrichment_request_not_found": status.HTTP_404_NOT_FOUND,
         "notification_not_found": status.HTTP_404_NOT_FOUND,
         "active_run_exists": status.HTTP_409_CONFLICT,
+        "scorecard_run_exists": status.HTTP_409_CONFLICT,
         "scorecard_required": status.HTTP_409_CONFLICT,
         "idempotency_conflict": status.HTTP_409_CONFLICT,
         "usage_reservation_conflict": status.HTTP_409_CONFLICT,
@@ -116,12 +117,25 @@ def start_run(
     del body
     service = _service(session, settings)
     try:
-        run = service.start(context, job_id, idempotency_key=idempotency_key)
+        outcome = service.start_with_outcome(
+            context, job_id, idempotency_key=idempotency_key
+        )
+        run = outcome.run
         response = _run_response(service, context, run)
         session.commit()
     except SourcingError as error:
         _raise_sourcing_error(error)
-    dispatcher(run.id, context.tenant_id, context.user_id)
+    if outcome.needs_dispatch:
+        dispatcher(
+            run.id,
+            context.tenant_id,
+            context.user_id,
+            f"sourcing-plan-{run.id}",
+        )
+        run.dispatch_pending = False
+        run.dispatch_claimed_at = None
+        run.dispatch_claim_token = None
+        session.commit()
     return response
 
 

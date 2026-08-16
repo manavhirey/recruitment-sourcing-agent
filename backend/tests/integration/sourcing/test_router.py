@@ -36,10 +36,12 @@ class StaticVerifier:
 
 class RecordingDispatcher:
     def __init__(self) -> None:
-        self.calls: list[tuple[UUID, UUID, UUID]] = []
+        self.calls: list[tuple[UUID, UUID, UUID, str]] = []
 
-    def __call__(self, run_id: UUID, tenant_id: UUID, user_id: UUID) -> None:
-        self.calls.append((run_id, tenant_id, user_id))
+    def __call__(
+        self, run_id: UUID, tenant_id: UUID, user_id: UUID, dispatch_key: str
+    ) -> None:
+        self.calls.append((run_id, tenant_id, user_id, dispatch_key))
 
 
 class RecordingEnrichmentDispatcher:
@@ -200,6 +202,7 @@ def test_start_status_activity_and_cancel_routes_are_idempotent(
     )
     assert created.status_code == replay.status_code == 201
     assert created.json()["id"] == replay.json()["id"]
+    assert len(sourcing_api["dispatcher"].calls) == 1
     assert created.json()["state"] == "queued"
     assert created.json()["budget_use"] == {
         "search_pages": 0,
@@ -227,8 +230,85 @@ def test_start_status_activity_and_cancel_routes_are_idempotent(
     )
     assert cancelled.status_code == cancel_replay.status_code == 200
     assert cancelled.json()["state"] == "cancelled"
+
+    duplicate_after_terminal = api.post(
+        url,
+        headers={**headers, "Idempotency-Key": "new-intent-same-scorecard"},
+        json={},
+    )
+    assert duplicate_after_terminal.status_code == 409
+    assert duplicate_after_terminal.json() == {
+        "detail": {"code": "scorecard_run_exists"}
+    }
     with Session(sourcing_api["engine"]) as session:
         assert session.scalar(select(func.count()).select_from(SourcingRun)) == 1
+
+
+def test_start_replay_recovers_a_committed_run_after_dispatch_failure(
+    sourcing_api: dict[str, Any],
+) -> None:
+    api: TestClient = sourcing_api["api"]
+    attempts: list[str] = []
+
+    def fail_once(_run_id: UUID, _tenant_id: UUID, _user_id: UUID, key: str) -> None:
+        attempts.append(key)
+        if len(attempts) == 1:
+            raise RuntimeError("queue unavailable")
+
+    api.app.state.sourcing_dispatcher = fail_once
+    url = f"/api/v1/jobs/{sourcing_api['job_id']}/runs"
+    headers = {**_headers(sourcing_api), "Idempotency-Key": "recover-dispatch"}
+
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        api.post(url, headers=headers, json={})
+    replay = api.post(url, headers=headers, json={})
+
+    assert replay.status_code == 201
+    assert attempts == [
+        f"sourcing-plan-{replay.json()['id']}",
+        f"sourcing-plan-{replay.json()['id']}",
+    ]
+    with Session(sourcing_api["engine"]) as session:
+        run = session.scalar(select(SourcingRun))
+        assert run is not None
+        assert run.dispatch_pending is False
+
+
+def test_start_with_a_new_key_recovers_pending_dispatch_after_reload(
+    sourcing_api: dict[str, Any],
+) -> None:
+    api: TestClient = sourcing_api["api"]
+    attempts: list[str] = []
+
+    def fail_once(_run_id: UUID, _tenant_id: UUID, _user_id: UUID, key: str) -> None:
+        attempts.append(key)
+        if len(attempts) == 1:
+            raise RuntimeError("queue unavailable")
+
+    api.app.state.sourcing_dispatcher = fail_once
+    url = f"/api/v1/jobs/{sourcing_api['job_id']}/runs"
+
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        api.post(
+            url,
+            headers={**_headers(sourcing_api), "Idempotency-Key": "lost-browser"},
+            json={},
+        )
+    recovered = api.post(
+        url,
+        headers={**_headers(sourcing_api), "Idempotency-Key": "reloaded-browser"},
+        json={},
+    )
+
+    assert recovered.status_code == 201
+    assert attempts == [
+        f"sourcing-plan-{recovered.json()['id']}",
+        f"sourcing-plan-{recovered.json()['id']}",
+    ]
+    with Session(sourcing_api["engine"]) as session:
+        assert session.scalar(select(func.count()).select_from(SourcingRun)) == 1
+        run = session.scalar(select(SourcingRun))
+        assert run is not None and run.dispatch_pending is False
 
 
 def test_run_lookup_does_not_disclose_another_tenant(

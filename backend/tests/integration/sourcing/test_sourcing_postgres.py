@@ -126,7 +126,7 @@ def test_0005_migration_upgrade_downgrade_and_model_parity(
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0010_privacy"
+            "0011_sourcing_dispatch_recovery"
         )
         assert set(_TENANT_TABLES).issubset(inspect(connection).get_table_names())
         differences = compare_metadata(
@@ -594,8 +594,8 @@ def test_concurrent_distinct_start_keys_enforce_one_active_run(
         thread.join(timeout=10)
         assert not thread.is_alive()
     results = [outcomes.get_nowait(), outcomes.get_nowait()]
-    assert sum(isinstance(result, UUID) for result in results) == 1
-    assert "active_run_exists" in results
+    assert all(isinstance(result, UUID) for result in results)
+    assert len(set(results)) == 1
 
 
 def test_transactional_budget_reservation_serializes_across_runs(

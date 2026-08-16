@@ -71,6 +71,13 @@ class SourcingRun(Base):
             postgresql_where=text(_ACTIVE_STATE_SQL),
             sqlite_where=text(_ACTIVE_STATE_SQL),
         ),
+        Index(
+            "ix_sourcing_runs_pending_dispatch",
+            "created_at",
+            "id",
+            postgresql_where=text("dispatch_pending"),
+            sqlite_where=text("dispatch_pending = 1"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -85,6 +92,13 @@ class SourcingRun(Base):
     state: Mapped[RunState] = mapped_column(
         run_state_type, default=RunState.QUEUED, nullable=False, index=True
     )
+    dispatch_pending: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False
+    )
+    dispatch_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    dispatch_claim_token: Mapped[UUID | None] = mapped_column()
     planned_queries: Mapped[list[dict[str, object]]] = mapped_column(
         JSON, default=list, nullable=False
     )

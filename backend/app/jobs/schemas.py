@@ -1,3 +1,5 @@
+import base64
+import json
 from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
@@ -15,6 +17,15 @@ class CriterionKind(StrEnum):
 
 def _criterion_text(criterion: "ScorecardCriterion") -> str:
     return " ".join((criterion.key, criterion.label, criterion.source_text or ""))
+
+
+def _confirmation_id(category: str, values: list[object]) -> str:
+    """Bind an approval to both its category and exact normalized content."""
+    canonical = json.dumps(
+        [category, *values], ensure_ascii=False, separators=(",", ":")
+    ).encode()
+    encoded = base64.urlsafe_b64encode(canonical).rstrip(b"=").decode()
+    return f"{category}:{encoded}"
 
 
 class ScorecardCriterion(BaseModel):
@@ -75,6 +86,37 @@ class ScorecardDraft(BaseModel):
     industry_code: str = Field(min_length=1, max_length=128)
     suggested_adjacent_industries: list[str] = Field(max_length=12)
     uncertainties: list[str] = Field(max_length=20)
+    confirmed_inferred_items: list[str] = Field(default_factory=list, max_length=72)
+
+    def inferred_item_ids(self) -> set[str]:
+        criterion_ids = {
+            _confirmation_id(
+                "criterion",
+                [
+                    criterion.key,
+                    criterion.label,
+                    criterion.kind.value,
+                    criterion.evidence_required,
+                    criterion.source_text,
+                    criterion.recruiter_entered,
+                    criterion.lawful_requirement_confirmed,
+                ],
+            )
+            for criterion in self.criteria
+            if criterion.inferred
+        }
+        adjacent_ids = {
+            _confirmation_id("adjacent", [industry_code])
+            for industry_code in self.suggested_adjacent_industries
+        }
+        uncertainty_ids = {
+            _confirmation_id("uncertainty", [position, uncertainty])
+            for position, uncertainty in enumerate(self.uncertainties)
+        }
+        return criterion_ids | adjacent_ids | uncertainty_ids
+
+    def unresolved_inferred_items(self) -> set[str]:
+        return self.inferred_item_ids() - set(self.confirmed_inferred_items)
 
     @model_validator(mode="after")
     def validate_scorecard(self) -> "ScorecardDraft":
@@ -87,6 +129,11 @@ class ScorecardDraft(BaseModel):
         criterion_keys = [criterion.key for criterion in self.criteria]
         if len(set(criterion_keys)) != len(criterion_keys):
             raise ValueError("scorecard criterion keys must be unique")
+        confirmations = set(self.confirmed_inferred_items)
+        if len(confirmations) != len(self.confirmed_inferred_items):
+            raise ValueError("inferred item confirmations must be unique")
+        if confirmations - self.inferred_item_ids():
+            raise ValueError("unknown inferred item confirmation")
         return self
 
 
@@ -152,6 +199,19 @@ class JobResponse(BaseModel):
     updated_at: datetime
 
 
+class JobSummary(BaseModel):
+    id: UUID
+    client_id: UUID
+    title: str
+    location: str | None
+    status: str
+
+
+class JobPage(BaseModel):
+    items: list[JobSummary]
+    next_offset: int | None
+
+
 class ScorecardGenerationRequest(BaseModel):
     expected_revision: int = Field(ge=0)
 
@@ -182,6 +242,7 @@ class EditableScorecardDraft(BaseModel):
         default_factory=list, max_length=12
     )
     uncertainties: list[str] = Field(default_factory=list, max_length=20)
+    confirmed_inferred_items: list[str] = Field(default_factory=list, max_length=72)
 
 
 class ScorecardDraftResponse(BaseModel):

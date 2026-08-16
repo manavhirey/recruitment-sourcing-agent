@@ -1,7 +1,7 @@
 from typing import Annotated, NoReturn
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -18,7 +18,9 @@ from app.jobs.schemas import (
     ConfirmedScorecard,
     ExtractionStatus,
     JobCreate,
+    JobPage,
     JobResponse,
+    JobSummary,
     ScorecardConfirmation,
     ScorecardDraftResponse,
     ScorecardDraftUpdate,
@@ -64,14 +66,44 @@ def _job_response(job: Job) -> JobResponse:
     )
 
 
+def _job_summary(job: Job) -> JobSummary:
+    return JobSummary(
+        id=job.id,
+        client_id=job.client_id,
+        title=job.title,
+        location=job.location,
+        status=job.status,
+    )
+
+
 def _raise_job_error(error: JobError) -> NoReturn:
     status_code = {
         "job_not_found": status.HTTP_404_NOT_FOUND,
         "scorecard_not_found": status.HTTP_404_NOT_FOUND,
+        "scorecard_draft_not_found": status.HTTP_404_NOT_FOUND,
         "scorecard_revision_conflict": status.HTTP_409_CONFLICT,
+        "scorecard_inferences_unresolved": status.HTTP_409_CONFLICT,
         "idempotency_conflict": status.HTTP_409_CONFLICT,
     }.get(error.code, status.HTTP_400_BAD_REQUEST)
     raise HTTPException(status_code=status_code, detail={"code": error.code}) from error
+
+
+@router.get("", response_model=JobPage)
+def list_jobs(
+    context: Annotated[RequestContext, Depends(get_request_context)],
+    session: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    gateway: Annotated[ScorecardGateway, Depends(get_scorecard_gateway)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
+) -> JobPage:
+    service = _service(session, settings, gateway)
+    jobs, next_offset = service.list_authorized(
+        context, limit=limit, offset=offset
+    )
+    return JobPage(
+        items=[_job_summary(job) for job in jobs], next_offset=next_offset
+    )
 
 
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
@@ -136,6 +168,21 @@ def generate_scorecard_draft(
     except JobError as error:
         _raise_job_error(error)
     return result
+
+
+@router.get("/{job_id}/scorecard/draft", response_model=ScorecardDraftResponse)
+def get_scorecard_draft(
+    job_id: UUID,
+    context: Annotated[RequestContext, Depends(get_request_context)],
+    session: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    gateway: Annotated[ScorecardGateway, Depends(get_scorecard_gateway)],
+) -> ScorecardDraftResponse:
+    service = _service(session, settings, gateway)
+    try:
+        return service.get_draft(context, job_id)
+    except JobError as error:
+        _raise_job_error(error)
 
 
 @router.put("/{job_id}/scorecard/draft", response_model=ScorecardDraftResponse)

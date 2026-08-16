@@ -126,7 +126,7 @@ def test_0007_to_head_upgrade_downgrade_and_model_parity(owner_engine: Engine) -
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0010_privacy"
+            "0011_sourcing_dispatch_recovery"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -263,6 +263,9 @@ def test_maintenance_role_can_only_erase_due_contacts(
         ("maintenance_delete_claimed_snapshot", "EXECUTE"),
         ("maintenance_erase_due_contacts", "EXECUTE"),
         ("maintenance_record_snapshot_delete_failure", "EXECUTE"),
+        ("maintenance_claim_pending_sourcing_dispatches", "EXECUTE"),
+        ("maintenance_complete_sourcing_dispatch", "EXECUTE"),
+        ("maintenance_release_sourcing_dispatch", "EXECUTE"),
     }
 
 

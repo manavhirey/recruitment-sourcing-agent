@@ -34,8 +34,13 @@ celery_app.conf.update(
             "task": "maintenance.resume_privacy_deletions",
             "schedule": crontab(hour=2, minute=0),
         },
+        "sourcing-dispatch-recovery": {
+            "task": "maintenance.recover_sourcing_dispatches",
+            "schedule": crontab(minute="*"),
+        },
     },
 )
 
 from app.privacy import tasks as _privacy_tasks  # noqa: F401
+from app.sourcing import dispatch_recovery as _dispatch_recovery  # noqa: F401
 from app.sourcing import maintenance_tasks as _maintenance_tasks  # noqa: F401

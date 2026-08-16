@@ -121,7 +121,7 @@ def test_start_requires_a_confirmed_immutable_scorecard(
         )
 
 
-def test_start_is_idempotent_and_rejects_a_second_active_run(
+def test_start_is_idempotent_and_binds_a_new_key_to_a_pending_run(
     service_scenario: dict[str, Any],
 ) -> None:
     scenario = service_scenario
@@ -145,12 +145,12 @@ def test_start_is_idempotent_and_rejects_a_second_active_run(
     )
     assert scenario["session"].scalar(select(func.count()).select_from(AuditEvent)) == 1
 
-    with pytest.raises(SourcingError, match="active_run_exists"):
-        service.start(
-            scenario["context"],
-            scenario["confirmed_job"].id,
-            idempotency_key="different-request",
-        )
+    recovered = service.start(
+        scenario["context"],
+        scenario["confirmed_job"].id,
+        idempotency_key="different-request",
+    )
+    assert recovered.id == first.id
 
 
 def test_cancel_is_replay_safe_and_terminal(

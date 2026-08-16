@@ -28,15 +28,20 @@ from app.sourcing.webhooks import (
 if False:  # pragma: no cover - imported only for static typing
     from app.providers.snapshots import SnapshotStore
 
-SourcingDispatcher = Callable[[UUID, UUID, UUID], None]
+SourcingDispatcher = Callable[[UUID, UUID, UUID, str], None]
 EnrichmentDispatcher = Callable[[UUID, UUID, UUID], None]
 PrivacyDispatcher = Callable[[UUID, UUID], None]
 
 
-def _dispatch_sourcing_run(run_id: UUID, tenant_id: UUID, user_id: UUID) -> None:
+def _dispatch_sourcing_run(
+    run_id: UUID, tenant_id: UUID, user_id: UUID, dispatch_key: str
+) -> None:
     from app.sourcing.tasks import plan_run
 
-    plan_run.delay(str(run_id), str(tenant_id), str(user_id), "plan")
+    plan_run.apply_async(
+        args=(str(run_id), str(tenant_id), str(user_id), "plan"),
+        task_id=dispatch_key,
+    )
 
 
 def _dispatch_enrichment_request(

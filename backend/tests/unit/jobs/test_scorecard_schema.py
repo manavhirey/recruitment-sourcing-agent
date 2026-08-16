@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.jobs.schemas import CriterionKind, ScorecardCriterion
+from app.jobs.schemas import CriterionKind, ScorecardCriterion, ScorecardDraft
 
 
 def test_protected_class_exclusion_is_rejected() -> None:
@@ -120,3 +120,74 @@ def test_blank_source_text_cannot_bypass_unstated_exclusion_guard(
         lawful_requirement_confirmed=True,
     )
     assert criterion.source_text is None
+
+
+def test_scorecard_tracks_every_inferred_item_with_stable_confirmation_ids() -> None:
+    draft = ScorecardDraft(
+        target_titles=["Product Manager"],
+        criteria=[
+            ScorecardCriterion(
+                key="growth",
+                label="Led product-led growth",
+                kind=CriterionKind.PREFERENCE,
+                inferred=True,
+            )
+        ],
+        seniority=[],
+        locations=[],
+        industry_code="technology.fintech",
+        suggested_adjacent_industries=["financial_services.banking"],
+        uncertainties=["Confirm ownership of go-to-market strategy"],
+    )
+
+    confirmation_ids = draft.inferred_item_ids()
+    assert len(confirmation_ids) == 3
+    assert {item.split(":", 1)[0] for item in confirmation_ids} == {
+        "criterion",
+        "adjacent",
+        "uncertainty",
+    }
+    assert draft.unresolved_inferred_items() == draft.inferred_item_ids()
+
+    edited = draft.model_copy(deep=True)
+    edited.criteria[0].label = "Owned product-led growth"
+    assert edited.inferred_item_ids() != confirmation_ids
+
+
+def test_scorecard_rejects_stale_and_unknown_inference_confirmations() -> None:
+    draft = ScorecardDraft(
+        target_titles=["Product Manager"],
+        criteria=[
+            ScorecardCriterion(
+                key="growth",
+                label="Led product-led growth",
+                kind=CriterionKind.PREFERENCE,
+                inferred=True,
+            )
+        ],
+        seniority=[],
+        locations=[],
+        industry_code="technology.fintech",
+        suggested_adjacent_industries=[],
+        uncertainties=[],
+    )
+    approved = sorted(draft.inferred_item_ids())
+
+    with pytest.raises(ValidationError, match="unknown inferred item confirmation"):
+        ScorecardDraft.model_validate(
+            {**draft.model_dump(), "confirmed_inferred_items": ["criterion:unknown"]}
+        )
+
+    with pytest.raises(ValidationError, match="unknown inferred item confirmation"):
+        ScorecardDraft.model_validate(
+            {
+                **draft.model_dump(),
+                "criteria": [
+                    {
+                        **draft.criteria[0].model_dump(),
+                        "label": "Owned product-led growth",
+                    }
+                ],
+                "confirmed_inferred_items": approved,
+            }
+        )

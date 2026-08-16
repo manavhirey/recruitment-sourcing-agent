@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -44,6 +45,12 @@ class SourcingError(AppError):
         super().__init__(code)
 
 
+@dataclass(frozen=True)
+class StartRunOutcome:
+    run: SourcingRun
+    needs_dispatch: bool
+
+
 class SourcingService:
     def __init__(self, session: Session, hmac_key: bytes) -> None:
         self.session = session
@@ -58,6 +65,17 @@ class SourcingService:
         *,
         idempotency_key: str,
     ) -> SourcingRun:
+        return self.start_with_outcome(
+            context, job_id, idempotency_key=idempotency_key
+        ).run
+
+    def start_with_outcome(
+        self,
+        context: RequestContext,
+        job_id: UUID,
+        *,
+        idempotency_key: str,
+    ) -> StartRunOutcome:
         job = self._job(context, job_id, for_update=True)
         record = self._begin(
             context,
@@ -66,8 +84,12 @@ class SourcingService:
             {"job_id": str(job_id)},
         )
         if record.response_payload is not None:
-            return self.get_authorized(
+            replayed = self.get_authorized(
                 context, UUID(str(record.response_payload["run_id"]))
+            )
+            return StartRunOutcome(
+                replayed,
+                needs_dispatch=replayed.dispatch_pending,
             )
         if job.current_scorecard_id is None:
             raise SourcingError("scorecard_required")
@@ -81,15 +103,29 @@ class SourcingService:
         if scorecard is None:
             raise SourcingError("scorecard_required")
         active = self.session.scalar(
-            select(SourcingRun.id).where(
+            select(SourcingRun)
+            .where(
                 SourcingRun.tenant_id == context.tenant_id,
                 SourcingRun.job_id == job.id,
                 SourcingRun.scorecard_version_id == scorecard.id,
                 SourcingRun.state.in_(_ACTIVE_STATES),
             )
+            .with_for_update()
         )
         if active is not None:
+            if active.dispatch_pending:
+                self._complete(record, {"run_id": str(active.id)})
+                return StartRunOutcome(active, needs_dispatch=True)
             raise SourcingError("active_run_exists")
+        existing = self.session.scalar(
+            select(SourcingRun.id).where(
+                SourcingRun.tenant_id == context.tenant_id,
+                SourcingRun.job_id == job.id,
+                SourcingRun.scorecard_version_id == scorecard.id,
+            )
+        )
+        if existing is not None:
+            raise SourcingError("scorecard_run_exists")
         run = SourcingRun(
             id=uuid4(),
             tenant_id=context.tenant_id,
@@ -116,7 +152,7 @@ class SourcingService:
             },
         )
         self._complete(record, {"run_id": str(run.id)})
-        return run
+        return StartRunOutcome(run, needs_dispatch=True)
 
     def cancel(
         self,

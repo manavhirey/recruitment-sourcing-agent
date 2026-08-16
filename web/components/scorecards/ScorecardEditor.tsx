@@ -1,0 +1,628 @@
+"use client"
+
+import { useMemo, useRef, useState } from "react"
+import { useRouter } from "next/navigation"
+
+import {
+  reauthenticateExpiredSession,
+  responseJson,
+} from "@/lib/client-response"
+import { industryTaxonomy } from "@/lib/generated-taxonomy"
+import {
+  adjacentConfirmationId,
+  criterionConfirmationId,
+  requiredInferenceIds,
+  uncertaintyConfirmationId,
+} from "@/lib/inference-confirmations"
+import type {
+  ConfirmedScorecard,
+  ScorecardCriterion,
+  ScorecardDraft,
+  ScorecardDraftResponse,
+  SourcingRun,
+} from "@/lib/schemas"
+
+type ScorecardEditorProps = {
+  draft: Omit<ScorecardDraftResponse, "original_job_description">
+  allowedIndustryCodes: readonly string[]
+  alreadyConfirmed?: boolean
+  onStarted?: (run: SourcingRun) => void
+}
+
+type ScorecardIntent = {
+  fingerprint: string
+  saveKey: string
+  confirmKey: string
+  sourceKey: string
+  revision: number
+  stage: "save" | "confirm" | "source"
+}
+
+type SuggestedItem = {
+  id: string
+  label: string
+  kind: "criterion" | "adjacent" | "uncertainty"
+}
+
+function newCriterion(kind: ScorecardCriterion["kind"], position: number): ScorecardCriterion {
+  return {
+    key: `manual_${kind}_${position + 1}`,
+    label: "New job-related criterion",
+    kind,
+    evidence_required: false,
+    source_text: null,
+    inferred: false,
+    recruiter_entered: true,
+    lawful_requirement_confirmed: kind !== "exclusion",
+  }
+}
+
+function listValues(value: string, separator: string): string[] {
+  return value
+    .split(separator)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+export function ScorecardEditor({
+  draft: response,
+  allowedIndustryCodes,
+  alreadyConfirmed = false,
+  onStarted,
+}: ScorecardEditorProps) {
+  const router = useRouter()
+  const [draft, setDraft] = useState<ScorecardDraft>(() => ({
+    target_titles: [...(response.draft.target_titles ?? [])],
+    criteria: (response.draft.criteria ?? []).map((criterion) => ({ ...criterion })),
+    seniority: [...(response.draft.seniority ?? [])],
+    minimum_years: response.draft.minimum_years ?? null,
+    maximum_years: response.draft.maximum_years ?? null,
+    locations: [...(response.draft.locations ?? [])],
+    industry_code: response.draft.industry_code ?? "",
+    suggested_adjacent_industries: [...(response.draft.suggested_adjacent_industries ?? [])],
+    uncertainties: [...(response.draft.uncertainties ?? [])],
+    confirmed_inferred_items: [...(response.draft.confirmed_inferred_items ?? [])],
+  }))
+  const [targetTitlesInput, setTargetTitlesInput] = useState(
+    () => (response.draft.target_titles ?? []).join(", "),
+  )
+  const [seniorityInput, setSeniorityInput] = useState(
+    () => (response.draft.seniority ?? []).join(", "),
+  )
+  const [locationsInput, setLocationsInput] = useState(
+    () => (response.draft.locations ?? []).join("\n"),
+  )
+  const [confirmedSuggestions, setConfirmedSuggestions] = useState<Set<string>>(
+    () => {
+      const required = new Set(requiredInferenceIds({
+        criteria: response.draft.criteria ?? [],
+        suggested_adjacent_industries:
+          response.draft.suggested_adjacent_industries ?? [],
+        uncertainties: response.draft.uncertainties ?? [],
+      }))
+      return new Set(
+        (response.draft.confirmed_inferred_items ?? []).filter((id) => required.has(id)),
+      )
+    },
+  )
+  const [error, setError] = useState<string | null>(null)
+  const [industryError, setIndustryError] = useState<string | null>(null)
+  const [adjacencyError, setAdjacencyError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const intent = useRef<ScorecardIntent | null>(null)
+  const confirmedSourceKey = useRef<string | null>(null)
+  const inFlight = useRef(false)
+
+  const suggestions = useMemo<SuggestedItem[]>(() => [
+    ...draft.criteria
+      .filter((criterion) => criterion.inferred)
+      .map((criterion) => ({
+        id: criterionConfirmationId(criterion),
+        label: criterion.label,
+        kind: "criterion" as const,
+      })),
+    ...draft.suggested_adjacent_industries.map((code) => ({
+      id: adjacentConfirmationId(code),
+      label: code,
+      kind: "adjacent" as const,
+    })),
+    ...draft.uncertainties.map((uncertainty, index) => ({
+      id: uncertaintyConfirmationId(uncertainty, index),
+      label: uncertainty,
+      kind: "uncertainty" as const,
+    })),
+  ], [draft])
+  const confirmedInferenceIds = suggestions
+    .map((item) => item.id)
+    .filter((id) => confirmedSuggestions.has(id))
+    .sort()
+  const allSuggestionsResolved = suggestions.every((item) => confirmedSuggestions.has(item.id))
+  const minimumYears = draft.minimum_years ?? null
+  const maximumYears = draft.maximum_years ?? null
+  const yearsValid =
+    minimumYears === null ||
+    maximumYears === null ||
+    minimumYears <= maximumYears
+  const structurallyValid =
+    draft.target_titles.some((title) => title.trim()) &&
+    draft.criteria.length > 0 &&
+    draft.criteria.every((criterion) =>
+      criterion.kind !== "exclusion" ||
+      Boolean(criterion.source_text) ||
+      (criterion.recruiter_entered && criterion.lawful_requirement_confirmed),
+    ) &&
+    Boolean(draft.industry_code) &&
+    yearsValid
+
+  function updateCriterion(index: number, patch: Partial<ScorecardCriterion>) {
+    setDraft((current) => ({
+      ...current,
+      criteria: current.criteria.map((criterion, criterionIndex) =>
+        criterionIndex === index ? { ...criterion, ...patch } : criterion,
+      ),
+    }))
+    intent.current = null
+  }
+
+  function removeSuggestion(item: SuggestedItem) {
+    setDraft((current) => {
+      if (item.kind === "criterion") {
+        return {
+          ...current,
+          criteria: current.criteria.filter(
+            (criterion) => criterionConfirmationId(criterion) !== item.id,
+          ),
+        }
+      }
+      if (item.kind === "adjacent") {
+        return {
+          ...current,
+          suggested_adjacent_industries: current.suggested_adjacent_industries.filter(
+            (code) => adjacentConfirmationId(code) !== item.id,
+          ),
+        }
+      }
+      return {
+        ...current,
+        uncertainties: current.uncertainties.filter(
+          (uncertainty, index) =>
+            uncertaintyConfirmationId(uncertainty, index) !== item.id,
+        ),
+      }
+    })
+    setConfirmedSuggestions((current) => {
+      const next = new Set(current)
+      next.delete(item.id)
+      return next
+    })
+    intent.current = null
+  }
+
+  function setSuggestionConfirmed(id: string, checked: boolean) {
+    setConfirmedSuggestions((current) => {
+      const next = new Set(current)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
+    intent.current = null
+  }
+
+  async function confirmAndSource() {
+    if (inFlight.current || !allSuggestionsResolved || !structurallyValid) return
+    inFlight.current = true
+    setSubmitting(true)
+    setError(null)
+    setIndustryError(null)
+    setAdjacencyError(null)
+    const mutationDraft: ScorecardDraft = {
+      ...draft,
+      confirmed_inferred_items: confirmedInferenceIds,
+    }
+    const fingerprint = JSON.stringify(mutationDraft)
+    if (!intent.current || intent.current.fingerprint !== fingerprint) {
+      intent.current = {
+        fingerprint,
+        saveKey: crypto.randomUUID(),
+        confirmKey: crypto.randomUUID(),
+        sourceKey: crypto.randomUUID(),
+        revision: response.draft_revision,
+        stage: "save",
+      }
+    }
+    const current = intent.current
+    try {
+      if (current.stage === "save") {
+        const saved = await responseJson<ScorecardDraftResponse>(
+          await fetch(`/api/bff/jobs/${response.job_id}/scorecard/draft`, {
+            method: "PUT",
+            headers: {
+              "Content-Type": "application/json",
+              "Idempotency-Key": current.saveKey,
+            },
+            body: JSON.stringify({
+              expected_revision: current.revision,
+              draft: mutationDraft,
+            }),
+          }),
+        )
+        current.revision = saved.draft_revision
+        current.stage = "confirm"
+      }
+      if (current.stage === "confirm") {
+        await responseJson<ConfirmedScorecard>(
+          await fetch(`/api/bff/jobs/${response.job_id}/scorecard/confirm`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Idempotency-Key": current.confirmKey,
+            },
+            body: JSON.stringify({ expected_revision: current.revision }),
+          }),
+        )
+        current.stage = "source"
+      }
+      const run = await responseJson<SourcingRun>(
+        await fetch(`/api/bff/jobs/${response.job_id}/runs`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": current.sourceKey,
+          },
+          body: "{}",
+        }),
+      )
+      if (onStarted) onStarted(run)
+      else router.push("/jobs")
+    } catch (caught) {
+      if (reauthenticateExpiredSession(caught, router)) return
+      const code = caught instanceof Error ? caught.message : "request_failed"
+      if (code === "scorecard_industry_invalid") {
+        setIndustryError("Choose an industry assigned to this client.")
+      } else if (code === "scorecard_adjacency_not_approved") {
+        setAdjacencyError("Delete adjacent industries that are not approved for this client.")
+      } else {
+        setError(
+          code === "scorecard_revision_conflict"
+            ? "The scorecard changed elsewhere. Reload before confirming."
+            : code === "scorecard_inferences_unresolved"
+              ? "Review every suggested item again before confirming."
+              : "The scorecard was not started. Retry uses the same safe request.",
+        )
+      }
+    } finally {
+      inFlight.current = false
+      setSubmitting(false)
+    }
+  }
+
+  async function sourceConfirmedVersion() {
+    if (inFlight.current) return
+    inFlight.current = true
+    setSubmitting(true)
+    setError(null)
+    confirmedSourceKey.current ??= crypto.randomUUID()
+    try {
+      const run = await responseJson<SourcingRun>(
+        await fetch(`/api/bff/jobs/${response.job_id}/runs`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": confirmedSourceKey.current,
+          },
+          body: "{}",
+        }),
+      )
+      if (onStarted) onStarted(run)
+      else router.push("/jobs")
+    } catch (caught) {
+      if (reauthenticateExpiredSession(caught, router)) return
+      const code = caught instanceof Error ? caught.message : "request_failed"
+      if (code === "active_run_exists" || code === "scorecard_run_exists") {
+        router.push("/jobs")
+      } else {
+        setError("Sourcing was not started. Retry uses the same safe request.")
+      }
+    } finally {
+      inFlight.current = false
+      setSubmitting(false)
+    }
+  }
+
+  if (alreadyConfirmed) {
+    return (
+      <div className="scorecard-editor confirmed-scorecard-state">
+        <div className="empty-state">
+          <p className="eyebrow">Confirmed scorecard</p>
+          <h2>This immutable version is ready to source.</h2>
+          <p>Starting here cannot create another scorecard version.</p>
+        </div>
+        {error ? <p role="alert" className="form-error">{error}</p> : null}
+        <div className="sticky-action">
+          <p>The confirmed criteria will be used as saved.</p>
+          <button
+            className="button button-primary"
+            type="button"
+            disabled={submitting}
+            onClick={sourceConfirmedVersion}
+          >
+            {submitting ? "Starting…" : "Start sourcing"}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="scorecard-editor">
+      {response.extraction_status === "manual_required" ? (
+        <div className="manual-warning" role="alert">
+          <strong>Manual scorecard required.</strong>{" "}
+          {response.extraction_warning ?? "Automated extraction could not be completed."}
+        </div>
+      ) : null}
+
+      <fieldset className="scorecard-fields" disabled={submitting}>
+      <legend className="sr-only">Scorecard criteria</legend>
+      <div className="provenance-legend" aria-label="Criterion provenance">
+        <span className="provenance provenance-extracted">From job description</span>
+        <span className="provenance provenance-inferred">Suggested — confirm before use</span>
+        <span className="provenance provenance-manual">Recruiter entered</span>
+      </div>
+
+      <section className="scorecard-section">
+        <h2>Role profile</h2>
+        <div className="field">
+          <label htmlFor="target-titles">Target titles</label>
+          <input
+            id="target-titles"
+            value={targetTitlesInput}
+            onChange={(event) => {
+              setTargetTitlesInput(event.target.value)
+              setDraft((current) => ({
+                ...current,
+                target_titles: listValues(event.target.value, ","),
+              }))
+              intent.current = null
+            }}
+            placeholder="Senior Product Manager, Product Lead"
+          />
+        </div>
+        <div className="field">
+          <label htmlFor="primary-industry">Primary industry</label>
+          <select
+            id="primary-industry"
+            value={draft.industry_code}
+            aria-invalid={industryError ? true : undefined}
+            aria-describedby={industryError ? "primary-industry-error" : undefined}
+            onChange={(event) => {
+              setDraft((current) => ({ ...current, industry_code: event.target.value }))
+              setIndustryError(null)
+              intent.current = null
+            }}
+          >
+            <option value="">Choose an industry</option>
+            {industryTaxonomy.industries
+              .filter((industry) => allowedIndustryCodes.includes(industry.code))
+              .map((industry) => (
+              <option key={industry.code} value={industry.code}>{industry.label}</option>
+              ))}
+          </select>
+          {industryError ? (
+            <p id="primary-industry-error" className="field-error" role="alert">
+              {industryError}
+            </p>
+          ) : null}
+        </div>
+        <div className="field-row">
+          <div className="field">
+            <label htmlFor="seniority">Seniority</label>
+            <input
+              id="seniority"
+              value={seniorityInput}
+              onChange={(event) => {
+                setSeniorityInput(event.target.value)
+                setDraft((current) => ({
+                  ...current,
+                  seniority: listValues(event.target.value, ","),
+                }))
+                intent.current = null
+              }}
+              placeholder="Senior, lead"
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="locations">Locations</label>
+            <textarea
+              id="locations"
+              rows={2}
+              value={locationsInput}
+              onChange={(event) => {
+                setLocationsInput(event.target.value)
+                setDraft((current) => ({
+                  ...current,
+                  locations: listValues(event.target.value, "\n"),
+                }))
+                intent.current = null
+              }}
+              placeholder={"New York, NY\nRemote"}
+            />
+          </div>
+        </div>
+        <div className="field-row">
+          <div className="field">
+            <label htmlFor="minimum-years">Minimum years</label>
+            <input
+              id="minimum-years"
+              type="number"
+              min={0}
+              max={50}
+              value={draft.minimum_years ?? ""}
+              onChange={(event) => {
+                setDraft((current) => ({
+                  ...current,
+                  minimum_years: event.target.value === ""
+                    ? null
+                    : Number(event.target.value),
+                }))
+                intent.current = null
+              }}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="maximum-years">Maximum years</label>
+            <input
+              id="maximum-years"
+              type="number"
+              min={0}
+              max={50}
+              value={draft.maximum_years ?? ""}
+              aria-invalid={!yearsValid || undefined}
+              aria-describedby={!yearsValid ? "years-error" : undefined}
+              onChange={(event) => {
+                setDraft((current) => ({
+                  ...current,
+                  maximum_years: event.target.value === ""
+                    ? null
+                    : Number(event.target.value),
+                }))
+                intent.current = null
+              }}
+            />
+          </div>
+        </div>
+        {!yearsValid ? (
+          <p id="years-error" className="field-error" role="alert">
+            Maximum years cannot be less than minimum years.
+          </p>
+        ) : null}
+      </section>
+
+      {(["must_have", "preference", "exclusion"] as const).map((kind) => (
+        <section className="scorecard-section" key={kind}>
+          <div className="section-heading">
+            <h2>{kind === "must_have" ? "Must-haves" : kind === "preference" ? "Preferences" : "Exclusions"}</h2>
+            <button
+              type="button"
+              className="button button-quiet"
+              onClick={() => setDraft((current) => ({
+                ...current,
+                criteria: [...current.criteria, newCriterion(kind, current.criteria.length)],
+              }))}
+            >
+              Add {kind === "must_have" ? "must-have" : kind}
+            </button>
+          </div>
+          <ul className="criteria-list">
+            {draft.criteria.map((criterion, index) =>
+              criterion.kind === kind ? (
+                <li key={criterion.key} className="criterion-row">
+                  <span className={`provenance ${criterion.inferred ? "provenance-inferred" : criterion.recruiter_entered ? "provenance-manual" : "provenance-extracted"}`}>
+                    {criterion.inferred ? "Suggested" : criterion.recruiter_entered ? "Recruiter entered" : "Extracted"}
+                  </span>
+                  <label className="sr-only" htmlFor={`criterion-${criterion.key}`}>Criterion</label>
+                  <input
+                    id={`criterion-${criterion.key}`}
+                    value={criterion.label}
+                    onChange={(event) => updateCriterion(index, { label: event.target.value })}
+                  />
+                  {kind === "exclusion" && !criterion.source_text ? (
+                    <label className="check-row">
+                      <input
+                        type="checkbox"
+                        checked={criterion.lawful_requirement_confirmed}
+                        onChange={(event) => updateCriterion(index, {
+                          recruiter_entered: true,
+                          lawful_requirement_confirmed: event.target.checked,
+                        })}
+                      />
+                      Confirm this is a lawful, job-related requirement
+                    </label>
+                  ) : null}
+                </li>
+              ) : null,
+            )}
+          </ul>
+        </section>
+      ))}
+
+      <section className="scorecard-section">
+        <h2>Adjacent industries</h2>
+        <ul className="suggestion-list">
+          {suggestions.filter((item) => item.kind === "adjacent").map((item) => (
+            <SuggestionRow key={item.id} item={item} confirmed={confirmedSuggestions.has(item.id)} onConfirm={(checked) => {
+              setSuggestionConfirmed(item.id, checked)
+            }} onDelete={() => removeSuggestion(item)} />
+          ))}
+        </ul>
+        {adjacencyError ? <p className="field-error" role="alert">{adjacencyError}</p> : null}
+      </section>
+
+      <section className="scorecard-section">
+        <h2>Uncertainties</h2>
+        <ul className="suggestion-list">
+          {suggestions.filter((item) => item.kind === "uncertainty").map((item) => (
+            <SuggestionRow key={item.id} item={item} confirmed={confirmedSuggestions.has(item.id)} onConfirm={(checked) => {
+              setSuggestionConfirmed(item.id, checked)
+            }} onDelete={() => removeSuggestion(item)} />
+          ))}
+        </ul>
+      </section>
+
+      {suggestions.filter((item) => item.kind === "criterion").length > 0 ? (
+        <section className="scorecard-section inferred-review">
+          <h2>Suggested criteria awaiting review</h2>
+          <ul className="suggestion-list">
+            {suggestions.filter((item) => item.kind === "criterion").map((item) => (
+              <SuggestionRow key={item.id} item={item} confirmed={confirmedSuggestions.has(item.id)} onConfirm={(checked) => {
+                setSuggestionConfirmed(item.id, checked)
+              }} onDelete={() => removeSuggestion(item)} />
+            ))}
+          </ul>
+        </section>
+      ) : null}
+      </fieldset>
+
+      {error ? <p role="alert" className="form-error">{error}</p> : null}
+      <div className="sticky-action">
+        <p>{allSuggestionsResolved ? "All suggestions reviewed." : `${suggestions.filter((item) => !confirmedSuggestions.has(item.id)).length} suggestions need review.`}</p>
+        <button
+          className="button button-primary"
+          type="button"
+          disabled={!allSuggestionsResolved || !structurallyValid || submitting}
+          onClick={confirmAndSource}
+        >
+          {submitting ? "Confirming…" : "Confirm and source"}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function SuggestionRow({
+  item,
+  confirmed,
+  onConfirm,
+  onDelete,
+}: {
+  item: SuggestedItem
+  confirmed: boolean
+  onConfirm: (checked: boolean) => void
+  onDelete: () => void
+}) {
+  return (
+    <li className="suggestion-row">
+      <label className="check-row">
+        <input
+          type="checkbox"
+          checked={confirmed}
+          onChange={(event) => onConfirm(event.target.checked)}
+        />
+        Confirm suggested {item.label}
+      </label>
+      <button className="button button-danger-quiet" type="button" onClick={onDelete}>
+        Delete {item.label}
+      </button>
+    </li>
+  )
+}

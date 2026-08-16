@@ -73,6 +73,7 @@ def test_clean_maintenance_worker_registers_only_maintenance_tasks() -> None:
                 "from app.maintenance_worker import celery_app; "
                 "required={'maintenance.reconcile_expired_snapshots',"
                 "'maintenance.expire_contact_points',"
+                "'maintenance.recover_sourcing_dispatches',"
                 "'maintenance.execute_privacy_deletion',"
                 "'maintenance.resume_privacy_deletions'}; "
                 "missing=required-set(celery_app.tasks); "
@@ -121,6 +122,7 @@ def test_maintenance_tasks_are_isolated_on_a_dedicated_worker_and_queue() -> Non
     assert "maintenance.expire_contact_points" in maintenance_celery_app.tasks
     assert "maintenance.execute_privacy_deletion" in maintenance_celery_app.tasks
     assert "maintenance.resume_privacy_deletions" in maintenance_celery_app.tasks
+    assert "maintenance.recover_sourcing_dispatches" in maintenance_celery_app.tasks
     assert "sourcing.plan_run" not in maintenance_celery_app.tasks
 
     entry = maintenance_celery_app.conf.beat_schedule[
@@ -140,6 +142,11 @@ def test_maintenance_tasks_are_isolated_on_a_dedicated_worker_and_queue() -> Non
     ]
     assert privacy_entry["task"] == resume_privacy_deletions.name
     assert str(privacy_entry["schedule"]) == "<crontab: 0 2 * * * (m/h/dM/MY/d)>"
+    dispatch_entry = maintenance_celery_app.conf.beat_schedule[
+        "sourcing-dispatch-recovery"
+    ]
+    assert dispatch_entry["task"] == "maintenance.recover_sourcing_dispatches"
+    assert str(dispatch_entry["schedule"]) == "<crontab: * * * * * (m/h/dM/MY/d)>"
     assert maintenance_celery_app.conf.task_routes == {
         "maintenance.*": {"queue": "maintenance"}
     }

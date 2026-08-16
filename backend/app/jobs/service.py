@@ -2,13 +2,14 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.clients.service import ClientError, ClientService
 from app.core.errors import AppError
 from app.identity.models import IdentityIdempotencyKey
-from app.identity.schemas import RequestContext
+from app.identity.schemas import RequestContext, Role
 from app.identity.service import IdentityError, MembershipService
 from app.jobs.llm import ScorecardExtractionError, ScorecardGateway
 from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
@@ -111,6 +112,27 @@ class JobService:
         self._authorize_client(context, job.client_id)
         return job
 
+    def list_authorized(
+        self,
+        context: RequestContext,
+        *,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[Job], int | None]:
+        statement = select(Job).where(Job.tenant_id == context.tenant_id)
+        if context.role is Role.RECRUITER:
+            allowed_client_ids = context.allowed_client_ids or frozenset()
+            statement = statement.where(Job.client_id.in_(allowed_client_ids))
+        rows = list(
+            self.session.scalars(
+                statement.order_by(Job.created_at.desc(), Job.id.desc())
+                .offset(offset)
+                .limit(limit + 1)
+            )
+        )
+        has_more = len(rows) > limit
+        return rows[:limit], offset + limit if has_more else None
+
     def generate_draft(
         self,
         context: RequestContext,
@@ -169,6 +191,14 @@ class JobService:
         self._complete(record, result.model_dump(mode="json"))
         return result
 
+    def get_draft(
+        self, context: RequestContext, job_id: UUID
+    ) -> ScorecardDraftResponse:
+        job = self.get_authorized(context, job_id)
+        if job.draft_revision == 0:
+            raise JobError("scorecard_draft_not_found")
+        return self._draft_response(job)
+
     def update_draft(
         self,
         context: RequestContext,
@@ -191,6 +221,7 @@ class JobService:
         if record.response_payload is not None:
             return ScorecardDraftResponse.model_validate(record.response_payload)
         self._check_revision(job, expected_revision)
+        draft = self._normalize_draft_provenance(job, draft)
         job.draft_payload = draft.model_dump(mode="json")
         job.draft_revision += 1
         if job.draft_extraction_status != ExtractionStatus.MANUAL_REQUIRED.value:
@@ -264,6 +295,7 @@ class JobService:
             )
         if expected_revision is not None:
             self._check_revision(job, expected_revision)
+        draft = self._normalize_draft_provenance(job, draft)
         scorecard = self._append_scorecard(context, job, draft)
         job.draft_payload = draft.model_dump(mode="json")
         job.draft_revision += 1
@@ -301,6 +333,8 @@ class JobService:
         self, context: RequestContext, job: Job, draft: ScorecardDraft
     ) -> ConfirmedScorecard:
         self._validate_industries(context, job, draft)
+        if draft.unresolved_inferred_items():
+            raise JobError("scorecard_inferences_unresolved")
         current_version = self.session.scalar(
             select(func.max(ScorecardVersion.version)).where(
                 ScorecardVersion.job_id == job.id
@@ -366,16 +400,94 @@ class JobService:
         ) or not suggested.issubset(approved):
             raise JobError("scorecard_adjacency_not_approved")
 
+    @staticmethod
+    def _normalize_draft_provenance(job: Job, draft: ScorecardDraft) -> ScorecardDraft:
+        previous = (
+            ScorecardDraft.model_validate(job.draft_payload)
+            if job.draft_payload is not None
+            else None
+        )
+        previous_criteria = previous.criteria if previous is not None else []
+        used: set[int] = set()
+
+        def semantic_content(criterion: ScorecardCriterion) -> tuple[object, ...]:
+            return (
+                criterion.label.strip().casefold(),
+                criterion.kind,
+                criterion.evidence_required,
+            )
+
+        normalized: list[ScorecardCriterion] = []
+        for criterion in draft.criteria:
+            match_index = next(
+                (
+                    index
+                    for index, old in enumerate(previous_criteria)
+                    if index not in used and old.key == criterion.key
+                ),
+                None,
+            )
+            if match_index is None:
+                match_index = next(
+                    (
+                        index
+                        for index, old in enumerate(previous_criteria)
+                        if index not in used
+                        and semantic_content(old) == semantic_content(criterion)
+                    ),
+                    None,
+                )
+            old = (
+                previous_criteria[match_index]
+                if match_index is not None
+                else None
+            )
+            if match_index is not None:
+                used.add(match_index)
+            unchanged_extraction = (
+                old is not None
+                and semantic_content(old) == semantic_content(criterion)
+            )
+            if old is not None and (old.inferred or unchanged_extraction):
+                provenance = {
+                    "source_text": old.source_text,
+                    "inferred": old.inferred,
+                    "recruiter_entered": old.recruiter_entered,
+                }
+            else:
+                provenance = {
+                    "source_text": None,
+                    "inferred": False,
+                    "recruiter_entered": True,
+                }
+            try:
+                normalized.append(
+                    ScorecardCriterion.model_validate(
+                        {**criterion.model_dump(), **provenance}
+                    )
+                )
+            except ValidationError as error:
+                raise JobError("scorecard_criterion_invalid") from error
+
+        payload = draft.model_dump()
+        payload["criteria"] = [criterion.model_dump() for criterion in normalized]
+        payload["confirmed_inferred_items"] = []
+        normalized_draft = ScorecardDraft.model_validate(payload)
+        valid_confirmations = sorted(
+            set(draft.confirmed_inferred_items)
+            & normalized_draft.inferred_item_ids()
+        )
+        return normalized_draft.model_copy(
+            update={"confirmed_inferred_items": valid_confirmations}
+        )
+
     def _to_confirmed(self, record: ScorecardVersion) -> ConfirmedScorecard:
         criteria = self.session.scalars(
             select(ScorecardCriterionRecord)
             .where(ScorecardCriterionRecord.scorecard_version_id == record.id)
             .order_by(ScorecardCriterionRecord.position)
         )
-        return ConfirmedScorecard(
-            id=record.id,
-            job_id=record.job_id,
-            version=record.version,
+        draft = ScorecardDraft(
             target_titles=record.target_titles,
             criteria=[
                 ScorecardCriterion(
@@ -399,6 +511,15 @@ class JobService:
             industry_code=record.industry_code,
             suggested_adjacent_industries=record.suggested_adjacent_industries,
             uncertainties=record.uncertainties,
+        )
+        confirmed_draft = draft.model_copy(
+            update={"confirmed_inferred_items": sorted(draft.inferred_item_ids())}
+        )
+        return ConfirmedScorecard(
+            **confirmed_draft.model_dump(),
+            id=record.id,
+            job_id=record.job_id,
+            version=record.version,
             confirmed_at=record.confirmed_at,
             extraction_status=ExtractionStatus(record.extraction_status),
         )
