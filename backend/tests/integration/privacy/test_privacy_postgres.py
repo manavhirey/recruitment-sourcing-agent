@@ -99,7 +99,7 @@ def test_0010_upgrade_downgrade_upgrade_and_model_parity(
     with owner_engine.begin() as connection:
         _grant_test_privileges(connection)
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0016_enrichment_retry_dispatch"
+            "0017_enrich_dispatch_deadlines"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)

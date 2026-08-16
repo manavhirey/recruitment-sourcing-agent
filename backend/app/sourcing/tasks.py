@@ -1689,8 +1689,9 @@ def enrich_request(
         finally:
             gateway.close()
         if isinstance(submission, DeferredEnrichment):
-            _record_provider_outcome("people_enrichment", "retry_scheduled")
-            raise self.retry(countdown=submission.retry_after_seconds)
+            if _requeue_enrichment_dispatch(parsed_request_id, context):
+                _record_provider_outcome("people_enrichment", "retry_scheduled")
+            return
         _record_provider_outcome(
             "people_enrichment",
             "provider_error" if isinstance(submission, FailedEnrichment) else "success",

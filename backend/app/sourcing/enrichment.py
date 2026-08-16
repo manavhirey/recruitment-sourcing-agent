@@ -464,6 +464,17 @@ def execute_queued_enrichment_request(
             )
             _finalize_if_terminal(session_factory, context, run_id)
             return FailedEnrichment(request_id=request_id)
+        retry_at = enrichment.poll_after
+        if retry_at is not None and retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        remaining = (
+            (retry_at - datetime.now(UTC)).total_seconds()
+            if retry_at is not None
+            else 0
+        )
+        if remaining > 0:
+            session.rollback()
+            return DeferredEnrichment(retry_after_seconds=max(1, int(remaining) + 1))
         run = _load_run(session, context, enrichment.run_id, for_update=True)
         if run.cancellation_requested or run.state is RunState.CANCELLED:
             enrichment.status = "cancelled"
@@ -499,6 +510,7 @@ def execute_queued_enrichment_request(
         enrichment.reveal_personal_emails = reveal_personal
         enrichment.reveal_phone_number = reveal_phone
         enrichment.status = "submitting"
+        enrichment.poll_after = None
         enrichment.stage_deadline = datetime.now(UTC) + _STAGE_DEADLINE
         session.commit()
         run_id = enrichment.run_id

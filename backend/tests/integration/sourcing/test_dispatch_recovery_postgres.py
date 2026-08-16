@@ -364,7 +364,7 @@ def test_0012_upgrade_downgrade_upgrade_and_model_parity(
 
     with owner_engine.begin() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0016_enrichment_retry_dispatch"
+            "0017_enrich_dispatch_deadlines"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -382,7 +382,28 @@ def test_0016_upgrade_downgrade_upgrade_and_model_parity(
 
     with owner_engine.begin() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0017_enrich_dispatch_deadlines"
+        )
+        assert (
+            compare_metadata(MigrationContext.configure(connection), Base.metadata)
+            == []
+        )
+
+
+def test_0017_upgrade_downgrade_upgrade_and_model_parity(
+    owner_engine: Engine,
+) -> None:
+    command.downgrade(_config(), "0016_enrichment_retry_dispatch")
+    with owner_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
             "0016_enrichment_retry_dispatch"
+        )
+    command.upgrade(_config(), "head")
+    _grant_api_test_access(owner_engine)
+
+    with owner_engine.begin() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0017_enrich_dispatch_deadlines"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)

@@ -454,14 +454,11 @@ def test_enrichment_authz_failures_disable_platform_before_future_calls(
     assert observed == expected
 
 
-def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(
+def test_deferred_enrichment_delivery_rearms_durable_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed: dict[str, object] = {}
     _allow_enrichment_request(monkeypatch)
-
-    class RetryRequested(RuntimeError):
-        pass
 
     class Gateway:
         def close(self) -> None:
@@ -485,19 +482,17 @@ def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(
         "_record_provider_outcome",
         lambda endpoint, outcome: observed.update(outcome=(endpoint, outcome)),
     )
+    monkeypatch.setattr(
+        tasks,
+        "_requeue_enrichment_dispatch",
+        lambda *args: observed.update(dispatch_rearmed=True) or True,
+    )
 
-    def retry(**kwargs: object) -> None:
-        observed.update(kwargs)
-        raise RetryRequested
-
-    monkeypatch.setattr(enrich_request, "retry", retry)
-
-    with pytest.raises(RetryRequested):
-        enrich_request.run(str(uuid4()), str(uuid4()), str(uuid4()))
+    enrich_request.run(str(uuid4()), str(uuid4()), str(uuid4()))
 
     assert observed == {
         "closed": True,
-        "countdown": 37,
+        "dispatch_rearmed": True,
         "outcome": ("people_enrichment", "retry_scheduled"),
     }
 
