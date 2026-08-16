@@ -814,6 +814,45 @@ def _run_is_enrich_eligible(
     return eligible
 
 
+def _enrichment_retry_dispatch_key(
+    session_factory: sessionmaker[Session],
+    run_id: UUID,
+    context: RequestContext,
+) -> str:
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        states = session.execute(
+            select(
+                EnrichmentRequest.id,
+                EnrichmentRequest.status,
+                EnrichmentRequest.retry_count,
+                EnrichmentRequest.poll_after,
+                EnrichmentRequest.stage_deadline,
+            )
+            .where(
+                EnrichmentRequest.tenant_id == context.tenant_id,
+                EnrichmentRequest.run_id == run_id,
+                EnrichmentRequest.status.in_(("queued", "submitting")),
+            )
+            .order_by(EnrichmentRequest.id)
+        ).all()
+        session.rollback()
+    fingerprint = "\0".join(
+        ":".join(
+            (
+                str(request_id),
+                status,
+                str(retry_count),
+                poll_after.isoformat() if poll_after is not None else "",
+                stage_deadline.isoformat() if stage_deadline is not None else "",
+            )
+        )
+        for request_id, status, retry_count, poll_after, stage_deadline in states
+    )
+    digest = hashlib.sha256(fingerprint.encode()).hexdigest()[:24]
+    return f"enrich-run-retry:{run_id}:{digest}"
+
+
 def _enrichment_dependencies(settings: Any):
     import boto3  # type: ignore[import-untyped]
 
@@ -1050,7 +1089,17 @@ def enrich_run(
             )
     if retry_delays:
         _record_provider_outcome("people_enrichment", "retry_scheduled")
-        raise self.retry(countdown=min(retry_delays))
+        delay = min(retry_delays)
+        enrich_run.apply_async(
+            args=(run_id, tenant_id, user_id, limit),
+            countdown=delay,
+            task_id=_enrichment_retry_dispatch_key(
+                database_session_factory,
+                UUID(run_id),
+                context,
+            ),
+        )
+        return
     _record_provider_outcome(
         "people_enrichment", "provider_error" if provider_failed else "success"
     )

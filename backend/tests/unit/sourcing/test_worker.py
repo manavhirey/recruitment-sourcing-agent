@@ -424,13 +424,11 @@ def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(
     }
 
 
-def test_enrichment_batch_deferral_retries_and_reports_retry_outcome(
+def test_exhausted_batch_schedules_one_fresh_run_delivery_for_later_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed: dict[str, object] = {}
-
-    class RetryRequested(RuntimeError):
-        pass
+    run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
 
     class Gateway:
         def close(self) -> None:
@@ -447,7 +445,10 @@ def test_enrichment_batch_deferral_retries_and_reports_retry_outcome(
     monkeypatch.setattr(
         tasks,
         "enqueue_top_enrichment",
-        lambda *args, **kwargs: [DeferredEnrichment(retry_after_seconds=23)],
+        lambda *args, **kwargs: [
+            FailedEnrichment(request_id=uuid4()),
+            DeferredEnrichment(retry_after_seconds=23),
+        ],
     )
     monkeypatch.setattr(
         tasks,
@@ -455,19 +456,34 @@ def test_enrichment_batch_deferral_retries_and_reports_retry_outcome(
         lambda endpoint, outcome: observed.update(outcome=(endpoint, outcome)),
     )
 
-    def retry(**kwargs: object) -> None:
-        observed.update(kwargs)
-        raise RetryRequested
+    monkeypatch.setattr(
+        tasks,
+        "_enrichment_retry_dispatch_key",
+        lambda *args: "enrich-run-retry:stable-state",
+    )
+    monkeypatch.setattr(
+        enrich_run,
+        "apply_async",
+        lambda *, args, countdown, task_id: observed.update(
+            scheduled=(args, countdown, task_id)
+        ),
+    )
+    monkeypatch.setattr(
+        enrich_run,
+        "retry",
+        lambda **kwargs: pytest.fail("durable deferrals must not consume task retries"),
+    )
 
-    monkeypatch.setattr(enrich_run, "retry", retry)
-
-    with pytest.raises(RetryRequested):
-        enrich_run.run(str(uuid4()), str(uuid4()), str(uuid4()))
+    enrich_run.run(str(run_id), str(tenant_id), str(user_id))
 
     assert observed == {
         "closed": True,
-        "countdown": 23,
         "outcome": ("people_enrichment", "retry_scheduled"),
+        "scheduled": (
+            (str(run_id), str(tenant_id), str(user_id), 50),
+            23,
+            "enrich-run-retry:stable-state",
+        ),
     }
 
 

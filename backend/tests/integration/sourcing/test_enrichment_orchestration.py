@@ -197,6 +197,30 @@ class RateLimitedThenAuthenticationGateway(RecordingGateway):
         raise ProviderAuthenticationError("provider authentication failed")
 
 
+class SixRateLimitsThenSuccessGateway(RecordingGateway):
+    def __init__(self, factory: sessionmaker[Session], run_id: UUID) -> None:
+        super().__init__(factory, run_id)
+        self.attempts = 0
+
+    def enrich_batch(
+        self,
+        people: tuple[EnrichmentInput, ...],
+        webhook_url: str,
+        *,
+        reveal_personal_emails: bool = False,
+        reveal_phone_number: bool = False,
+    ) -> EnrichmentReceipt:
+        self.attempts += 1
+        if self.attempts <= 6:
+            raise ProviderRateLimited(17)
+        return super().enrich_batch(
+            people,
+            webhook_url,
+            reveal_personal_emails=reveal_personal_emails,
+            reveal_phone_number=reveal_phone_number,
+        )
+
+
 class SecondBatchAuthenticationGateway(RecordingGateway):
     def __init__(self, factory: sessionmaker[Session], run_id: UUID) -> None:
         super().__init__(factory, run_id)
@@ -1124,6 +1148,68 @@ def test_rate_limited_enrichment_exhaustion_becomes_terminal_without_charge(
         assert all(
             charged == 0
             for charged in session.scalars(select(UsageLedger.charged_units))
+        )
+
+
+def test_later_batches_complete_after_first_batch_exhausts_rate_limit_retries(
+    enrichment_scenario: dict[str, Any],
+) -> None:
+    scenario = enrichment_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    gateway = SixRateLimitsThenSuccessGateway(scenario["factory"], scenario["run_id"])
+    common = {
+        "session_factory": scenario["factory"],
+        "context": context,
+        "gateway": gateway,
+        "callback_base_url": "https://api.example.test",
+        "contact_cipher": ContactCipher(
+            base64.b64encode(b"c" * 32).decode(), b"contact-lookup"
+        ),
+        "snapshot_store": SnapshotStore(
+            MemoryObjectStore(),
+            "snapshots",
+            base64.b64encode(b"s" * 32).decode(),
+        ),
+        "policy": RegionalContactPolicy(False, False),
+        "token_codec": CapabilityTokenCodec(b"webhook-key"),
+    }
+
+    for attempt in range(6):
+        outcomes = enqueue_top_enrichment(scenario["run_id"], 50, **common)
+        if attempt < 5:
+            assert outcomes == [DeferredEnrichment(retry_after_seconds=17)]
+        else:
+            assert len(outcomes) == 2
+            assert isinstance(outcomes[0], FailedEnrichment)
+            assert outcomes[1] == DeferredEnrichment(retry_after_seconds=17)
+        with scenario["factory"]() as session:
+            for request in session.scalars(
+                select(EnrichmentRequest).where(EnrichmentRequest.status == "queued")
+            ):
+                request.poll_after = datetime.now(UTC) - timedelta(seconds=1)
+            session.commit()
+
+    completed = enqueue_top_enrichment(scenario["run_id"], 50, **common)
+
+    assert len(completed) == 4
+    assert all(not isinstance(item, DeferredEnrichment) for item in completed)
+    assert gateway.attempts == 10
+    with scenario["factory"]() as session:
+        requests = session.scalars(select(EnrichmentRequest)).all()
+        assert [request.status for request in requests].count("failed") == 1
+        assert [request.status for request in requests].count("completed") == 4
+        assert not {request.status for request in requests} & {"queued", "submitting"}
+        assert (
+            session.scalar(
+                select(func.sum(UsageLedger.charged_units)).where(
+                    UsageLedger.unit_type == "enrichments"
+                )
+            )
+            == 40
         )
 
 
