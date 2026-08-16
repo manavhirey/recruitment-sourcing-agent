@@ -54,21 +54,6 @@ class SnapshotStore:
         self._client = client
         self._bucket = bucket
 
-    def ensure_lifecycle(self) -> None:
-        self._client.put_bucket_lifecycle_configuration(
-            Bucket=self._bucket,
-            LifecycleConfiguration={
-                "Rules": [
-                    {
-                        "ID": "expire-provider-snapshots-30-days",
-                        "Status": "Enabled",
-                        "Filter": {"Prefix": ""},
-                        "Expiration": {"Days": _RETENTION_DAYS},
-                    }
-                ]
-            },
-        )
-
     def put(
         self,
         *,
@@ -115,11 +100,11 @@ class SnapshotStore:
         return SnapshotReceipt(reference, checksum, timestamp, expires_at)
 
     def delete(self, reference: str) -> None:
-        _validate_reference(reference)
+        validate_snapshot_reference(reference)
         self._client.delete_object(Bucket=self._bucket, Key=reference)
 
     def exists(self, reference: str) -> bool:
-        _validate_reference(reference)
+        validate_snapshot_reference(reference)
         try:
             self._client.head_object(Bucket=self._bucket, Key=reference)
         except (KeyError, FileNotFoundError):
@@ -134,7 +119,23 @@ def _reference(tenant_id: UUID, run_id: UUID, provider: str, request_id: str) ->
     return f"{tenant_id}/{run_id}/{provider}/{request_id}"
 
 
-def _validate_reference(reference: str) -> None:
+def configure_snapshot_lifecycle(client: ObjectStoreClient, bucket: str) -> None:
+    client.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [
+                {
+                    "ID": "expire-provider-snapshots-30-days",
+                    "Status": "Enabled",
+                    "Filter": {"Prefix": ""},
+                    "Expiration": {"Days": _RETENTION_DAYS},
+                }
+            ]
+        },
+    )
+
+
+def validate_snapshot_reference(reference: str) -> None:
     components = reference.split("/")
     if len(components) != 4:
         raise ValueError("snapshot reference is invalid")

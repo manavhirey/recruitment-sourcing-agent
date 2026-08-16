@@ -10,6 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.audit.service import AuditService
 from app.candidates.contacts import ContactCipher, ContactService
@@ -211,12 +212,6 @@ async def apollo_webhook(
         forwarded_for=request.headers.get("x-forwarded-for"),
         trusted_proxies=trusted,
     )
-    limiter = _limiter(request)
-    if not limiter.allow(source, datetime.now(UTC).timestamp()):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={"code": "webhook_rate_limited"},
-        )
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -250,6 +245,32 @@ async def apollo_webhook(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "webhook_payload_invalid"},
         )
+    await run_in_threadpool(
+        _process_webhook_delivery,
+        session,
+        capability_token,
+        payload,
+        request,
+        settings,
+        source,
+    )
+    return {"status": "accepted"}
+
+
+def _process_webhook_delivery(
+    session: Session,
+    capability_token: str,
+    payload: dict[str, object],
+    request: Request,
+    settings: Settings,
+    source: str,
+) -> None:
+    limiter = _limiter(request)
+    if not limiter.allow(source, datetime.now(UTC).timestamp()):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "webhook_rate_limited"},
+        )
     codec = CapabilityTokenCodec(settings.webhook_hmac_key.get_secret_value().encode())
     try:
         apply_capability_payload(
@@ -267,7 +288,6 @@ async def apollo_webhook(
         raise HTTPException(
             status_code=error.status_code, detail={"code": error.code}
         ) from error
-    return {"status": "accepted"}
 
 
 def apply_capability_payload(
@@ -383,7 +403,7 @@ def apply_enrichment_payload(
         run_id=enrichment.run_id,
         provider=enrichment.provider,
         request_id=enrichment.provider_request_id,
-        payload=result.snapshot_payload,
+        payload=_snapshot_payload_for_request(result.snapshot_payload, enrichment),
     )
     reference = session.scalar(
         select(ProviderSnapshot).where(
@@ -466,6 +486,33 @@ def apply_enrichment_payload(
         payload={"source": source, "candidate_count": len(found_candidates)},
     )
     session.flush()
+
+
+def _snapshot_payload_for_request(
+    payload: dict[str, object], enrichment: EnrichmentRequest
+) -> dict[str, object]:
+    denied_keys: set[str] = set()
+    if not enrichment.reveal_personal_emails:
+        denied_keys.update(("personal_email", "personal_emails"))
+    if not enrichment.reveal_phone_number:
+        denied_keys.update(
+            ("mobile_phone", "mobile_phone_number", "phone_number", "phone_numbers")
+        )
+
+    def sanitize(value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                key: sanitize(item)
+                for key, item in value.items()
+                if key not in denied_keys
+            }
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        return value
+
+    sanitized = sanitize(payload)
+    assert isinstance(sanitized, dict)
+    return sanitized
 
 
 def _terminalize_existing_delivery(

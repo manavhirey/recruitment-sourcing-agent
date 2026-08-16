@@ -8,12 +8,12 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import UUID
 
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.audit.service import AuditService
-from app.candidates.contacts import ContactCipher, expire_due_contacts
+from app.candidates.contacts import ContactCipher
 from app.candidates.service import CandidateService
 from app.core.config import get_settings
 from app.core.database import session_factory as database_session_factory
@@ -35,7 +35,6 @@ from app.sourcing.enrichment import (
     enqueue_top_enrichment,
     execute_queued_enrichment_request,
     poll_enrichment_request,
-    reconcile_snapshot_references,
 )
 from app.sourcing.models import (
     EnrichmentRequest,
@@ -744,6 +743,7 @@ def _context(tenant_id: str, user_id: str) -> RequestContext:
 @celery_app.task(
     bind=True,
     name="sourcing.plan_run",
+    shared=False,
     acks_late=True,
     reject_on_worker_lost=True,
     max_retries=5,
@@ -771,6 +771,7 @@ def plan_run(
 @celery_app.task(
     bind=True,
     name="sourcing.source_run",
+    shared=False,
     acks_late=True,
     reject_on_worker_lost=True,
     max_retries=5,
@@ -816,6 +817,7 @@ def source_run(
 @celery_app.task(
     bind=True,
     name="sourcing.match_run",
+    shared=False,
     acks_late=True,
     reject_on_worker_lost=True,
     max_retries=5,
@@ -844,6 +846,7 @@ def match_run(
 @celery_app.task(
     bind=True,
     name="sourcing.enrich_run",
+    shared=False,
     acks_late=True,
     reject_on_worker_lost=True,
     max_retries=5,
@@ -896,6 +899,7 @@ def enrich_run(
 @celery_app.task(
     bind=True,
     name="sourcing.enrich_request",
+    shared=False,
     acks_late=True,
     reject_on_worker_lost=True,
     max_retries=5,
@@ -936,6 +940,7 @@ def enrich_request(
 @celery_app.task(
     bind=True,
     name="sourcing.poll_enrichment_result",
+    shared=False,
     acks_late=True,
     reject_on_worker_lost=True,
     max_retries=5,
@@ -968,50 +973,3 @@ def poll_enrichment_result(
         poll_enrichment_result.apply_async(
             args=(request_id, tenant_id, user_id), countdown=retry_after
         )
-
-
-@celery_app.task(name="sourcing.reconcile_expired_snapshots")
-def reconcile_expired_snapshots() -> None:
-    settings = get_settings()
-    _, snapshots, _, _ = _enrichment_dependencies(settings)
-    maintenance_engine = create_engine(
-        settings.maintenance_database_url,
-        pool_pre_ping=True,
-    )
-    try:
-        maintenance_sessions = sessionmaker(
-            bind=maintenance_engine,
-            expire_on_commit=False,
-        )
-        with maintenance_sessions() as session:
-            reconcile_snapshot_references(session, snapshots)
-            session.commit()
-    finally:
-        maintenance_engine.dispose()
-
-
-@celery_app.task(name="sourcing.expire_contact_points")
-def expire_contact_points() -> None:
-    settings = get_settings()
-    maintenance_engine = create_engine(
-        settings.maintenance_database_url,
-        pool_pre_ping=True,
-    )
-    try:
-        maintenance_sessions = sessionmaker(
-            bind=maintenance_engine,
-            expire_on_commit=False,
-        )
-        with maintenance_sessions() as session:
-            expire_due_contacts(session)
-            session.commit()
-    finally:
-        maintenance_engine.dispose()
-
-
-@celery_app.task(name="sourcing.configure_snapshot_lifecycle")
-def configure_snapshot_lifecycle() -> None:
-    """Explicit deployment operation; provider workers never run bucket admin."""
-    settings = get_settings()
-    _, snapshots, _, _ = _enrichment_dependencies(settings)
-    snapshots.ensure_lifecycle()

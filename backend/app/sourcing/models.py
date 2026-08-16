@@ -301,6 +301,9 @@ class ProviderSnapshot(Base):
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
+    maintenance_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
 
 
 class UsageBudget(Base):

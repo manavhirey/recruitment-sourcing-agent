@@ -1,30 +1,31 @@
 import subprocess
 import sys
-from inspect import getsource
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine as sqlalchemy_create_engine
 from sqlalchemy.exc import OperationalError
 
+from app.core.config import Settings
+from app.maintenance_worker import celery_app as maintenance_celery_app
 from app.providers.base import (
     ProviderAuthenticationError,
     ProviderRateLimited,
     ProviderTemporaryError,
 )
-from app.sourcing import tasks
+from app.sourcing import maintenance_tasks, tasks
+from app.sourcing.maintenance_tasks import (
+    expire_contact_points,
+    reconcile_expired_snapshots,
+)
 from app.sourcing.tasks import (
     _provider_retry_countdown,
-    configure_snapshot_lifecycle,
     enrich_request,
     enrich_run,
-    expire_contact_points,
     match_run,
     plan_run,
     poll_enrichment_result,
-    reconcile_expired_snapshots,
     source_run,
 )
 from app.worker import celery_app
@@ -40,12 +41,37 @@ def test_clean_worker_process_registers_sourcing_tasks() -> None:
                 "from app.worker import celery_app; "
                 "required={'sourcing.plan_run','sourcing.source_run',"
                 "'sourcing.match_run','sourcing.enrich_run','sourcing.enrich_request',"
-                "'sourcing.poll_enrichment_result',"
-                "'sourcing.reconcile_expired_snapshots',"
-                "'sourcing.expire_contact_points',"
-                "'sourcing.configure_snapshot_lifecycle'}; "
+                "'sourcing.poll_enrichment_result'}; "
                 "missing=required-set(celery_app.tasks); "
-                "assert not missing, sorted(missing)"
+                "forbidden={'maintenance.reconcile_expired_snapshots',"
+                "'maintenance.expire_contact_points',"
+                "'sourcing.configure_snapshot_lifecycle'}; "
+                "assert not missing, sorted(missing); "
+                "assert not forbidden.intersection(celery_app.tasks)"
+            ),
+        ],
+        cwd=backend_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+
+
+def test_clean_maintenance_worker_registers_only_maintenance_tasks() -> None:
+    backend_root = Path(__file__).resolve().parents[3]
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from app.maintenance_worker import celery_app; "
+                "required={'maintenance.reconcile_expired_snapshots',"
+                "'maintenance.expire_contact_points'}; "
+                "missing=required-set(celery_app.tasks); "
+                "assert not missing, sorted(missing); "
+                "assert 'sourcing.plan_run' not in celery_app.tasks"
             ),
         ],
         cwd=backend_root,
@@ -83,15 +109,27 @@ def test_sourcing_tasks_use_late_acknowledgement_and_bounded_retries() -> None:
     assert source_run.retry_jitter is True
 
 
-def test_snapshot_reconciliation_is_scheduled_daily() -> None:
-    entry = celery_app.conf.beat_schedule["snapshot-reference-reconciliation"]
+def test_maintenance_tasks_are_isolated_on_a_dedicated_worker_and_queue() -> None:
+    assert celery_app.conf.beat_schedule == {}
+    assert "maintenance.reconcile_expired_snapshots" in maintenance_celery_app.tasks
+    assert "maintenance.expire_contact_points" in maintenance_celery_app.tasks
+    assert "sourcing.plan_run" not in maintenance_celery_app.tasks
+
+    entry = maintenance_celery_app.conf.beat_schedule[
+        "snapshot-reference-reconciliation"
+    ]
 
     assert entry["task"] == reconcile_expired_snapshots.name
     assert str(entry["schedule"]) == "<crontab: 0 2 * * * (m/h/dM/MY/d)>"
 
-    contact_entry = celery_app.conf.beat_schedule["contact-point-expiration"]
+    contact_entry = maintenance_celery_app.conf.beat_schedule[
+        "contact-point-expiration"
+    ]
     assert contact_entry["task"] == expire_contact_points.name
     assert str(contact_entry["schedule"]) == "<crontab: 15 2 * * * (m/h/dM/MY/d)>"
+    assert maintenance_celery_app.conf.task_routes == {
+        "maintenance.*": {"queue": "maintenance"}
+    }
 
 
 def test_maintenance_tasks_use_only_narrow_maintenance_database_url(
@@ -99,53 +137,38 @@ def test_maintenance_tasks_use_only_narrow_maintenance_database_url(
 ) -> None:
     opened: list[str] = []
 
-    def engine_for(url: str, **kwargs: object):
-        del kwargs
-        opened.append(url)
-        return sqlalchemy_create_engine("sqlite+pysqlite:///:memory:")
-
     settings = SimpleNamespace(
         maintenance_database_url="postgresql://maintenance-only",
-        database_url="postgresql://api-role",
-        migration_database_url="postgresql://schema-owner",
     )
-    monkeypatch.setattr(tasks, "get_settings", lambda: settings)
-    monkeypatch.setattr(tasks, "create_engine", engine_for)
+    monkeypatch.setattr(maintenance_tasks, "get_maintenance_settings", lambda: settings)
     monkeypatch.setattr(
-        tasks,
-        "_enrichment_dependencies",
-        lambda value: (object(), object(), object(), object()),
+        maintenance_tasks,
+        "_run_contact_expiry",
+        lambda url: opened.append(url),
     )
-    monkeypatch.setattr(tasks, "reconcile_snapshot_references", lambda *args: 0)
-    monkeypatch.setattr(tasks, "expire_due_contacts", lambda *args: 0)
+    monkeypatch.setattr(
+        maintenance_tasks,
+        "_run_snapshot_reconciliation",
+        lambda value: opened.append(value.maintenance_database_url),
+    )
 
     reconcile_expired_snapshots.run()
     expire_contact_points.run()
 
     assert opened == [settings.maintenance_database_url] * 2
-    source = getsource(tasks.reconcile_expired_snapshots) + getsource(
-        tasks.expire_contact_points
-    )
-    assert "settings.migration_database_url" not in source
-    assert "settings.database_url" not in source
 
 
-def test_bucket_lifecycle_admin_is_explicit_not_a_provider_worker_side_effect(
+def test_provider_runtime_dependency_setup_has_no_bucket_admin_side_effect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[str] = []
-    snapshots = SimpleNamespace(ensure_lifecycle=lambda: calls.append("configured"))
-    monkeypatch.setattr(tasks, "get_settings", lambda: object())
-    monkeypatch.setattr(
-        tasks,
-        "_enrichment_dependencies",
-        lambda value: (object(), snapshots, object(), object()),
-    )
+    class RuntimeObjectStore:
+        def put_bucket_lifecycle_configuration(self, **kwargs: object) -> None:
+            del kwargs
+            raise AssertionError("provider runtime attempted bucket administration")
 
-    configure_snapshot_lifecycle.run()
+    monkeypatch.setattr("boto3.client", lambda *args, **kwargs: RuntimeObjectStore())
 
-    assert calls == ["configured"]
-    assert "ensure_lifecycle" not in getsource(tasks._enrichment_dependencies)
+    tasks._enrichment_dependencies(Settings.for_test())
 
 
 def test_provider_retry_uses_reset_time_or_exponential_jitter() -> None:

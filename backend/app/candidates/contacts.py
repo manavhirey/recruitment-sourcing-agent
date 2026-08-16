@@ -19,6 +19,7 @@ from app.candidates.models import (
     CandidateExperience,
     CandidateFieldProvenance,
     ContactPoint,
+    ContactRetentionTombstone,
     DuplicateSuggestion,
     SourceIdentity,
 )
@@ -187,28 +188,51 @@ class ContactService:
                         context.tenant_id, candidate.id, contact.kind
                     )
 
-        encrypted = self.cipher.encrypt(contact.value, contact_context)
         point = self.session.scalar(
             select(ContactPoint).where(
                 ContactPoint.tenant_id == context.tenant_id,
                 ContactPoint.candidate_id == candidate.id,
                 ContactPoint.kind == contact.kind,
-                ContactPoint.lookup_hmac == encrypted.lookup_hmac,
+                ContactPoint.lookup_hmac == lookup_hmac,
             )
         )
+        tombstone = self.session.scalar(
+            select(ContactRetentionTombstone).where(
+                ContactRetentionTombstone.tenant_id == context.tenant_id,
+                ContactRetentionTombstone.candidate_id == candidate.id,
+                ContactRetentionTombstone.kind == contact.kind,
+                ContactRetentionTombstone.suppression_hmac == lookup_hmac,
+            )
+        )
+        if point is None and tombstone is not None:
+            point = self.session.scalar(
+                select(ContactPoint).where(
+                    ContactPoint.tenant_id == context.tenant_id,
+                    ContactPoint.id == tombstone.contact_point_id,
+                )
+            )
         last_verified_at = (
             observed_at if contact.verification_state == "verified" else None
         )
         if point is not None and processing_time >= _utc(point.expires_at):
-            _erase_contact(point, processing_time)
-            self.session.flush()
-            return ContactResolution(
-                candidate_id=candidate.id,
-                contact_point=point,
-                merged_candidate_id=merged_candidate_id,
-                duplicate_suggestion_id=duplicate_suggestion_id,
-                accepted=False,
+            tombstone = _erase_contact(self.session, point, processing_time)
+        if tombstone is not None and tombstone.retired_at is not None:
+            is_new_verification = (
+                contact.verification_state == "verified"
+                and contact.observed_at is not None
+                and observed_at > _utc(tombstone.retired_at)
             )
+            if not is_new_verification:
+                self.session.flush()
+                assert point is not None
+                return ContactResolution(
+                    candidate_id=candidate.id,
+                    contact_point=point,
+                    merged_candidate_id=merged_candidate_id,
+                    duplicate_suggestion_id=duplicate_suggestion_id,
+                    accepted=False,
+                )
+        encrypted = self.cipher.encrypt(contact.value, contact_context)
         if point is None:
             point = ContactPoint(
                 tenant_id=context.tenant_id,
@@ -229,6 +253,32 @@ class ContactService:
                 expires_at=(last_verified_at or observed_at) + _CONTACT_RETENTION,
             )
             self.session.add(point)
+            self.session.flush()
+            tombstone = ContactRetentionTombstone(
+                tenant_id=context.tenant_id,
+                candidate_id=candidate.id,
+                contact_point_id=point.id,
+                kind=contact.kind,
+                suppression_hmac=encrypted.lookup_hmac,
+            )
+            self.session.add(tombstone)
+        elif tombstone is not None and tombstone.retired_at is not None:
+            point.classification = contact.classification
+            point.verification_state = "verified"
+            point.confidence = contact.confidence
+            point.provider = "apollo"
+            point.lookup_hmac = encrypted.lookup_hmac
+            point.value_ciphertext = encrypted.ciphertext
+            point.value_nonce = encrypted.nonce
+            point.encrypted_data_key = encrypted.encrypted_data_key
+            point.key_nonce = encrypted.key_nonce
+            point.schema_version = encrypted.schema_version
+            point.observed_at = observed_at
+            point.last_verified_at = observed_at
+            point.last_used_at = None
+            point.expires_at = observed_at + _CONTACT_RETENTION
+            point.expired_at = None
+            tombstone.retired_at = None
         elif observed_at >= _utc(point.observed_at):
             point.classification = contact.classification
             point.verification_state = contact.verification_state
@@ -280,7 +330,7 @@ class ContactService:
             raise LookupError("contact point not found")
         use_time = _utc(used_at or datetime.now(UTC))
         if use_time >= _utc(point.expires_at):
-            _erase_contact(point, use_time)
+            _erase_contact(self.session, point, use_time)
             self.session.flush()
             raise LookupError("contact point is expired")
         if any(
@@ -367,13 +417,14 @@ class ContactService:
         return suggestion
 
     def _merge_candidate(self, source: Candidate, target: Candidate) -> Candidate:
+        if self.merge_coordinator is None:
+            raise RuntimeError("candidate merge coordinator is required")
         self._move_contacts(source, target)
-        if self.merge_coordinator is not None:
-            self.merge_coordinator.merge_candidate_memberships(
-                source.tenant_id,
-                source.id,
-                target.id,
-            )
+        self.merge_coordinator.merge_candidate_memberships(
+            source.tenant_id,
+            source.id,
+            target.id,
+        )
         identities = self.session.scalars(
             select(SourceIdentity).where(
                 SourceIdentity.tenant_id == source.tenant_id,
@@ -419,15 +470,23 @@ class ContactService:
             )
         ).all()
         for point in points:
-            collision = self.session.scalar(
-                select(ContactPoint).where(
-                    ContactPoint.tenant_id == source.tenant_id,
-                    ContactPoint.candidate_id == target.id,
-                    ContactPoint.kind == point.kind,
-                    ContactPoint.lookup_hmac == point.lookup_hmac,
-                    ContactPoint.lookup_hmac.is_not(None),
+            tombstone = self.session.scalar(
+                select(ContactRetentionTombstone).where(
+                    ContactRetentionTombstone.tenant_id == source.tenant_id,
+                    ContactRetentionTombstone.contact_point_id == point.id,
                 )
             )
+            collision = None
+            if tombstone is not None:
+                collision = self.session.scalar(
+                    select(ContactRetentionTombstone).where(
+                        ContactRetentionTombstone.tenant_id == source.tenant_id,
+                        ContactRetentionTombstone.candidate_id == target.id,
+                        ContactRetentionTombstone.kind == tombstone.kind,
+                        ContactRetentionTombstone.suppression_hmac
+                        == tombstone.suppression_hmac,
+                    )
+                )
             if collision is not None:
                 self.session.delete(point)
                 continue
@@ -464,6 +523,8 @@ class ContactService:
                 point.lookup_hmac = encrypted.lookup_hmac
                 point.schema_version = encrypted.schema_version
             point.candidate_id = target.id
+            if tombstone is not None:
+                tombstone.candidate_id = target.id
 
 
 def expire_due_contacts(
@@ -482,12 +543,42 @@ def expire_due_contacts(
         .with_for_update()
     ).all()
     for point in points:
-        _erase_contact(point, timestamp)
+        _erase_contact(session, point, timestamp)
     session.flush()
     return len(points)
 
 
-def _erase_contact(point: ContactPoint, timestamp: datetime) -> None:
+def _erase_contact(
+    session: Session, point: ContactPoint, timestamp: datetime
+) -> ContactRetentionTombstone:
+    if point.lookup_hmac is None:
+        tombstone = session.scalar(
+            select(ContactRetentionTombstone).where(
+                ContactRetentionTombstone.tenant_id == point.tenant_id,
+                ContactRetentionTombstone.contact_point_id == point.id,
+            )
+        )
+        if tombstone is None:
+            raise RuntimeError("expired contact is missing its retention tombstone")
+    else:
+        tombstone = session.scalar(
+            select(ContactRetentionTombstone).where(
+                ContactRetentionTombstone.tenant_id == point.tenant_id,
+                ContactRetentionTombstone.candidate_id == point.candidate_id,
+                ContactRetentionTombstone.kind == point.kind,
+                ContactRetentionTombstone.suppression_hmac == point.lookup_hmac,
+            )
+        )
+        if tombstone is None:
+            tombstone = ContactRetentionTombstone(
+                tenant_id=point.tenant_id,
+                candidate_id=point.candidate_id,
+                contact_point_id=point.id,
+                kind=point.kind,
+                suppression_hmac=point.lookup_hmac,
+            )
+            session.add(tombstone)
+    tombstone.retired_at = _utc(point.expires_at)
     point.value_ciphertext = None
     point.value_nonce = None
     point.encrypted_data_key = None
@@ -495,6 +586,7 @@ def _erase_contact(point: ContactPoint, timestamp: datetime) -> None:
     point.lookup_hmac = None
     point.verification_state = "expired"
     point.expired_at = timestamp
+    return tombstone
 
 
 def _associated_data(context: ContactContext, schema_version: int) -> bytes:

@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy.engine import make_url
 
-from app.core.config import MigrationSettings, Settings
+from app.core.config import MaintenanceSettings, MigrationSettings, Settings
 from app.main import create_app
 
 
@@ -17,9 +17,8 @@ def test_test_settings_supply_all_required_secrets() -> None:
     assert settings.environment == "test"
     assert make_url(settings.database_url).username == "sourcing_api_test"
     assert not hasattr(settings, "migration_database_url")
-    assert make_url(settings.maintenance_database_url).username == (
-        "sourcing_maintenance"
-    )
+    assert not hasattr(settings, "maintenance_database_url")
+    assert not hasattr(settings, "object_store_admin_secret_access_key")
 
 
 def test_runtime_settings_do_not_require_schema_owner_credentials(
@@ -38,36 +37,45 @@ def test_migration_database_url_must_use_a_distinct_role() -> None:
     payload = {
         "database_url": runtime.database_url,
         "migration_database_url": runtime.database_url,
-        "maintenance_database_url": runtime.maintenance_database_url,
+        "maintenance_database_url": MaintenanceSettings.for_test().maintenance_database_url,
     }
 
     with pytest.raises(ValidationError, match="database roles must be distinct"):
         MigrationSettings.model_validate(payload)
 
 
-def test_maintenance_database_url_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    payload = Settings.for_test().model_dump()
-    payload.pop("maintenance_database_url")
+def test_maintenance_database_url_is_required_only_by_maintenance_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("MAINTENANCE_DATABASE_URL")
 
     with pytest.raises(ValidationError, match="maintenance_database_url"):
-        Settings(_env_file=None, **payload)
+        MaintenanceSettings(
+            _env_file=None,
+            redis_url="redis://localhost/15",
+            object_store_endpoint="http://localhost:9000",
+            object_store_admin_access_key_id="admin",
+            object_store_admin_secret_access_key="secret",
+        )
+
+    assert not hasattr(Settings.for_test(), "maintenance_database_url")
 
 
 def test_maintenance_database_url_must_use_a_distinct_api_role() -> None:
-    payload = Settings.for_test().model_dump()
-    payload["maintenance_database_url"] = payload["database_url"]
+    payload = MaintenanceSettings.for_test().model_dump()
+    payload["maintenance_database_url"] = Settings.for_test().database_url
 
-    with pytest.raises(ValidationError, match="distinct from API"):
-        Settings.model_validate(payload)
+    with pytest.raises(ValidationError, match="dedicated maintenance role"):
+        MaintenanceSettings.model_validate(payload)
 
 
 def test_maintenance_database_url_must_differ_from_migration_role() -> None:
     runtime = Settings.for_test()
+    maintenance = MaintenanceSettings.for_test()
     payload = {
         "database_url": runtime.database_url,
-        "migration_database_url": runtime.maintenance_database_url,
-        "maintenance_database_url": runtime.maintenance_database_url,
+        "migration_database_url": maintenance.maintenance_database_url,
+        "maintenance_database_url": maintenance.maintenance_database_url,
     }
 
     with pytest.raises(ValidationError, match="database roles must be distinct"):

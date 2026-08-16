@@ -17,6 +17,7 @@ from app.candidates.contacts import (
 from app.candidates.models import (
     Candidate,
     ContactPoint,
+    ContactRetentionTombstone,
     DuplicateSuggestion,
     SourceIdentity,
 )
@@ -47,6 +48,13 @@ def _candidate(session: Session, tenant_id, name: str) -> Candidate:
     session.add(candidate)
     session.flush()
     return candidate
+
+
+class _NoopMergeCoordinator:
+    def merge_candidate_memberships(
+        self, tenant_id: object, source_id: object, target_id: object
+    ) -> None:
+        del tenant_id, source_id, target_id
 
 
 def test_contact_service_stores_only_ciphertext_and_extends_retention_on_reveal() -> (
@@ -239,6 +247,58 @@ def test_expired_contact_cannot_be_revived_and_daily_reconciliation_erases_keys(
         assert second.encrypted_data_key is None
         assert second.lookup_hmac is None
 
+        replay = service.store(
+            context,
+            candidate.id,
+            ProviderContact(
+                kind="phone",
+                value="+1 212 555 0112",
+                verification_state="unverified",
+                observed_at=second.expires_at + timedelta(days=1),
+            ),
+            processed_at=second.expires_at + timedelta(days=1),
+        )
+        assert replay.accepted is False
+        assert replay.contact_point.id == second.id
+        assert session.scalar(select(func.count()).select_from(ContactPoint)) == 2
+        tombstone = session.scalar(
+            select(ContactRetentionTombstone).where(
+                ContactRetentionTombstone.contact_point_id == second.id
+            )
+        )
+        assert tombstone is not None
+        assert tombstone.suppression_hmac
+
+        stale_verified = service.store(
+            context,
+            candidate.id,
+            ProviderContact(
+                kind="phone",
+                value="+1 212 555 0112",
+                verification_state="verified",
+                observed_at=second.expires_at,
+            ),
+            processed_at=second.expires_at + timedelta(days=2),
+        )
+        assert stale_verified.accepted is False
+
+        verified_at = second.expires_at + timedelta(days=3)
+        reverified = service.store(
+            context,
+            candidate.id,
+            ProviderContact(
+                kind="phone",
+                value="+1 212 555 0112",
+                verification_state="verified",
+                observed_at=verified_at,
+            ),
+            processed_at=verified_at,
+        )
+        assert reverified.accepted is True
+        assert reverified.contact_point.id == second.id
+        assert reverified.contact_point.value_ciphertext is not None
+        assert reverified.contact_point.expires_at == verified_at + timedelta(days=180)
+
     engine.dispose()
 
 
@@ -253,7 +313,9 @@ def test_verified_email_merges_same_tenant_candidate_without_name_or_provider_co
         session.flush()
         first = _candidate(session, tenant.id, "Priya Sharma")
         second = _candidate(session, tenant.id, "Priya Sharma")
-        service = ContactService(session, _cipher())
+        service = ContactService(
+            session, _cipher(), merge_coordinator=_NoopMergeCoordinator()
+        )
         context = _context(tenant.id)
         contact = ProviderContact(
             kind="email",
@@ -281,7 +343,9 @@ def test_verified_email_merge_reencrypts_source_contacts_for_target_aad() -> Non
         session.flush()
         target = _candidate(session, tenant.id, "Priya Sharma")
         source = _candidate(session, tenant.id, "Priya Sharma")
-        service = ContactService(session, _cipher())
+        service = ContactService(
+            session, _cipher(), merge_coordinator=_NoopMergeCoordinator()
+        )
         context = _context(tenant.id)
         service.store(
             context,
@@ -363,6 +427,35 @@ def test_candidate_merge_delegates_sourcing_membership_reconciliation() -> None:
         merge_source = inspect.getsource(ContactService._merge_candidate)
         assert "RunCandidate" not in merge_source
         assert "app.sourcing" not in merge_source
+
+    engine.dispose()
+
+
+def test_verified_email_merge_without_coordinator_fails_before_candidate_delete() -> (
+    None
+):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        tenant = Tenant(slug=f"merge-required-{uuid4()}")
+        session.add(tenant)
+        session.flush()
+        target = _candidate(session, tenant.id, "Priya Sharma")
+        source = _candidate(session, tenant.id, "Priya Sharma")
+        service = ContactService(session, _cipher())
+        context = _context(tenant.id)
+        contact = ProviderContact(
+            kind="email",
+            value="priya@example.com",
+            verification_state="verified",
+        )
+        service.store(context, target.id, contact)
+
+        with pytest.raises(RuntimeError, match="merge coordinator"):
+            service.store(context, source.id, contact)
+
+        assert session.get(Candidate, target.id) is not None
+        assert session.get(Candidate, source.id) is not None
 
     engine.dispose()
 

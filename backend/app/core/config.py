@@ -13,7 +13,6 @@ class Settings(BaseSettings):
 
     environment: str = "development"
     database_url: str
-    maintenance_database_url: str
     redis_url: str
     object_store_endpoint: str
     object_store_bucket: str = "provider-snapshots"
@@ -31,28 +30,12 @@ class Settings(BaseSettings):
     apollo_reveal_personal_emails: bool = False
     apollo_reveal_phone_numbers: bool = False
 
-    @model_validator(mode="after")
-    def require_distinct_database_roles(self) -> "Settings":
-        api_role = make_url(self.database_url).username
-        if api_role is None:
-            raise ValueError("DATABASE_URL must include a database role")
-        maintenance_role = make_url(self.maintenance_database_url).username
-        if maintenance_role is None or maintenance_role == api_role:
-            raise ValueError(
-                "MAINTENANCE_DATABASE_URL must use a role distinct from API"
-            )
-        return self
-
     @classmethod
     def for_test(cls) -> "Settings":
         return cls(
             environment="test",
             database_url=(
                 "postgresql+psycopg://sourcing_api_test:sourcing-api-test"
-                "@localhost:5432/sourcing_test"
-            ),
-            maintenance_database_url=(
-                "postgresql+psycopg://sourcing_maintenance:sourcing-maintenance-test"
                 "@localhost:5432/sourcing_test"
             ),
             redis_url="redis://localhost:6379/15",
@@ -64,6 +47,41 @@ class Settings(BaseSettings):
             contact_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             suppression_hmac_key="test-suppression-key",
             webhook_hmac_key="test-webhook-key",
+        )
+
+
+class MaintenanceSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
+    )
+
+    maintenance_database_url: str
+    redis_url: str
+    object_store_endpoint: str
+    object_store_bucket: str = "provider-snapshots"
+    object_store_admin_access_key_id: SecretStr
+    object_store_admin_secret_access_key: SecretStr
+
+    @model_validator(mode="after")
+    def require_dedicated_maintenance_role(self) -> "MaintenanceSettings":
+        role = make_url(self.maintenance_database_url).username
+        if role != "sourcing_maintenance":
+            raise ValueError(
+                "MAINTENANCE_DATABASE_URL must use the dedicated maintenance role"
+            )
+        return self
+
+    @classmethod
+    def for_test(cls) -> "MaintenanceSettings":
+        return cls(
+            maintenance_database_url=(
+                "postgresql+psycopg://sourcing_maintenance:sourcing-maintenance-test"
+                "@localhost:5432/sourcing_test"
+            ),
+            redis_url="redis://localhost:6379/15",
+            object_store_endpoint="http://localhost:9000",
+            object_store_admin_access_key_id="test-admin-key",
+            object_store_admin_secret_access_key="test-admin-secret",
         )
 
 
@@ -96,6 +114,11 @@ class MigrationSettings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+@lru_cache
+def get_maintenance_settings() -> MaintenanceSettings:
+    return MaintenanceSettings()
 
 
 @lru_cache

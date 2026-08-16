@@ -16,8 +16,13 @@ from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session, sessionmaker
 
 from alembic import command
-from app.candidates.contacts import ContactCipher, ContactService, expire_due_contacts
-from app.candidates.models import Candidate, ContactPoint, SourceIdentity
+from app.candidates.contacts import ContactCipher, ContactService
+from app.candidates.models import (
+    Candidate,
+    ContactPoint,
+    ContactRetentionTombstone,
+    SourceIdentity,
+)
 from app.clients.models import ClientCompany
 from app.core.database import Base
 from app.identity.dependencies import apply_tenant_context
@@ -35,6 +40,7 @@ from app.sourcing import tasks
 from app.sourcing.enrichment import RegionalContactPolicy
 from app.sourcing.models import (
     EnrichmentRequest,
+    ProviderSnapshot,
     RunCandidate,
     SourcingRun,
     UsageBudget,
@@ -58,6 +64,7 @@ pytestmark = pytest.mark.skipif(
 
 _TENANT_TABLES = (
     "candidate_contact_points",
+    "candidate_contact_retention_tombstones",
     "enrichment_requests",
     "enrichment_webhook_deliveries",
     "provider_snapshot_references",
@@ -104,10 +111,11 @@ def owner_engine() -> Generator[Engine, None, None]:
     engine.dispose()
 
 
-def test_0007_upgrade_downgrade_and_model_parity(owner_engine: Engine) -> None:
+def test_0007_to_head_upgrade_downgrade_and_model_parity(owner_engine: Engine) -> None:
     command.downgrade(_config(), "0006_contacts_enrichment")
     tables = set(inspect(owner_engine).get_table_names())
-    assert set(_TENANT_TABLES).issubset(tables)
+    assert set(_TENANT_TABLES) - {"candidate_contact_retention_tombstones"} <= tables
+    assert "candidate_contact_retention_tombstones" not in tables
     request_columns = {
         column["name"]
         for column in inspect(owner_engine).get_columns("enrichment_requests")
@@ -118,7 +126,7 @@ def test_0007_upgrade_downgrade_and_model_parity(owner_engine: Engine) -> None:
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0007_enrichment_security_fixes"
+            "0008_retention_maintenance"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -193,18 +201,19 @@ def test_maintenance_role_can_only_erase_due_contacts(
 
     maintenance_engine = create_engine(MAINTENANCE_DATABASE_URL)
     with Session(maintenance_engine) as session:
-        assert expire_due_contacts(session, now=now) == 1
+        assert session.scalar(text("SELECT maintenance_erase_due_contacts()")) == 1
         session.commit()
-        visible_ids = set(session.scalars(select(ContactPoint.id)))
-        assert visible_ids == {expired_id}
-        changed = session.execute(
-            text(
-                "UPDATE candidate_contact_points SET verification_state = 'expired' "
-                "WHERE id = :id"
-            ),
-            {"id": current_id},
-        )
-        assert changed.rowcount == 0
+        with pytest.raises(ProgrammingError):
+            session.scalars(select(ContactPoint.id)).all()
+        session.rollback()
+        with pytest.raises(ProgrammingError):
+            session.execute(
+                text(
+                    "UPDATE candidate_contact_points "
+                    "SET verification_state = 'expired' WHERE id = :id"
+                ),
+                {"id": current_id},
+            )
         session.rollback()
         with pytest.raises(ProgrammingError):
             session.execute(text("CREATE TABLE task9_maintenance_forbidden (id int)"))
@@ -222,9 +231,16 @@ def test_maintenance_role_can_only_erase_due_contacts(
         ) == (None, None, None)
         assert current_row.verification_state == "unverified"
         assert current_row.value_ciphertext is not None
+        tombstone = session.scalar(
+            select(ContactRetentionTombstone).where(
+                ContactRetentionTombstone.contact_point_id == expired_id
+            )
+        )
+        assert tombstone is not None and tombstone.suppression_hmac
+        assert "expired@example.test" not in tombstone.suppression_hmac
 
     with owner_engine.connect() as connection:
-        grants = set(
+        table_grants = set(
             connection.execute(
                 text(
                     "SELECT table_name, privilege_type FROM information_schema."
@@ -232,11 +248,20 @@ def test_maintenance_role_can_only_erase_due_contacts(
                 )
             ).all()
         )
-    assert grants == {
-        ("candidate_contact_points", "SELECT"),
-        ("candidate_contact_points", "UPDATE"),
-        ("provider_snapshot_references", "SELECT"),
-        ("provider_snapshot_references", "DELETE"),
+        routine_grants = set(
+            connection.execute(
+                text(
+                    "SELECT routine_name, privilege_type FROM information_schema."
+                    "role_routine_grants WHERE grantee = 'sourcing_maintenance' "
+                    "AND routine_name LIKE 'maintenance_%'"
+                )
+            ).all()
+        )
+    assert table_grants == set()
+    assert routine_grants == {
+        ("maintenance_claim_expired_snapshots", "EXECUTE"),
+        ("maintenance_delete_claimed_snapshot", "EXECUTE"),
+        ("maintenance_erase_due_contacts", "EXECUTE"),
     }
 
 
@@ -297,7 +322,118 @@ def test_postgres_contact_row_contains_no_plaintext(owner_engine: Engine) -> Non
             )
         )
         assert "priya@example.com" not in serialized
+        suppression = session.scalar(select(ContactRetentionTombstone.suppression_hmac))
+        assert suppression is not None
+        assert "priya@example.com" not in suppression
     engine.dispose()
+
+
+def test_postgres_erasure_tombstone_blocks_stale_replay_under_forced_rls(
+    owner_engine: Engine,
+) -> None:
+    assert API_DATABASE_URL is not None
+    assert MAINTENANCE_DATABASE_URL is not None
+    tenant_id, candidate_id = uuid4(), uuid4()
+    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    deadline = observed_at + timedelta(days=180)
+    with owner_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO tenants (id, slug, created_at) VALUES (:id, :slug, now())"
+            ),
+            {"id": tenant_id, "slug": f"task9-tombstone-{tenant_id}"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO candidates "
+                "(id, tenant_id, full_name, normalized_name, created_at, updated_at) "
+                "VALUES (:id, :tenant, 'Retention Candidate', "
+                "'retention candidate', now(), now())"
+            ),
+            {"id": candidate_id, "tenant": tenant_id},
+        )
+        connection.execute(
+            text(
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES "
+                "IN SCHEMA public TO sourcing_api_test"
+            )
+        )
+
+    api_engine = create_engine(API_DATABASE_URL)
+    context = RequestContext(tenant_id=tenant_id, user_id=uuid4(), role=Role.OWNER)
+    cipher = ContactCipher(base64.b64encode(b"c" * 32).decode(), b"lookup")
+    with Session(api_engine) as session:
+        apply_tenant_context(session, tenant_id)
+        point = (
+            ContactService(session, cipher)
+            .store(
+                context,
+                candidate_id,
+                ProviderContact(
+                    kind="email",
+                    value="retained@example.test",
+                    verification_state="verified",
+                    observed_at=observed_at,
+                ),
+                processed_at=observed_at,
+            )
+            .contact_point
+        )
+        point_id = point.id
+        session.commit()
+
+    maintenance_engine = create_engine(MAINTENANCE_DATABASE_URL)
+    with Session(maintenance_engine) as session:
+        session.scalar(text("SELECT maintenance_erase_due_contacts()"))
+        session.commit()
+    maintenance_engine.dispose()
+
+    with Session(api_engine) as session:
+        apply_tenant_context(session, tenant_id)
+        replay = ContactService(session, cipher).store(
+            context,
+            candidate_id,
+            ProviderContact(
+                kind="email",
+                value="retained@example.test",
+                verification_state="unverified",
+                observed_at=deadline + timedelta(days=1),
+            ),
+            processed_at=deadline + timedelta(days=1),
+        )
+        assert replay.accepted is False
+        assert replay.contact_point.id == point_id
+        assert session.scalar(select(func.count()).select_from(ContactPoint)) == 1
+        tombstone = session.scalar(select(ContactRetentionTombstone))
+        assert tombstone is not None
+        assert "retained@example.test" not in tombstone.suppression_hmac
+        session.rollback()
+
+    with Session(api_engine) as session:
+        apply_tenant_context(session, uuid4())
+        assert (
+            session.scalar(select(func.count()).select_from(ContactRetentionTombstone))
+            == 0
+        )
+
+    with Session(api_engine) as session:
+        apply_tenant_context(session, tenant_id)
+        reverified = ContactService(session, cipher).store(
+            context,
+            candidate_id,
+            ProviderContact(
+                kind="email",
+                value="retained@example.test",
+                verification_state="verified",
+                observed_at=deadline + timedelta(days=2),
+            ),
+            processed_at=deadline + timedelta(days=2),
+        )
+        assert reverified.accepted is True
+        assert reverified.contact_point.id == point_id
+        assert reverified.contact_point.expires_at == deadline + timedelta(days=182)
+        session.commit()
+    api_engine.dispose()
 
 
 class ThreadSafeObjectStore:
@@ -673,6 +809,90 @@ def _seed_celery_entry_run(
         )
         session.commit()
         return tenant_id, user_id, run.id, run_candidate.id
+
+
+def test_maintenance_snapshot_functions_only_claim_and_delete_due_references(
+    owner_engine: Engine,
+) -> None:
+    assert MAINTENANCE_DATABASE_URL is not None
+    tenant_id, _user_id, run_id, _candidate_id = _seed_celery_entry_run(
+        owner_engine, suffix="snap"
+    )
+    now = datetime.now(UTC)
+    with Session(owner_engine, expire_on_commit=False) as session:
+        expired_request = EnrichmentRequest(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            provider="apollo",
+            provider_request_id="expired-snapshot",
+            candidate_ids=[],
+            reservation_key="snapshot-expired",
+            status="completed",
+        )
+        current_request = EnrichmentRequest(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            provider="apollo",
+            provider_request_id="current-snapshot",
+            candidate_ids=[],
+            reservation_key="snapshot-current",
+            status="completed",
+        )
+        session.add_all((expired_request, current_request))
+        session.flush()
+        expired = ProviderSnapshot(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            enrichment_request_id=expired_request.id,
+            provider="apollo",
+            object_reference=f"{tenant_id}/{run_id}/apollo/expired-snapshot",
+            checksum_sha256="a" * 64,
+            created_at=now - timedelta(days=31),
+            expires_at=now - timedelta(days=1),
+        )
+        current = ProviderSnapshot(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            enrichment_request_id=current_request.id,
+            provider="apollo",
+            object_reference=f"{tenant_id}/{run_id}/apollo/current-snapshot",
+            checksum_sha256="b" * 64,
+            created_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+        session.add_all((expired, current))
+        session.flush()
+        expired_id, current_id = expired.id, current.id
+        session.commit()
+
+    engine = create_engine(MAINTENANCE_DATABASE_URL)
+    with Session(engine) as session:
+        claimed = session.execute(
+            text(
+                "SELECT snapshot_id, object_reference "
+                "FROM maintenance_claim_expired_snapshots(100)"
+            )
+        ).all()
+        session.commit()
+        assert claimed == [
+            (
+                expired_id,
+                f"{tenant_id}/{run_id}/apollo/expired-snapshot",
+            )
+        ]
+        assert session.scalar(
+            text("SELECT maintenance_delete_claimed_snapshot(:id)"),
+            {"id": expired_id},
+        )
+        session.commit()
+        with pytest.raises(ProgrammingError):
+            session.scalars(select(ProviderSnapshot.id)).all()
+        session.rollback()
+    engine.dispose()
+
+    with Session(owner_engine) as session:
+        assert session.get(ProviderSnapshot, expired_id) is None
+        assert session.get(ProviderSnapshot, current_id) is not None
 
 
 def _patch_celery_entry_dependencies(

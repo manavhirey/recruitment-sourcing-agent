@@ -292,3 +292,40 @@ class ContactPoint(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
+
+
+class ContactRetentionTombstone(Base):
+    __tablename__ = "candidate_contact_retention_tombstones"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "candidate_id", "kind", "suppression_hmac"),
+        ForeignKeyConstraint(
+            ("tenant_id", "candidate_id"),
+            ("candidates.tenant_id", "candidates.id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "contact_point_id"),
+            ("candidate_contact_points.tenant_id", "candidate_contact_points.id"),
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "kind IN ('email', 'phone')", name="ck_contact_tombstones_kind"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    candidate_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    contact_point_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    suppression_hmac: Mapped[str] = mapped_column(String(64), nullable=False)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )

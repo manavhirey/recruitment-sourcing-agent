@@ -15,6 +15,8 @@ os.environ.update(
         ),
         "REDIS_URL": "redis://localhost:6379/15",
         "OBJECT_STORE_ENDPOINT": "http://localhost:9000",
+        "OBJECT_STORE_ADMIN_ACCESS_KEY_ID": "test-admin-key",
+        "OBJECT_STORE_ADMIN_SECRET_ACCESS_KEY": "test-admin-secret",
         "OIDC_ISSUER": "https://issuer.test/",
         "OIDC_AUDIENCE": "sourcing-api",
         "OPENAI_API_KEY": "test-openai-key",

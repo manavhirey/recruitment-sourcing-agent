@@ -1,12 +1,18 @@
+import asyncio
 import base64
 import hashlib
+import json
 import logging
+import threading
+import time
 from collections.abc import Generator
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi.testclient import TestClient
 from redis import Redis
 from redis.exceptions import RedisError
@@ -64,6 +70,23 @@ class AllowAllLimiter:
     def allow(self, source: str, now: float) -> bool:
         del source, now
         return True
+
+
+def _decrypt_snapshot(reference: str, body: bytes) -> dict[str, object]:
+    assert body[:4] == b"SNP1"
+    nonce = body[4:16]
+    key_nonce = body[16:28]
+    wrapped_length = int.from_bytes(body[28:30], "big")
+    wrapped_key = body[30 : 30 + wrapped_length]
+    ciphertext = body[30 + wrapped_length :]
+    aad = f"provider-snapshot-v1\0{reference}".encode()
+    data_key = AESGCM(b"s" * 32).decrypt(
+        key_nonce, wrapped_key, b"snapshot-data-key\0" + aad
+    )
+    decoded = AESGCM(data_key).decrypt(nonce, ciphertext, aad)
+    payload = json.loads(decoded)
+    assert isinstance(payload, dict)
+    return payload
 
 
 @pytest.fixture
@@ -287,6 +310,8 @@ def test_persisted_reveal_permissions_filter_denied_contacts_for_every_delivery_
         "people": [
             {
                 "id": "person-1",
+                "email": "work@example.test",
+                "email_status": "verified",
                 "personal_emails": ["private@example.test"],
                 "phone_numbers": [
                     {
@@ -315,7 +340,14 @@ def test_persisted_reveal_permissions_filter_denied_contacts_for_every_delivery_
         session.commit()
 
     with Session(scenario["engine"]) as session:
-        assert session.scalar(select(func.count()).select_from(ContactPoint)) == 0
+        assert session.scalar(select(func.count()).select_from(ContactPoint)) == 1
+    assert len(scenario["objects"].objects) == 1
+    (_bucket, reference), body = next(iter(scenario["objects"].objects.items()))
+    stored_payload = _decrypt_snapshot(reference, body)
+    serialized = json.dumps(stored_payload, sort_keys=True)
+    assert "private@example.test" not in serialized
+    assert "+1 212 555 0112" not in serialized
+    assert "work@example.test" in serialized
 
 
 def test_contact_and_capability_token_never_reach_logs(
@@ -422,6 +454,52 @@ def test_webhook_rejects_oversized_body_before_payload_processing(
     assert response.status_code == 413
     with Session(webhook_scenario["engine"]) as session:
         assert session.scalar(select(func.count()).select_from(WebhookDelivery)) == 0
+
+
+def test_blocked_sync_webhook_dependency_does_not_stall_event_loop(
+    webhook_scenario: dict[str, Any], apollo_phone_payload: dict[str, object]
+) -> None:
+    scenario = webhook_scenario
+    release = threading.Event()
+
+    class BlockingLimiter:
+        def allow(self, source: str, now: float) -> bool:
+            del source, now
+            release.wait(timeout=0.75)
+            return True
+
+    app = scenario["api"].app
+    app.state.webhook_rate_limiter = BlockingLimiter()
+    probe_path = f"/event-loop-probe-{uuid4()}"
+
+    @app.get(probe_path)
+    async def event_loop_probe() -> dict[str, str]:
+        return {"status": "responsive"}
+
+    async def exercise() -> tuple[float, int, int]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            started_at = time.monotonic()
+            webhook = asyncio.create_task(
+                client.post(
+                    f"/webhooks/apollo/{scenario['token']}",
+                    json=apollo_phone_payload,
+                )
+            )
+            await asyncio.sleep(0.05)
+            probe = await client.get(probe_path)
+            elapsed = time.monotonic() - started_at
+            release.set()
+            webhook_response = await webhook
+            return elapsed, probe.status_code, webhook_response.status_code
+
+    elapsed, probe_status, webhook_status = asyncio.run(exercise())
+
+    assert probe_status == 200
+    assert webhook_status == 202
+    assert elapsed < 0.3
 
 
 def test_duplicate_nonterminal_payload_can_terminalize_same_request(

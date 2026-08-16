@@ -1,5 +1,4 @@
 from celery import Celery  # type: ignore[import-untyped]
-from celery.schedules import crontab  # type: ignore[import-untyped]
 
 from app.core.config import get_settings
 
@@ -20,15 +19,6 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     worker_prefetch_multiplier=1,
-    beat_schedule={
-        "snapshot-reference-reconciliation": {
-            "task": "sourcing.reconcile_expired_snapshots",
-            "schedule": crontab(hour=2, minute=0),
-        },
-        "contact-point-expiration": {
-            "task": "sourcing.expire_contact_points",
-            "schedule": crontab(hour=2, minute=15),
-        },
-    },
+    beat_schedule={},
 )
 celery_app.autodiscover_tasks(("app.sourcing",), force=True)

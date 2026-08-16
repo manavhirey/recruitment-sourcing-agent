@@ -3,7 +3,7 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from app.providers.snapshots import SnapshotStore
+from app.providers.snapshots import SnapshotStore, configure_snapshot_lifecycle
 
 
 class FakeObjectStore:
@@ -84,7 +84,7 @@ def test_snapshot_path_components_are_validated_and_delete_is_idempotent() -> No
 def test_snapshot_lifecycle_uses_exactly_30_days() -> None:
     fake = FakeObjectStore()
 
-    _store(fake).ensure_lifecycle()
+    configure_snapshot_lifecycle(fake, "snapshots")
 
     assert fake.lifecycle == {
         "Bucket": "snapshots",
