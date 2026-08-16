@@ -1,4 +1,5 @@
 import base64
+import inspect
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -10,6 +11,7 @@ from app.audit.models import AuditEvent  # noqa: F401
 from app.candidates.contacts import (
     ContactCipher,
     ContactService,
+    expire_due_contacts,
     reveal_candidate_contact,
 )
 from app.candidates.models import (
@@ -81,6 +83,161 @@ def test_contact_service_stores_only_ciphertext_and_extends_retention_on_reveal(
         )
         assert revealed == "priya@example.com"
         assert point.expires_at == observed_at + timedelta(days=190)
+
+    engine.dispose()
+
+
+def test_contact_retention_does_not_extend_for_observation_but_does_for_verification() -> (
+    None
+):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    with Session(engine) as session:
+        tenant = Tenant(slug=f"retention-{uuid4()}")
+        session.add(tenant)
+        session.flush()
+        candidate = _candidate(session, tenant.id, "Priya Sharma")
+        service = ContactService(session, _cipher())
+        context = _context(tenant.id)
+        first = service.store(
+            context,
+            candidate.id,
+            ProviderContact(
+                kind="email",
+                value="priya@example.com",
+                verification_state="unverified",
+                observed_at=observed_at,
+            ),
+            processed_at=observed_at,
+        ).contact_point
+        original_expiry = first.expires_at
+
+        service.store(
+            context,
+            candidate.id,
+            ProviderContact(
+                kind="email",
+                value="priya@example.com",
+                verification_state="unverified",
+                observed_at=observed_at + timedelta(days=10),
+            ),
+            processed_at=observed_at + timedelta(days=10),
+        )
+        assert first.expires_at == original_expiry
+
+        service.store(
+            context,
+            candidate.id,
+            ProviderContact(
+                kind="email",
+                value="priya@example.com",
+                verification_state="verified",
+                observed_at=observed_at + timedelta(days=20),
+            ),
+            processed_at=observed_at + timedelta(days=20),
+        )
+        assert first.expires_at == observed_at + timedelta(days=200)
+
+    engine.dispose()
+
+
+def test_contact_reveal_is_allowed_before_but_not_at_or_after_utc_deadline() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    with Session(engine) as session:
+        tenant = Tenant(slug=f"deadline-{uuid4()}")
+        session.add(tenant)
+        session.flush()
+        candidate = _candidate(session, tenant.id, "Priya Sharma")
+        service = ContactService(session, _cipher())
+        context = _context(tenant.id)
+        point = service.store(
+            context,
+            candidate.id,
+            ProviderContact(
+                kind="email",
+                value="priya@example.com",
+                verification_state="verified",
+                observed_at=observed_at,
+            ),
+            processed_at=observed_at,
+        ).contact_point
+        deadline = point.expires_at
+
+        assert (
+            service.reveal(
+                context, point.id, used_at=deadline - timedelta(microseconds=1)
+            )
+            == "priya@example.com"
+        )
+        point.expires_at = deadline
+        with pytest.raises(LookupError, match="expired"):
+            service.reveal(context, point.id, used_at=deadline)
+        assert point.lookup_hmac is None
+        assert point.value_ciphertext is None
+        assert point.encrypted_data_key is None
+
+    engine.dispose()
+
+
+def test_expired_contact_cannot_be_revived_and_daily_reconciliation_erases_keys() -> (
+    None
+):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    with Session(engine) as session:
+        tenant = Tenant(slug=f"erase-{uuid4()}")
+        session.add(tenant)
+        session.flush()
+        candidate = _candidate(session, tenant.id, "Priya Sharma")
+        service = ContactService(session, _cipher())
+        context = _context(tenant.id)
+        point = service.store(
+            context,
+            candidate.id,
+            ProviderContact(
+                kind="email",
+                value="priya@example.com",
+                verification_state="verified",
+                observed_at=observed_at,
+            ),
+            processed_at=observed_at,
+        ).contact_point
+        deadline = point.expires_at
+
+        resolution = service.store(
+            context,
+            candidate.id,
+            ProviderContact(
+                kind="email",
+                value="priya@example.com",
+                verification_state="unverified",
+                observed_at=deadline,
+            ),
+            processed_at=deadline,
+        )
+        assert resolution.accepted is False
+        assert point.value_ciphertext is None
+        assert point.lookup_hmac is None
+
+        second = service.store(
+            context,
+            candidate.id,
+            ProviderContact(
+                kind="phone",
+                value="+1 212 555 0112",
+                verification_state="verified",
+                observed_at=observed_at,
+            ),
+            processed_at=observed_at,
+        ).contact_point
+        assert expire_due_contacts(session, now=second.expires_at) == 1
+        assert second.value_ciphertext is None
+        assert second.encrypted_data_key is None
+        assert second.lookup_hmac is None
 
     engine.dispose()
 
@@ -164,6 +321,48 @@ def test_verified_email_merge_reencrypts_source_contacts_for_target_aad() -> Non
         assert session.get(Candidate, source.id) is None
         assert phone is not None
         assert service.reveal(context, phone.id) == "+12125550112"
+
+    engine.dispose()
+
+
+def test_candidate_merge_delegates_sourcing_membership_reconciliation() -> None:
+    class RecordingCoordinator:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, object, object]] = []
+
+        def merge_candidate_memberships(
+            self, tenant_id: object, source_id: object, target_id: object
+        ) -> None:
+            self.calls.append((tenant_id, source_id, target_id))
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    coordinator = RecordingCoordinator()
+    with Session(engine) as session:
+        tenant = Tenant(slug=f"merge-boundary-{uuid4()}")
+        session.add(tenant)
+        session.flush()
+        target = _candidate(session, tenant.id, "Priya Sharma")
+        source = _candidate(session, tenant.id, "Priya Sharma")
+        service = ContactService(
+            session,
+            _cipher(),
+            merge_coordinator=coordinator,
+        )
+        context = _context(tenant.id)
+        contact = ProviderContact(
+            kind="email",
+            value="priya@example.com",
+            verification_state="verified",
+        )
+
+        service.store(context, target.id, contact)
+        service.store(context, source.id, contact)
+
+        assert coordinator.calls == [(tenant.id, source.id, target.id)]
+        merge_source = inspect.getsource(ContactService._merge_candidate)
+        assert "RunCandidate" not in merge_source
+        assert "app.sourcing" not in merge_source
 
     engine.dispose()
 

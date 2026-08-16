@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import logging
 from collections.abc import Generator
 from datetime import UTC, datetime
@@ -7,6 +8,8 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from redis import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -20,6 +23,7 @@ from app.identity.models import Tenant, User
 from app.jobs.models import Job, ScorecardVersion
 from app.main import create_app
 from app.providers.snapshots import SnapshotStore
+from app.sourcing import webhooks as webhooks_module
 from app.sourcing.models import (
     EnrichmentRequest,
     RunCandidate,
@@ -27,7 +31,12 @@ from app.sourcing.models import (
     WebhookDelivery,
 )
 from app.sourcing.state_machine import RunState
-from app.sourcing.webhooks import CapabilityTokenCodec, WebhookRateLimiter
+from app.sourcing.webhooks import (
+    CapabilityTokenCodec,
+    RedisWebhookRateLimiter,
+    apply_enrichment_payload,
+    resolve_webhook_source,
+)
 
 
 class MemoryObjectStore:
@@ -49,6 +58,12 @@ class MemoryObjectStore:
 
     def put_bucket_lifecycle_configuration(self, **kwargs: object) -> None:
         return None
+
+
+class AllowAllLimiter:
+    def allow(self, source: str, now: float) -> bool:
+        del source, now
+        return True
 
 
 @pytest.fixture
@@ -147,6 +162,7 @@ def webhook_scenario() -> Generator[dict[str, Any], None, None]:
             candidate_ids=[str(candidate.id)],
             status="pending",
             reservation_key="enrich:1",
+            reveal_phone_number=True,
         )
         session.add(request)
         session.flush()
@@ -181,6 +197,7 @@ def webhook_scenario() -> Generator[dict[str, Any], None, None]:
         sourcing_dispatcher=lambda *_: None,
         snapshot_store=snapshot_store,
         contact_cipher=contact_cipher,
+        webhook_rate_limiter=AllowAllLimiter(),
     )
     app.dependency_overrides[get_db] = database_override
     with TestClient(app) as api:
@@ -192,6 +209,8 @@ def webhook_scenario() -> Generator[dict[str, Any], None, None]:
             "request_id": request_id,
             "run_id": run_id,
             "objects": objects,
+            "snapshot_store": snapshot_store,
+            "contact_cipher": contact_cipher,
         }
     engine.dispose()
 
@@ -199,16 +218,17 @@ def webhook_scenario() -> Generator[dict[str, Any], None, None]:
 @pytest.fixture
 def apollo_phone_payload() -> dict[str, object]:
     return {
-        "request_id": 123,
+        "status": "success",
+        "credits_consumed": 8,
         "people": [
             {
                 "id": "person-1",
-                "name": "Priya Sharma",
+                "status": "success",
                 "phone_numbers": [
                     {
                         "raw_number": "+1 212 555 0112",
-                        "type": "mobile",
-                        "status": "verified",
+                        "type_cd": "mobile",
+                        "status_cd": "valid_number",
                     }
                 ],
             }
@@ -239,10 +259,12 @@ def test_duplicate_webhook_is_applied_once(
     )
 
 
-def test_webhook_rejects_request_id_mismatch_without_writing_contact(
+def test_webhook_rejects_provider_person_outside_bound_request(
     webhook_scenario: dict[str, Any], apollo_phone_payload: dict[str, object]
 ) -> None:
-    apollo_phone_payload["request_id"] = 999
+    people = apollo_phone_payload["people"]
+    assert isinstance(people, list) and isinstance(people[0], dict)
+    people[0]["id"] = "person-outside-request"
 
     response = webhook_scenario["api"].post(
         f"/webhooks/apollo/{webhook_scenario['token']}",
@@ -251,6 +273,48 @@ def test_webhook_rejects_request_id_mismatch_without_writing_contact(
 
     assert response.status_code == 400
     with Session(webhook_scenario["engine"]) as session:
+        assert session.scalar(select(func.count()).select_from(ContactPoint)) == 0
+
+
+@pytest.mark.parametrize("source", ["synchronous", "webhook", "poll"])
+def test_persisted_reveal_permissions_filter_denied_contacts_for_every_delivery_path(
+    webhook_scenario: dict[str, Any], source: str
+) -> None:
+    scenario = webhook_scenario
+    payload: dict[str, object] = {
+        "request_id": 123,
+        "credits_consumed": 1,
+        "people": [
+            {
+                "id": "person-1",
+                "personal_emails": ["private@example.test"],
+                "phone_numbers": [
+                    {
+                        "raw_number": "+1 212 555 0112",
+                        "type_cd": "mobile",
+                        "status_cd": "valid_number",
+                    }
+                ],
+            }
+        ],
+    }
+    with Session(scenario["engine"]) as session:
+        request = session.get(EnrichmentRequest, scenario["request_id"])
+        assert request is not None
+        request.reveal_personal_emails = False
+        request.reveal_phone_number = False
+        apply_enrichment_payload(
+            session,
+            request,
+            payload,
+            codec=CapabilityTokenCodec(b"test-webhook-key"),
+            snapshot_store=scenario["snapshot_store"],
+            contact_cipher=scenario["contact_cipher"],
+            source=source,
+        )
+        session.commit()
+
+    with Session(scenario["engine"]) as session:
         assert session.scalar(select(func.count()).select_from(ContactPoint)) == 0
 
 
@@ -271,10 +335,161 @@ def test_contact_and_capability_token_never_reach_logs(
     assert webhook_scenario["token"] not in serialized
 
 
-def test_webhook_rate_limit_is_scoped_by_source_and_window() -> None:
-    limiter = WebhookRateLimiter(limit=1, window_seconds=60)
+def test_webhook_rate_limit_is_shared_across_instances_without_local_lock_state() -> (
+    None
+):
+    class SharedRedis:
+        def __init__(self) -> None:
+            self.counts: dict[str, int] = {}
 
-    assert limiter.allow("192.0.2.10", now=100)
-    assert not limiter.allow("192.0.2.10", now=101)
-    assert limiter.allow("192.0.2.11", now=101)
-    assert limiter.allow("192.0.2.10", now=161)
+        def eval(self, script: str, key_count: int, key: str, ttl: int) -> int:
+            del script, key_count, ttl
+            self.counts[key] = self.counts.get(key, 0) + 1
+            return self.counts[key]
+
+    shared = SharedRedis()
+    first = RedisWebhookRateLimiter(shared, limit=1, window_seconds=60)
+    second = RedisWebhookRateLimiter(shared, limit=1, window_seconds=60)
+
+    assert first.allow("192.0.2.10", now=100)
+    assert not second.allow("192.0.2.10", now=101)
+    assert second.allow("192.0.2.11", now=101)
+    assert first.allow("192.0.2.10", now=161)
+    assert not hasattr(webhooks_module, "_REQUEST_LOCKS")
+
+
+def test_webhook_rate_limit_is_shared_by_real_redis_instances() -> None:
+    first_client = Redis.from_url(Settings.for_test().redis_url)
+    second_client = Redis.from_url(Settings.for_test().redis_url)
+    try:
+        first_client.ping()
+    except RedisError:
+        pytest.skip("Redis integration service is unavailable")
+    now = datetime.now(UTC).timestamp()
+    source = f"198.51.100.{uuid4().int % 255}"
+    bucket = int(now // 60)
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    key = f"webhook-rate:apollo:{bucket}:{digest}"
+    first_client.delete(key)
+    try:
+        first = RedisWebhookRateLimiter(first_client, limit=1)
+        second = RedisWebhookRateLimiter(second_client, limit=1)
+
+        assert first.allow(source, now)
+        assert not second.allow(source, now)
+    finally:
+        first_client.delete(key)
+        first_client.close()
+        second_client.close()
+
+
+def test_webhook_source_uses_forwarded_address_only_from_trusted_proxy() -> None:
+    assert (
+        resolve_webhook_source(
+            peer="10.0.0.5",
+            forwarded_for="192.0.2.10, 10.0.0.5",
+            trusted_proxies=frozenset({"10.0.0.5"}),
+        )
+        == "192.0.2.10"
+    )
+    assert (
+        resolve_webhook_source(
+            peer="198.51.100.9",
+            forwarded_for="192.0.2.10",
+            trusted_proxies=frozenset({"10.0.0.5"}),
+        )
+        == "198.51.100.9"
+    )
+    assert (
+        resolve_webhook_source(
+            peer="10.0.0.5",
+            forwarded_for="203.0.113.66, 192.0.2.10",
+            trusted_proxies=frozenset({"10.0.0.5"}),
+        )
+        == "192.0.2.10"
+    )
+
+
+def test_webhook_rejects_oversized_body_before_payload_processing(
+    webhook_scenario: dict[str, Any],
+) -> None:
+    response = webhook_scenario["api"].post(
+        f"/webhooks/apollo/{webhook_scenario['token']}",
+        content=b"x" * (262_144 + 1),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    with Session(webhook_scenario["engine"]) as session:
+        assert session.scalar(select(func.count()).select_from(WebhookDelivery)) == 0
+
+
+def test_duplicate_nonterminal_payload_can_terminalize_same_request(
+    webhook_scenario: dict[str, Any], apollo_phone_payload: dict[str, object]
+) -> None:
+    scenario = webhook_scenario
+    codec = CapabilityTokenCodec(b"test-webhook-key")
+    with Session(scenario["engine"]) as session:
+        request = session.get(EnrichmentRequest, scenario["request_id"])
+        assert request is not None
+        apply_enrichment_payload(
+            session,
+            request,
+            apollo_phone_payload,
+            codec=codec,
+            snapshot_store=scenario["snapshot_store"],
+            contact_cipher=scenario["contact_cipher"],
+            source="synchronous",
+            terminal=False,
+        )
+        session.commit()
+        assert request.status == "pending"
+
+        apply_enrichment_payload(
+            session,
+            request,
+            apollo_phone_payload,
+            codec=codec,
+            snapshot_store=scenario["snapshot_store"],
+            contact_cipher=scenario["contact_cipher"],
+            source="poll",
+            terminal=True,
+        )
+        session.commit()
+
+    with Session(scenario["engine"]) as session:
+        request = session.get(EnrichmentRequest, scenario["request_id"])
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert request is not None and request.status == "completed"
+        assert run is not None and run.state is RunState.READY
+        assert session.scalar(select(func.count()).select_from(ContactPoint)) == 1
+        assert session.scalar(select(func.count()).select_from(WebhookDelivery)) == 1
+
+
+@pytest.mark.parametrize("request_status", ["failed", "cancelled"])
+def test_failed_or_cancelled_request_is_fenced_before_any_payload_write(
+    webhook_scenario: dict[str, Any],
+    apollo_phone_payload: dict[str, object],
+    request_status: str,
+) -> None:
+    scenario = webhook_scenario
+    with Session(scenario["engine"]) as session:
+        request = session.get(EnrichmentRequest, scenario["request_id"])
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert request is not None and run is not None
+        request.status = request_status
+        if request_status == "cancelled":
+            run.state = RunState.CANCELLED
+            run.cancellation_requested = True
+        session.commit()
+
+    response = scenario["api"].post(
+        f"/webhooks/apollo/{scenario['token']}",
+        json=apollo_phone_payload,
+    )
+
+    assert response.status_code == 202
+    with Session(scenario["engine"]) as session:
+        assert session.scalar(select(func.count()).select_from(ContactPoint)) == 0
+        assert session.scalar(select(func.count()).select_from(WebhookDelivery)) == 0
+    assert scenario["objects"].objects == {}

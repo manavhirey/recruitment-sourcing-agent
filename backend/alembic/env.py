@@ -6,14 +6,14 @@ from alembic import context
 from app.audit import models as audit_models  # noqa: F401
 from app.candidates import models as candidate_models  # noqa: F401
 from app.clients import models as client_models  # noqa: F401
-from app.core.config import get_settings
+from app.core.config import get_migration_settings
 from app.core.database import Base
 from app.identity import models  # noqa: F401
 from app.jobs import models as job_models  # noqa: F401
 from app.sourcing import models as sourcing_models  # noqa: F401
 
 config = context.config
-settings = get_settings()
+settings = get_migration_settings()
 config.set_main_option("sqlalchemy.url", settings.migration_database_url)
 
 if config.config_file_name is not None:

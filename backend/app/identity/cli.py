@@ -3,7 +3,7 @@ import argparse
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app.core.config import Settings, get_settings
+from app.core.config import MigrationSettings, get_migration_settings
 from app.identity.schemas import IdentityClaims
 from app.identity.service import TenantService
 
@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def provision_tenant(
-    settings: Settings,
+    settings: MigrationSettings,
     *,
     slug: str,
     owner_claims: IdentityClaims,
@@ -36,7 +36,7 @@ def provision_tenant(
 def main() -> None:
     arguments = build_parser().parse_args()
     tenant_id = provision_tenant(
-        get_settings(),
+        get_migration_settings(),
         slug=arguments.slug,
         owner_claims=IdentityClaims(
             subject=arguments.subject,

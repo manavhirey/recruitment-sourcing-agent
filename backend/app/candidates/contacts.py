@@ -7,6 +7,7 @@ import re
 import secrets
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 from uuid import UUID
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -118,21 +119,41 @@ class ContactResolution:
     contact_point: ContactPoint
     merged_candidate_id: UUID | None = None
     duplicate_suggestion_id: UUID | None = None
+    accepted: bool = True
+
+
+class CandidateMergeCoordinator(Protocol):
+    def merge_candidate_memberships(
+        self,
+        tenant_id: UUID,
+        source_candidate_id: UUID,
+        target_candidate_id: UUID,
+    ) -> None: ...
 
 
 class ContactService:
-    def __init__(self, session: Session, cipher: ContactCipher) -> None:
+    def __init__(
+        self,
+        session: Session,
+        cipher: ContactCipher,
+        *,
+        merge_coordinator: CandidateMergeCoordinator | None = None,
+    ) -> None:
         self.session = session
         self.cipher = cipher
+        self.merge_coordinator = merge_coordinator
 
     def store(
         self,
         context: RequestContext,
         candidate_id: UUID,
         contact: ProviderContact,
+        *,
+        processed_at: datetime | None = None,
     ) -> ContactResolution:
         candidate = self._candidate(context.tenant_id, candidate_id)
         observed_at = _utc(contact.observed_at or datetime.now(UTC))
+        processing_time = _utc(processed_at or datetime.now(UTC))
         contact_context = ContactContext(context.tenant_id, candidate.id, contact.kind)
         lookup_hmac = self.cipher.lookup_hmac(contact.value, contact_context)
         duplicate_suggestion_id: UUID | None = None
@@ -178,6 +199,16 @@ class ContactService:
         last_verified_at = (
             observed_at if contact.verification_state == "verified" else None
         )
+        if point is not None and processing_time >= _utc(point.expires_at):
+            _erase_contact(point, processing_time)
+            self.session.flush()
+            return ContactResolution(
+                candidate_id=candidate.id,
+                contact_point=point,
+                merged_candidate_id=merged_candidate_id,
+                duplicate_suggestion_id=duplicate_suggestion_id,
+                accepted=False,
+            )
         if point is None:
             point = ContactPoint(
                 tenant_id=context.tenant_id,
@@ -209,20 +240,19 @@ class ContactService:
             point.key_nonce = encrypted.key_nonce
             point.schema_version = encrypted.schema_version
             point.observed_at = observed_at
-            if last_verified_at is not None:
+            if last_verified_at is not None and (
+                point.last_verified_at is None
+                or last_verified_at > _utc(point.last_verified_at)
+            ):
                 point.last_verified_at = last_verified_at
-            point.expires_at = (
-                max(
-                    value
-                    for value in (
-                        point.observed_at,
-                        point.last_verified_at,
-                        point.last_used_at,
+                point.expires_at = (
+                    max(
+                        value
+                        for value in (point.last_verified_at, point.last_used_at)
+                        if value is not None
                     )
-                    if value is not None
+                    + _CONTACT_RETENTION
                 )
-                + _CONTACT_RETENTION
-            )
         self.session.flush()
         return ContactResolution(
             candidate_id=candidate.id,
@@ -248,6 +278,11 @@ class ContactService:
         )
         if point is None:
             raise LookupError("contact point not found")
+        use_time = _utc(used_at or datetime.now(UTC))
+        if use_time >= _utc(point.expires_at):
+            _erase_contact(point, use_time)
+            self.session.flush()
+            raise LookupError("contact point is expired")
         if any(
             value is None
             for value in (
@@ -255,9 +290,11 @@ class ContactService:
                 point.value_nonce,
                 point.encrypted_data_key,
                 point.key_nonce,
+                point.lookup_hmac,
             )
         ):
             raise LookupError("contact point is expired")
+        assert point.lookup_hmac is not None
         encrypted = EncryptedContact(
             ciphertext=point.value_ciphertext,  # type: ignore[arg-type]
             nonce=point.value_nonce,  # type: ignore[arg-type]
@@ -270,7 +307,7 @@ class ContactService:
             encrypted,
             ContactContext(context.tenant_id, point.candidate_id, point.kind),
         )
-        point.last_used_at = _utc(used_at or datetime.now(UTC))
+        point.last_used_at = use_time
         point.expires_at = point.last_used_at + _CONTACT_RETENTION
         self.session.flush()
         return value
@@ -330,9 +367,13 @@ class ContactService:
         return suggestion
 
     def _merge_candidate(self, source: Candidate, target: Candidate) -> Candidate:
-        from app.sourcing.models import RunCandidate
-
         self._move_contacts(source, target)
+        if self.merge_coordinator is not None:
+            self.merge_coordinator.merge_candidate_memberships(
+                source.tenant_id,
+                source.id,
+                target.id,
+            )
         identities = self.session.scalars(
             select(SourceIdentity).where(
                 SourceIdentity.tenant_id == source.tenant_id,
@@ -357,24 +398,6 @@ class ContactService:
             )
             .values(candidate_id=target.id)
         )
-        run_rows = self.session.scalars(
-            select(RunCandidate).where(
-                RunCandidate.tenant_id == source.tenant_id,
-                RunCandidate.candidate_id == source.id,
-            )
-        ).all()
-        for row in run_rows:
-            collision = self.session.scalar(
-                select(RunCandidate.id).where(
-                    RunCandidate.tenant_id == source.tenant_id,
-                    RunCandidate.run_id == row.run_id,
-                    RunCandidate.candidate_id == target.id,
-                )
-            )
-            if collision is None:
-                row.candidate_id = target.id
-            else:
-                self.session.delete(row)
         self.session.execute(
             delete(DuplicateSuggestion).where(
                 DuplicateSuggestion.tenant_id == source.tenant_id,
@@ -402,6 +425,7 @@ class ContactService:
                     ContactPoint.candidate_id == target.id,
                     ContactPoint.kind == point.kind,
                     ContactPoint.lookup_hmac == point.lookup_hmac,
+                    ContactPoint.lookup_hmac.is_not(None),
                 )
             )
             if collision is not None:
@@ -414,8 +438,10 @@ class ContactService:
                     point.value_nonce,
                     point.encrypted_data_key,
                     point.key_nonce,
+                    point.lookup_hmac,
                 )
             ):
+                assert point.lookup_hmac is not None
                 plaintext = self.cipher.decrypt(
                     EncryptedContact(
                         ciphertext=point.value_ciphertext,  # type: ignore[arg-type]
@@ -438,6 +464,37 @@ class ContactService:
                 point.lookup_hmac = encrypted.lookup_hmac
                 point.schema_version = encrypted.schema_version
             point.candidate_id = target.id
+
+
+def expire_due_contacts(
+    session: Session,
+    *,
+    now: datetime | None = None,
+) -> int:
+    timestamp = _utc(now or datetime.now(UTC))
+    points = session.scalars(
+        select(ContactPoint)
+        .where(
+            ContactPoint.expires_at <= timestamp,
+            ContactPoint.expired_at.is_(None),
+        )
+        .order_by(ContactPoint.expires_at, ContactPoint.id)
+        .with_for_update()
+    ).all()
+    for point in points:
+        _erase_contact(point, timestamp)
+    session.flush()
+    return len(points)
+
+
+def _erase_contact(point: ContactPoint, timestamp: datetime) -> None:
+    point.value_ciphertext = None
+    point.value_nonce = None
+    point.encrypted_data_key = None
+    point.key_nonce = None
+    point.lookup_hmac = None
+    point.verification_state = "expired"
+    point.expired_at = timestamp
 
 
 def _associated_data(context: ContactContext, schema_version: int) -> bytes:

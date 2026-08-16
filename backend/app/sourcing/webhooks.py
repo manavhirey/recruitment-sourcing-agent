@@ -1,11 +1,10 @@
 import hashlib
 import hmac
+import ipaddress
 import json
 import secrets
-import threading
-from collections import defaultdict, deque
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any, Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -20,19 +19,20 @@ from app.core.database import get_db
 from app.identity.dependencies import get_app_settings
 from app.identity.schemas import RequestContext, Role
 from app.providers.apollo import normalize_enrichment_payload
-from app.providers.base import ProviderPayloadError
+from app.providers.base import EnrichmentResult, ProviderPayloadError
 from app.providers.snapshots import SnapshotStore
 from app.sourcing.models import (
     EnrichmentRequest,
     ProviderSnapshot,
     RunCandidate,
     SourcingRun,
+    UsageLedger,
     WebhookDelivery,
 )
+from app.sourcing.service import SourcingService
 from app.sourcing.state_machine import RunState, transition_run
 
 router = APIRouter(tags=["provider-webhooks"])
-_REQUEST_LOCKS: defaultdict[UUID, threading.Lock] = defaultdict(threading.Lock)
 
 
 class WebhookError(ValueError):
@@ -94,23 +94,69 @@ class CapabilityTokenCodec:
         return hmac.digest(tenant_key, canonical, hashlib.sha256).hex()
 
 
-class WebhookRateLimiter:
-    def __init__(self, limit: int = 120, window_seconds: int = 60) -> None:
+class RedisCounter(Protocol):
+    def eval(self, script: str, key_count: int, *keys_and_args: Any) -> Any: ...
+
+
+class WebhookRateLimiter(Protocol):
+    def allow(self, source: str, now: float) -> bool: ...
+
+
+class RedisWebhookRateLimiter:
+    _SCRIPT = """
+    local count = redis.call('INCR', KEYS[1])
+    if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+    return count
+    """
+
+    def __init__(
+        self,
+        client: RedisCounter,
+        limit: int = 120,
+        window_seconds: int = 60,
+    ) -> None:
+        self.client = client
         self.limit = limit
         self.window_seconds = window_seconds
-        self._events: defaultdict[str, deque[float]] = defaultdict(deque)
-        self._lock = threading.Lock()
 
     def allow(self, source: str, now: float) -> bool:
-        with self._lock:
-            events = self._events[source]
-            cutoff = now - self.window_seconds
-            while events and events[0] <= cutoff:
-                events.popleft()
-            if len(events) >= self.limit:
-                return False
-            events.append(now)
-            return True
+        bucket = int(now // self.window_seconds)
+        source_digest = hashlib.sha256(source.encode()).hexdigest()
+        key = f"webhook-rate:apollo:{bucket}:{source_digest}"
+        count = int(
+            self.client.eval(
+                self._SCRIPT,
+                1,
+                key,
+                self.window_seconds * 2,
+            )
+        )
+        return count <= self.limit
+
+
+def resolve_webhook_source(
+    *,
+    peer: str,
+    forwarded_for: str | None,
+    trusted_proxies: frozenset[str],
+) -> str:
+    try:
+        normalized_peer = str(ipaddress.ip_address(peer))
+    except ValueError:
+        return "unknown"
+    if normalized_peer not in trusted_proxies or not forwarded_for:
+        return normalized_peer
+    chain: list[str] = []
+    for value in forwarded_for.split(","):
+        try:
+            chain.append(str(ipaddress.ip_address(value.strip())))
+        except ValueError:
+            return normalized_peer
+    chain.append(normalized_peer)
+    index = len(chain) - 1
+    while index > 0 and chain[index] in trusted_proxies:
+        index -= 1
+    return chain[index]
 
 
 def _snapshot_store(request: Request) -> SnapshotStore:
@@ -148,19 +194,61 @@ def _limiter(request: Request) -> WebhookRateLimiter:
     "/webhooks/apollo/{capability_token}",
     status_code=status.HTTP_202_ACCEPTED,
 )
-def apollo_webhook(
+async def apollo_webhook(
     capability_token: str,
-    payload: dict[str, object],
     request: Request,
     session: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> dict[str, str]:
-    source = request.client.host if request.client else "unknown"
+    peer = request.client.host if request.client else "unknown"
+    trusted = frozenset(
+        value.strip()
+        for value in settings.webhook_trusted_proxy_ips.split(",")
+        if value.strip()
+    )
+    source = resolve_webhook_source(
+        peer=peer,
+        forwarded_for=request.headers.get("x-forwarded-for"),
+        trusted_proxies=trusted,
+    )
     limiter = _limiter(request)
     if not limiter.allow(source, datetime.now(UTC).timestamp()):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={"code": "webhook_rate_limited"},
+        )
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = settings.webhook_max_body_bytes + 1
+        if declared_length > settings.webhook_max_body_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail={"code": "webhook_payload_too_large"},
+            )
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > settings.webhook_max_body_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail={"code": "webhook_payload_too_large"},
+            )
+        chunks.append(chunk)
+    try:
+        payload = json.loads(b"".join(chunks))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "webhook_payload_invalid"},
+        ) from None
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "webhook_payload_invalid"},
         )
     codec = CapabilityTokenCodec(settings.webhook_hmac_key.get_secret_value().encode())
     try:
@@ -194,33 +282,30 @@ def apply_capability_payload(
 ) -> None:
     tenant_id = codec.tenant_id(token)
     request_id = codec.request_id(token)
-    with _REQUEST_LOCKS[request_id]:
-        if session.bind is not None and session.bind.dialect.name == "postgresql":
-            session.execute(
-                select(func.set_config("app.tenant_id", str(tenant_id), True))
-            )
-        enrichment = session.scalar(
-            select(EnrichmentRequest)
-            .where(
-                EnrichmentRequest.id == request_id,
-                EnrichmentRequest.tenant_id == tenant_id,
-            )
-            .with_for_update()
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        session.execute(select(func.set_config("app.tenant_id", str(tenant_id), True)))
+    enrichment = session.scalar(
+        select(EnrichmentRequest)
+        .where(
+            EnrichmentRequest.id == request_id,
+            EnrichmentRequest.tenant_id == tenant_id,
         )
-        if enrichment is None or enrichment.capability_token_hmac is None:
-            raise WebhookError("webhook_not_found", status.HTTP_404_NOT_FOUND)
-        supplied = codec.digest(token, enrichment.tenant_id)
-        if not hmac.compare_digest(supplied, enrichment.capability_token_hmac):
-            raise WebhookError("webhook_not_found", status.HTTP_404_NOT_FOUND)
-        apply_enrichment_payload(
-            session,
-            enrichment,
-            payload,
-            codec=codec,
-            snapshot_store=snapshot_store,
-            contact_cipher=contact_cipher,
-            source=source,
-        )
+        .with_for_update()
+    )
+    if enrichment is None or enrichment.capability_token_hmac is None:
+        raise WebhookError("webhook_not_found", status.HTTP_404_NOT_FOUND)
+    supplied = codec.digest(token, enrichment.tenant_id)
+    if not hmac.compare_digest(supplied, enrichment.capability_token_hmac):
+        raise WebhookError("webhook_not_found", status.HTTP_404_NOT_FOUND)
+    apply_enrichment_payload(
+        session,
+        enrichment,
+        payload,
+        codec=codec,
+        snapshot_store=snapshot_store,
+        contact_cipher=contact_cipher,
+        source=source,
+    )
 
 
 def apply_enrichment_payload(
@@ -234,6 +319,21 @@ def apply_enrichment_payload(
     source: str,
     terminal: bool = True,
 ) -> None:
+    run = session.scalar(
+        select(SourcingRun)
+        .where(
+            SourcingRun.tenant_id == enrichment.tenant_id,
+            SourcingRun.id == enrichment.run_id,
+        )
+        .with_for_update()
+    )
+    if (
+        enrichment.status in ("completed", "failed", "cancelled")
+        or run is None
+        or run.state is RunState.CANCELLED
+        or run.cancellation_requested
+    ):
+        return
     if enrichment.provider_request_id is None:
         raise WebhookError("webhook_request_not_ready", 409)
     try:
@@ -242,15 +342,33 @@ def apply_enrichment_payload(
         )
     except (ProviderPayloadError, ValueError) as error:
         raise WebhookError("webhook_payload_invalid") from error
+    allowed_candidates = {UUID(value) for value in enrichment.candidate_ids}
+    identities = session.scalars(
+        select(SourceIdentity).where(
+            SourceIdentity.tenant_id == enrichment.tenant_id,
+            SourceIdentity.provider == enrichment.provider,
+            SourceIdentity.candidate_id.in_(allowed_candidates),
+        )
+    ).all()
+    identity_by_provider_id = {
+        identity.provider_person_id: identity for identity in identities
+    }
+    if any(
+        person.provider_person_id not in identity_by_provider_id
+        for person in result.people
+    ):
+        raise WebhookError("webhook_payload_invalid")
     payload_hmac = codec.payload_digest(payload, enrichment.tenant_id)
     existing = session.scalar(
-        select(WebhookDelivery.id).where(
+        select(WebhookDelivery).where(
             WebhookDelivery.tenant_id == enrichment.tenant_id,
             WebhookDelivery.enrichment_request_id == enrichment.id,
             WebhookDelivery.payload_hmac == payload_hmac,
         )
     )
-    if existing is not None or enrichment.status == "completed":
+    if existing is not None:
+        if terminal:
+            _terminalize_existing_delivery(session, enrichment, result, existing.source)
         return
     delivery = WebhookDelivery(
         tenant_id=enrichment.tenant_id,
@@ -291,8 +409,11 @@ def apply_enrichment_payload(
         reference.created_at = snapshot.created_at
         reference.expires_at = snapshot.expires_at
 
-    allowed_candidates = {UUID(value) for value in enrichment.candidate_ids}
-    contacts = ContactService(session, contact_cipher)
+    contacts = ContactService(
+        session,
+        contact_cipher,
+        merge_coordinator=SourcingService(session, b"internal-enrichment"),
+    )
     found_candidates: set[UUID] = set()
     context = RequestContext(
         tenant_id=enrichment.tenant_id,
@@ -300,19 +421,19 @@ def apply_enrichment_payload(
         role=Role.OWNER,
     )
     for person in result.people:
-        identity = session.scalar(
-            select(SourceIdentity).where(
-                SourceIdentity.tenant_id == enrichment.tenant_id,
-                SourceIdentity.provider == enrichment.provider,
-                SourceIdentity.provider_person_id == person.provider_person_id,
-            )
-        )
-        if identity is None or identity.candidate_id not in allowed_candidates:
-            continue
-        if person.contacts:
-            found_candidates.add(identity.candidate_id)
+        identity = identity_by_provider_id[person.provider_person_id]
         for contact in person.contacts:
-            contacts.store(context, identity.candidate_id, contact)
+            if contact.kind == "phone" and not enrichment.reveal_phone_number:
+                continue
+            if (
+                contact.kind == "email"
+                and contact.classification == "personal"
+                and not enrichment.reveal_personal_emails
+            ):
+                continue
+            resolution = contacts.store(context, identity.candidate_id, contact)
+            if resolution.accepted:
+                found_candidates.add(resolution.candidate_id)
 
     now = datetime.now(UTC)
     for row in session.scalars(
@@ -332,6 +453,7 @@ def apply_enrichment_payload(
     enrichment.status = "completed" if terminal else "pending"
     enrichment.completed_at = now if terminal else None
     if terminal:
+        _reconcile_terminal_usage(session, enrichment, context, result, source)
         _finalize_run(session, enrichment)
     AuditService(session).record(
         tenant_id=enrichment.tenant_id,
@@ -344,6 +466,89 @@ def apply_enrichment_payload(
         payload={"source": source, "candidate_count": len(found_candidates)},
     )
     session.flush()
+
+
+def _terminalize_existing_delivery(
+    session: Session,
+    enrichment: EnrichmentRequest,
+    result: EnrichmentResult,
+    source: str,
+) -> None:
+    context = RequestContext(
+        tenant_id=enrichment.tenant_id,
+        user_id=_run_actor(session, enrichment),
+        role=Role.OWNER,
+    )
+    now = datetime.now(UTC)
+    for row in session.scalars(
+        select(RunCandidate).where(
+            RunCandidate.tenant_id == enrichment.tenant_id,
+            RunCandidate.run_id == enrichment.run_id,
+            RunCandidate.candidate_id.in_(
+                [UUID(value) for value in enrichment.candidate_ids]
+            ),
+        )
+    ):
+        if row.enrichment_status != "available":
+            row.enrichment_status = "unavailable"
+            row.enriched_at = now
+    enrichment.status = "completed"
+    enrichment.completed_at = now
+    _reconcile_terminal_usage(session, enrichment, context, result, source)
+    _finalize_run(session, enrichment)
+    session.flush()
+
+
+def _reconcile_terminal_usage(
+    session: Session,
+    enrichment: EnrichmentRequest,
+    context: RequestContext,
+    result: EnrichmentResult,
+    source: str,
+) -> None:
+    if enrichment.usage_reconciled_at is not None:
+        return
+    ledgers = list(
+        session.scalars(
+            select(UsageLedger)
+            .where(
+                UsageLedger.tenant_id == enrichment.tenant_id,
+                UsageLedger.run_id == enrichment.run_id,
+                UsageLedger.reservation_key == enrichment.reservation_key,
+            )
+            .with_for_update()
+        )
+    )
+    if not ledgers:
+        enrichment.usage_reconciled_at = datetime.now(UTC)
+        return
+    requested = {row.unit_type: row.requested_units for row in ledgers}
+    reported_credits = result.charged_credits
+    if source == "synchronous":
+        credits = (
+            reported_credits
+            if reported_credits is not None
+            else enrichment.synchronous_credits
+        )
+    else:
+        remaining = max(
+            0,
+            requested["estimated_credits"] - enrichment.synchronous_credits,
+        )
+        credits = enrichment.synchronous_credits + (
+            reported_credits if reported_credits is not None else remaining
+        )
+    SourcingService(session, b"internal-enrichment").reconcile_usage(
+        context,
+        enrichment.run_id,
+        reservation_key=enrichment.reservation_key,
+        charged_units={
+            "enrichments": requested["enrichments"],
+            "estimated_credits": credits,
+        },
+        provider_request_id=enrichment.provider_request_id,
+    )
+    enrichment.usage_reconciled_at = datetime.now(UTC)
 
 
 def _run_actor(session: Session, enrichment: EnrichmentRequest) -> UUID:

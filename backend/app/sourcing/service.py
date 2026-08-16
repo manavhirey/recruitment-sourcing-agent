@@ -277,6 +277,31 @@ class SourcingService:
         self._complete(record, {"enrichment_request_id": str(request.id)})
         return request, True
 
+    def merge_candidate_memberships(
+        self,
+        tenant_id: UUID,
+        source_candidate_id: UUID,
+        target_candidate_id: UUID,
+    ) -> None:
+        run_rows = self.session.scalars(
+            select(RunCandidate).where(
+                RunCandidate.tenant_id == tenant_id,
+                RunCandidate.candidate_id == source_candidate_id,
+            )
+        ).all()
+        for row in run_rows:
+            collision = self.session.scalar(
+                select(RunCandidate.id).where(
+                    RunCandidate.tenant_id == tenant_id,
+                    RunCandidate.run_id == row.run_id,
+                    RunCandidate.candidate_id == target_candidate_id,
+                )
+            )
+            if collision is None:
+                row.candidate_id = target_candidate_id
+            else:
+                self.session.delete(row)
+
     def list_notifications(self, context: RequestContext) -> list[TenantNotification]:
         return list(
             self.session.scalars(

@@ -1,9 +1,12 @@
 import subprocess
 import sys
+from inspect import getsource
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import create_engine as sqlalchemy_create_engine
 from sqlalchemy.exc import OperationalError
 
 from app.providers.base import (
@@ -14,8 +17,10 @@ from app.providers.base import (
 from app.sourcing import tasks
 from app.sourcing.tasks import (
     _provider_retry_countdown,
+    configure_snapshot_lifecycle,
     enrich_request,
     enrich_run,
+    expire_contact_points,
     match_run,
     plan_run,
     poll_enrichment_result,
@@ -36,7 +41,9 @@ def test_clean_worker_process_registers_sourcing_tasks() -> None:
                 "required={'sourcing.plan_run','sourcing.source_run',"
                 "'sourcing.match_run','sourcing.enrich_run','sourcing.enrich_request',"
                 "'sourcing.poll_enrichment_result',"
-                "'sourcing.reconcile_expired_snapshots'}; "
+                "'sourcing.reconcile_expired_snapshots',"
+                "'sourcing.expire_contact_points',"
+                "'sourcing.configure_snapshot_lifecycle'}; "
                 "missing=required-set(celery_app.tasks); "
                 "assert not missing, sorted(missing)"
             ),
@@ -81,6 +88,64 @@ def test_snapshot_reconciliation_is_scheduled_daily() -> None:
 
     assert entry["task"] == reconcile_expired_snapshots.name
     assert str(entry["schedule"]) == "<crontab: 0 2 * * * (m/h/dM/MY/d)>"
+
+    contact_entry = celery_app.conf.beat_schedule["contact-point-expiration"]
+    assert contact_entry["task"] == expire_contact_points.name
+    assert str(contact_entry["schedule"]) == "<crontab: 15 2 * * * (m/h/dM/MY/d)>"
+
+
+def test_maintenance_tasks_use_only_narrow_maintenance_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[str] = []
+
+    def engine_for(url: str, **kwargs: object):
+        del kwargs
+        opened.append(url)
+        return sqlalchemy_create_engine("sqlite+pysqlite:///:memory:")
+
+    settings = SimpleNamespace(
+        maintenance_database_url="postgresql://maintenance-only",
+        database_url="postgresql://api-role",
+        migration_database_url="postgresql://schema-owner",
+    )
+    monkeypatch.setattr(tasks, "get_settings", lambda: settings)
+    monkeypatch.setattr(tasks, "create_engine", engine_for)
+    monkeypatch.setattr(
+        tasks,
+        "_enrichment_dependencies",
+        lambda value: (object(), object(), object(), object()),
+    )
+    monkeypatch.setattr(tasks, "reconcile_snapshot_references", lambda *args: 0)
+    monkeypatch.setattr(tasks, "expire_due_contacts", lambda *args: 0)
+
+    reconcile_expired_snapshots.run()
+    expire_contact_points.run()
+
+    assert opened == [settings.maintenance_database_url] * 2
+    source = getsource(tasks.reconcile_expired_snapshots) + getsource(
+        tasks.expire_contact_points
+    )
+    assert "settings.migration_database_url" not in source
+    assert "settings.database_url" not in source
+
+
+def test_bucket_lifecycle_admin_is_explicit_not_a_provider_worker_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    snapshots = SimpleNamespace(ensure_lifecycle=lambda: calls.append("configured"))
+    monkeypatch.setattr(tasks, "get_settings", lambda: object())
+    monkeypatch.setattr(
+        tasks,
+        "_enrichment_dependencies",
+        lambda value: (object(), snapshots, object(), object()),
+    )
+
+    configure_snapshot_lifecycle.run()
+
+    assert calls == ["configured"]
+    assert "ensure_lifecycle" not in getsource(tasks._enrichment_dependencies)
 
 
 def test_provider_retry_uses_reset_time_or_exponential_jitter() -> None:

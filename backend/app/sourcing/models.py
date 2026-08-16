@@ -203,6 +203,10 @@ class EnrichmentRequest(Base):
             "'cancelled')",
             name="ck_enrichment_requests_status",
         ),
+        CheckConstraint(
+            "synchronous_credits >= 0",
+            name="ck_enrichment_requests_synchronous_credits",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -225,6 +229,10 @@ class EnrichmentRequest(Base):
     stage_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     poll_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    synchronous_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    usage_reconciled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     error_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False

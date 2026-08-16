@@ -271,7 +271,7 @@ class ContactPoint(Base):
     verification_state: Mapped[str] = mapped_column(String(16), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
-    lookup_hmac: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    lookup_hmac: Mapped[str | None] = mapped_column(String(64), index=True)
     value_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary)
     value_nonce: Mapped[bytes | None] = mapped_column(LargeBinary)
     encrypted_data_key: Mapped[bytes | None] = mapped_column(LargeBinary)

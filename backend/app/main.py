@@ -3,6 +3,7 @@ from uuid import UUID
 
 from fastapi import FastAPI
 from openai import OpenAI
+from redis import Redis
 
 from app.clients.router import router as clients_router
 from app.core.config import Settings, get_settings
@@ -13,6 +14,7 @@ from app.jobs.llm import OpenAIResponsesScorecardGateway, ScorecardGateway
 from app.jobs.router import router as jobs_router
 from app.sourcing.router import router as sourcing_router
 from app.sourcing.webhooks import (
+    RedisWebhookRateLimiter,
     WebhookRateLimiter,
 )
 from app.sourcing.webhooks import (
@@ -49,6 +51,7 @@ def create_app(
     enrichment_dispatcher: EnrichmentDispatcher | None = None,
     snapshot_store: "SnapshotStore | None" = None,
     contact_cipher: "ContactCipher | None" = None,
+    webhook_rate_limiter: WebhookRateLimiter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Recruitment Sourcing API", version="1.0.0")
     app.state.settings = settings or get_settings()
@@ -63,7 +66,9 @@ def create_app(
     )
     app.state.snapshot_store = snapshot_store
     app.state.contact_cipher = contact_cipher
-    app.state.webhook_rate_limiter = WebhookRateLimiter()
+    app.state.webhook_rate_limiter = webhook_rate_limiter or RedisWebhookRateLimiter(
+        Redis.from_url(app.state.settings.redis_url)
+    )
     install_sensitive_data_log_filters()
     app.include_router(identity_router)
     app.include_router(clients_router)

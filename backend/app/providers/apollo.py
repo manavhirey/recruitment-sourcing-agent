@@ -1,6 +1,7 @@
 import math
 import time
 from collections.abc import Iterable, Mapping
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any, Self
 
 import httpx
@@ -8,6 +9,7 @@ import httpx
 from app.core.config import Settings
 from app.core.log_redaction import install_sensitive_data_log_filters
 from app.providers.base import (
+    EnrichedContactSet,
     EnrichmentInput,
     EnrichmentPending,
     EnrichmentReceipt,
@@ -158,6 +160,8 @@ class ApolloGateway:
         document = _response_document(response)
         request_id = _enrichment_request_id(document)
         result = normalize_enrichment_payload(document, expected_request_id=request_id)
+        charged_credits = _charged_credits(document, len(people))
+        assert charged_credits is not None
         return EnrichmentReceipt(
             provider="apollo",
             request_id=request_id,
@@ -165,7 +169,7 @@ class ApolloGateway:
             result=result,
             charged_units=(
                 ("enrichments", len(people)),
-                ("estimated_credits", _charged_credits(document, len(people))),
+                ("estimated_credits", charged_credits),
             ),
         )
 
@@ -226,18 +230,31 @@ def _enrichment_request_id(document: Mapping[str, Any]) -> str:
     return normalized
 
 
-def _charged_credits(document: Mapping[str, Any], submitted_count: int) -> int:
-    value = document.get("credits_consumed", submitted_count)
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+def _charged_credits(document: Mapping[str, Any], fallback: int | None) -> int | None:
+    value = document.get("credits_consumed", fallback)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ProviderPayloadError("provider credit usage is invalid")
-    return value
+    try:
+        credits = Decimal(str(value))
+    except InvalidOperation:
+        raise ProviderPayloadError("provider credit usage is invalid") from None
+    if not credits.is_finite() or credits < 0:
+        raise ProviderPayloadError("provider credit usage is invalid")
+    return int(credits.to_integral_value(rounding=ROUND_CEILING))
 
 
 def normalize_enrichment_payload(
     payload: Mapping[str, Any], *, expected_request_id: str
 ) -> EnrichmentResult:
-    actual_request_id = _enrichment_request_id(payload)
-    if actual_request_id != expected_request_id:
+    supplied_request_id = payload.get("request_id")
+    actual_request_id = (
+        _enrichment_request_id(payload)
+        if supplied_request_id is not None
+        else expected_request_id
+    )
+    if supplied_request_id is not None and actual_request_id != expected_request_id:
         raise ProviderPayloadError("provider enrichment request ID does not match")
     raw_people = _enriched_people(payload)
     people = tuple(_enriched_person(value) for value in raw_people)
@@ -246,6 +263,7 @@ def normalize_enrichment_payload(
         request_id=actual_request_id,
         people=people,
         snapshot_payload=dict(payload),
+        charged_credits=_charged_credits(payload, None),
     )
 
 
@@ -259,16 +277,10 @@ def _enriched_people(document: Mapping[str, Any]) -> list[object]:
     person = document.get("person")
     if person is not None:
         return [person]
-    person_id = document.get("person_id")
-    if person_id is not None:
-        native_webhook = dict(document)
-        native_webhook["id"] = person_id
-        native_webhook.setdefault("name", "Unknown Candidate")
-        return [native_webhook]
     return []
 
 
-def _enriched_person(value: object) -> ProviderPerson:
+def _enriched_person(value: object) -> EnrichedContactSet:
     if not isinstance(value, dict):
         raise ProviderPayloadError("provider enriched person must be an object")
     nested = value.get("person")
@@ -277,15 +289,8 @@ def _enriched_person(value: object) -> ProviderPerson:
             raise ProviderPayloadError("provider enriched person must be an object")
         value = nested
     contacts = tuple(_email_contacts(value) + _phone_contacts(value))
-    return ProviderPerson(
-        provider="apollo",
+    return EnrichedContactSet(
         provider_person_id=_required_string(value, "id"),
-        full_name=_full_name(value),
-        current_title=_optional_string(value, "title"),
-        current_company=_enriched_company(value),
-        location=_location(value),
-        linkedin_url=_optional_string(value, "linkedin_url"),
-        experiences=_experiences(value.get("employment_history", [])),
         contacts=contacts,
     )
 
@@ -343,7 +348,11 @@ def _phone_contacts(person: Mapping[str, object]) -> list[ProviderContact]:
         )
         if raw is None:
             raise ProviderPayloadError("provider phone number value is missing")
-        phone_type = (_optional_string(phone, "type") or "work").casefold()
+        phone_type = (
+            _optional_string(phone, "type_cd")
+            or _optional_string(phone, "type")
+            or "work"
+        ).casefold()
         contacts.append(
             ProviderContact(
                 kind="phone",
@@ -351,7 +360,9 @@ def _phone_contacts(person: Mapping[str, object]) -> list[ProviderContact]:
                 classification="personal"
                 if phone_type in {"mobile", "personal"}
                 else "work",
-                verification_state=_verification(phone.get("status")),
+                verification_state=_verification(
+                    phone.get("status_cd", phone.get("status"))
+                ),
             )
         )
     return contacts
@@ -362,7 +373,8 @@ def _verification(value: object) -> str:
         return "unverified"
     return (
         "verified"
-        if value.casefold() in {"verified", "valid", "enrichment_successful"}
+        if value.casefold()
+        in {"verified", "valid", "valid_number", "enrichment_successful"}
         else "unverified"
     )
 

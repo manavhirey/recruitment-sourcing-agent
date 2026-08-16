@@ -9,6 +9,10 @@ os.environ.update(
         "MIGRATION_DATABASE_URL": (
             "postgresql+psycopg://postgres:postgres@localhost:5432/sourcing_test"
         ),
+        "MAINTENANCE_DATABASE_URL": (
+            "postgresql+psycopg://sourcing_maintenance:sourcing-maintenance-test"
+            "@localhost:5432/sourcing_test"
+        ),
         "REDIS_URL": "redis://localhost:6379/15",
         "OBJECT_STORE_ENDPOINT": "http://localhost:9000",
         "OIDC_ISSUER": "https://issuer.test/",

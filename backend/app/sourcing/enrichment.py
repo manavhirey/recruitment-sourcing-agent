@@ -1,10 +1,11 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.candidates.contacts import ContactCipher
@@ -23,6 +24,7 @@ from app.sourcing.models import (
     ProviderSnapshot,
     RunCandidate,
     SourcingRun,
+    UsageLedger,
 )
 from app.sourcing.service import SourcingError, SourcingService
 from app.sourcing.state_machine import RunState, transition_run
@@ -49,6 +51,19 @@ class EnrichmentGateway(Protocol):
     def poll_enrichment(
         self, request_id: str
     ) -> EnrichmentResult | EnrichmentPending: ...
+
+
+@contextmanager
+def _tenant_session(
+    session_factory: sessionmaker[Session], tenant_id: UUID
+) -> Iterator[Session]:
+    with session_factory() as session:
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(
+                text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+                {"tenant_id": str(tenant_id)},
+            )
+        yield session
 
 
 @dataclass(frozen=True)
@@ -125,7 +140,7 @@ def enqueue_top_enrichment(
     if not callback_base_url.startswith("https://"):
         raise ValueError("callback base URL must use HTTPS")
     codec = token_codec
-    with session_factory() as session:
+    with _tenant_session(session_factory, context.tenant_id) as session:
         run = _load_run(session, context, run_id, for_update=True)
         if run.cancellation_requested or run.state is RunState.CANCELLED:
             session.rollback()
@@ -152,7 +167,15 @@ def enqueue_top_enrichment(
 
     candidates = _provider_candidates(session_factory, context, selected_ids)
     batches = _policy_batches(candidates, policy)
-    submissions: list[SubmittedEnrichment] = []
+    prepared_batches: list[
+        tuple[
+            list[tuple[UUID, EnrichmentInput, str | None]],
+            bool,
+            bool,
+            UUID,
+            str,
+        ]
+    ] = []
     for index, (records, reveal_personal, reveal_phone) in enumerate(batches):
         candidate_ids = tuple(record[0] for record in records)
         reservation_key = _reservation_key(index, candidate_ids)
@@ -169,6 +192,27 @@ def enqueue_top_enrichment(
         if prepared is None:
             continue
         enrichment_id, capability_token = prepared
+        prepared_batches.append(
+            (
+                records,
+                reveal_personal,
+                reveal_phone,
+                enrichment_id,
+                capability_token,
+            )
+        )
+
+    submissions: list[SubmittedEnrichment] = []
+    for (
+        records,
+        reveal_personal,
+        reveal_phone,
+        enrichment_id,
+        capability_token,
+    ) in prepared_batches:
+        if not _request_dispatchable(session_factory, context, enrichment_id):
+            continue
+        candidate_ids = tuple(record[0] for record in records)
         inputs = tuple(record[1] for record in records)
         callback_url = (
             f"{callback_base_url.rstrip('/')}/webhooks/apollo/{capability_token}"
@@ -220,7 +264,7 @@ def poll_enrichment_request(
     snapshot_store: SnapshotStore,
     contact_cipher: ContactCipher,
 ) -> int | None:
-    with session_factory() as session:
+    with _tenant_session(session_factory, context.tenant_id) as session:
         enrichment = session.scalar(
             select(EnrichmentRequest).where(
                 EnrichmentRequest.id == request_id,
@@ -248,10 +292,12 @@ def poll_enrichment_request(
             context,
             request_id,
             error_code="provider_poll_failed",
+            charge_reserved=True,
         )
+        _finalize_if_terminal(session_factory, context, enrichment.run_id)
         return None
     if isinstance(result, EnrichmentPending):
-        with session_factory() as session:
+        with _tenant_session(session_factory, context.tenant_id) as session:
             enrichment = session.get(EnrichmentRequest, request_id)
             if enrichment is not None and enrichment.tenant_id == context.tenant_id:
                 enrichment.retry_count += 1
@@ -260,7 +306,7 @@ def poll_enrichment_request(
                 )
                 session.commit()
         return result.retry_after_seconds
-    with session_factory() as session:
+    with _tenant_session(session_factory, context.tenant_id) as session:
         enrichment = session.scalar(
             select(EnrichmentRequest)
             .where(
@@ -298,7 +344,7 @@ def execute_queued_enrichment_request(
 ) -> SubmittedEnrichment | None:
     if not callback_base_url.startswith("https://"):
         raise ValueError("callback base URL must use HTTPS")
-    with session_factory() as session:
+    with _tenant_session(session_factory, context.tenant_id) as session:
         enrichment = session.scalar(
             select(EnrichmentRequest)
             .where(
@@ -409,7 +455,7 @@ def _provider_candidates(
     context: RequestContext,
     candidate_ids: Sequence[UUID],
 ) -> list[tuple[UUID, EnrichmentInput, str | None]]:
-    with session_factory() as session:
+    with _tenant_session(session_factory, context.tenant_id) as session:
         candidates = {
             candidate.id: candidate
             for candidate in session.scalars(
@@ -487,7 +533,7 @@ def _prepare_request(
     reveal_phone: bool,
     codec: CapabilityTokenCodec,
 ) -> tuple[UUID, str] | None:
-    with session_factory() as session:
+    with _tenant_session(session_factory, context.tenant_id) as session:
         existing = session.scalar(
             select(EnrichmentRequest).where(
                 EnrichmentRequest.tenant_id == context.tenant_id,
@@ -559,7 +605,7 @@ def _record_receipt(
     *,
     terminal: bool,
 ) -> None:
-    with session_factory() as session:
+    with _tenant_session(session_factory, context.tenant_id) as session:
         enrichment = session.scalar(
             select(EnrichmentRequest)
             .where(
@@ -570,6 +616,27 @@ def _record_receipt(
         )
         if enrichment is None:
             raise LookupError("enrichment request not found")
+        if enrichment.status in ("completed", "failed", "cancelled"):
+            return
+        run = _load_run(session, context, enrichment.run_id, for_update=True)
+        if run.cancellation_requested or run.state is RunState.CANCELLED:
+            enrichment.provider_request_id = receipt.request_id
+            enrichment.status = "cancelled"
+            enrichment.completed_at = datetime.now(UTC)
+            if enrichment.usage_reconciled_at is None:
+                reserved = {
+                    row.unit_type: row.requested_units
+                    for row in session.scalars(
+                        select(UsageLedger).where(
+                            UsageLedger.tenant_id == context.tenant_id,
+                            UsageLedger.run_id == enrichment.run_id,
+                            UsageLedger.reservation_key == enrichment.reservation_key,
+                        )
+                    )
+                }
+                _reconcile_receipt_usage(session, enrichment, context, reserved)
+            session.commit()
+            return
         enrichment.provider_request_id = receipt.request_id
         enrichment.status = "pending"
         enrichment.poll_after = enrichment.stage_deadline
@@ -577,13 +644,7 @@ def _record_receipt(
             "enrichments": receipt.submitted_count,
             "estimated_credits": receipt.submitted_count,
         }
-        SourcingService(session, b"internal-enrichment").reconcile_usage(
-            context,
-            enrichment.run_id,
-            reservation_key=enrichment.reservation_key,
-            charged_units=charged,
-            provider_request_id=receipt.request_id,
-        )
+        enrichment.synchronous_credits = charged["estimated_credits"]
         if receipt.result is not None:
             apply_enrichment_payload(
                 session,
@@ -596,6 +657,7 @@ def _record_receipt(
                 terminal=terminal,
             )
         elif terminal:
+            _reconcile_receipt_usage(session, enrichment, context, charged)
             enrichment.status = "completed"
             enrichment.completed_at = datetime.now(UTC)
             session.execute(
@@ -615,14 +677,66 @@ def _record_receipt(
         session.commit()
 
 
+def _request_dispatchable(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    request_id: UUID,
+) -> bool:
+    with _tenant_session(session_factory, context.tenant_id) as session:
+        enrichment = session.scalar(
+            select(EnrichmentRequest)
+            .where(
+                EnrichmentRequest.id == request_id,
+                EnrichmentRequest.tenant_id == context.tenant_id,
+            )
+            .with_for_update()
+        )
+        if enrichment is None or enrichment.status != "submitting":
+            return False
+        run = _load_run(session, context, enrichment.run_id, for_update=True)
+        if not run.cancellation_requested and run.state is not RunState.CANCELLED:
+            session.rollback()
+            return True
+        enrichment.status = "cancelled"
+        enrichment.completed_at = datetime.now(UTC)
+        if enrichment.usage_reconciled_at is None:
+            _reconcile_receipt_usage(
+                session,
+                enrichment,
+                context,
+                {"enrichments": 0, "estimated_credits": 0},
+            )
+        session.commit()
+        return False
+
+
+def _reconcile_receipt_usage(
+    session: Session,
+    enrichment: EnrichmentRequest,
+    context: RequestContext,
+    charged: dict[str, int],
+) -> None:
+    if enrichment.usage_reconciled_at is not None:
+        return
+    SourcingService(session, b"internal-enrichment").reconcile_usage(
+        context,
+        enrichment.run_id,
+        reservation_key=enrichment.reservation_key,
+        charged_units=charged,
+        provider_request_id=enrichment.provider_request_id,
+    )
+    enrichment.usage_reconciled_at = datetime.now(UTC)
+
+
 def _fail_request(
     session_factory: sessionmaker[Session],
     context: RequestContext,
     request_id: UUID,
     *,
     error_code: str,
+    charge_reserved: bool = False,
 ) -> None:
-    with session_factory() as session:
+    with _tenant_session(session_factory, context.tenant_id) as session:
         enrichment = session.scalar(
             select(EnrichmentRequest)
             .where(
@@ -647,13 +761,29 @@ def _fail_request(
             )
             .values(enrichment_status="failed", enriched_at=datetime.now(UTC))
         )
-        SourcingService(session, b"internal-enrichment").reconcile_usage(
-            context,
-            enrichment.run_id,
-            reservation_key=enrichment.reservation_key,
-            charged_units={"enrichments": 0, "estimated_credits": 0},
-            provider_request_id=None,
-        )
+        if enrichment.usage_reconciled_at is None:
+            charged_units = {"enrichments": 0, "estimated_credits": 0}
+            provider_request_id = None
+            if charge_reserved:
+                ledger = list(
+                    session.scalars(
+                        select(UsageLedger).where(
+                            UsageLedger.tenant_id == context.tenant_id,
+                            UsageLedger.run_id == enrichment.run_id,
+                            UsageLedger.reservation_key == enrichment.reservation_key,
+                        )
+                    )
+                )
+                charged_units = {row.unit_type: row.requested_units for row in ledger}
+                provider_request_id = enrichment.provider_request_id
+            SourcingService(session, b"internal-enrichment").reconcile_usage(
+                context,
+                enrichment.run_id,
+                reservation_key=enrichment.reservation_key,
+                charged_units=charged_units,
+                provider_request_id=provider_request_id,
+            )
+            enrichment.usage_reconciled_at = datetime.now(UTC)
         session.commit()
 
 
@@ -678,7 +808,7 @@ def _load_run(
 def _finish_empty_enrichment(
     session_factory: sessionmaker[Session], context: RequestContext, run_id: UUID
 ) -> None:
-    with session_factory() as session:
+    with _tenant_session(session_factory, context.tenant_id) as session:
         run = _load_run(session, context, run_id, for_update=True)
         if run.state is RunState.ENRICHING and not run.cancellation_requested:
             run.state = transition_run(run.state, RunState.READY)
@@ -690,7 +820,7 @@ def _finish_empty_enrichment(
 def _finalize_if_terminal(
     session_factory: sessionmaker[Session], context: RequestContext, run_id: UUID
 ) -> None:
-    with session_factory() as session:
+    with _tenant_session(session_factory, context.tenant_id) as session:
         pending = int(
             session.scalar(
                 select(func.count())

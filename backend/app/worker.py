@@ -24,7 +24,11 @@ celery_app.conf.update(
         "snapshot-reference-reconciliation": {
             "task": "sourcing.reconcile_expired_snapshots",
             "schedule": crontab(hour=2, minute=0),
-        }
+        },
+        "contact-point-expiration": {
+            "task": "sourcing.expire_contact_points",
+            "schedule": crontab(hour=2, minute=15),
+        },
     },
 )
 celery_app.autodiscover_tasks(("app.sourcing",), force=True)

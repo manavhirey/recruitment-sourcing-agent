@@ -56,6 +56,7 @@ def test_apollo_bulk_enrichment_sends_headers_flags_details_and_https_callback(
             json={
                 "status": "success",
                 "request_id": 1039995589705121900,
+                "credits_consumed": 1.25,
                 "matches": [
                     {
                         "id": "person-0",
@@ -94,6 +95,7 @@ def test_apollo_bulk_enrichment_sends_headers_flags_details_and_https_callback(
     assert receipt.submitted_count == 1
     assert receipt.result is not None
     assert receipt.result.people[0].contacts[0].value == "priya@work.example"
+    assert dict(receipt.charged_units)["estimated_credits"] == 2
 
 
 def test_apollo_bulk_enrichment_rejects_non_https_callback(
@@ -140,16 +142,15 @@ def test_apollo_poll_normalizes_ready_phone_result(
         return_value=httpx.Response(
             200,
             json={
-                "request_id": 123,
+                "credits_consumed": 8,
                 "people": [
                     {
                         "id": "person-0",
-                        "name": "Priya Sharma",
                         "phone_numbers": [
                             {
                                 "raw_number": "+1 212 555 0112",
-                                "type": "mobile",
-                                "status": "verified",
+                                "type_cd": "mobile",
+                                "status_cd": "valid_number",
                             }
                         ],
                     }
@@ -162,6 +163,7 @@ def test_apollo_poll_normalizes_ready_phone_result(
 
     assert not isinstance(result, EnrichmentPending)
     assert result.request_id == "123"
+    assert result.charged_credits == 8
     assert result.people[0].contacts[0].kind == "phone"
     assert result.people[0].contacts[0].value == "+1 212 555 0112"
 
@@ -169,13 +171,23 @@ def test_apollo_poll_normalizes_ready_phone_result(
 def test_apollo_normalizes_native_phone_webhook_shape() -> None:
     result = normalize_enrichment_payload(
         {
-            "request_id": 123,
-            "person_id": "person-0",
-            "phone_numbers": [
+            "status": "success",
+            "total_requested_enrichments": 1,
+            "unique_enriched_records": 1,
+            "missing_records": 0,
+            "credits_consumed": 8,
+            "people": [
                 {
-                    "number": "+1 212 555 0112",
-                    "type": "mobile",
-                    "status": "verified",
+                    "id": "person-0",
+                    "status": "success",
+                    "phone_numbers": [
+                        {
+                            "raw_number": "+1 212 555 0112",
+                            "sanitized_number": "+12125550112",
+                            "type_cd": "mobile",
+                            "status_cd": "valid_number",
+                        }
+                    ],
                 }
             ],
         },
@@ -184,6 +196,9 @@ def test_apollo_normalizes_native_phone_webhook_shape() -> None:
 
     assert result.people[0].provider_person_id == "person-0"
     assert result.people[0].contacts[0].value == "+1 212 555 0112"
+    assert result.people[0].contacts[0].classification == "personal"
+    assert result.people[0].contacts[0].verification_state == "verified"
+    assert result.charged_credits == 8
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy.engine import make_url
 
-from app.core.config import Settings
+from app.core.config import MigrationSettings, Settings
 from app.main import create_app
 
 
@@ -16,24 +16,62 @@ def test_test_settings_supply_all_required_secrets() -> None:
     settings = Settings.for_test()
     assert settings.environment == "test"
     assert make_url(settings.database_url).username == "sourcing_api_test"
-    assert make_url(settings.migration_database_url).username == "postgres"
+    assert not hasattr(settings, "migration_database_url")
+    assert make_url(settings.maintenance_database_url).username == (
+        "sourcing_maintenance"
+    )
 
 
-def test_migration_database_url_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_runtime_settings_do_not_require_schema_owner_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = Settings.for_test().model_dump()
-    payload.pop("migration_database_url")
     monkeypatch.delenv("MIGRATION_DATABASE_URL")
 
-    with pytest.raises(ValidationError, match="migration_database_url"):
-        Settings(_env_file=None, **payload)
+    settings = Settings(_env_file=None, **payload)
+
+    assert not hasattr(settings, "migration_database_url")
 
 
 def test_migration_database_url_must_use_a_distinct_role() -> None:
-    payload = Settings.for_test().model_dump()
-    payload["migration_database_url"] = payload["database_url"]
+    runtime = Settings.for_test()
+    payload = {
+        "database_url": runtime.database_url,
+        "migration_database_url": runtime.database_url,
+        "maintenance_database_url": runtime.maintenance_database_url,
+    }
 
-    with pytest.raises(ValidationError, match="distinct database role"):
+    with pytest.raises(ValidationError, match="database roles must be distinct"):
+        MigrationSettings.model_validate(payload)
+
+
+def test_maintenance_database_url_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = Settings.for_test().model_dump()
+    payload.pop("maintenance_database_url")
+    monkeypatch.delenv("MAINTENANCE_DATABASE_URL")
+
+    with pytest.raises(ValidationError, match="maintenance_database_url"):
+        Settings(_env_file=None, **payload)
+
+
+def test_maintenance_database_url_must_use_a_distinct_api_role() -> None:
+    payload = Settings.for_test().model_dump()
+    payload["maintenance_database_url"] = payload["database_url"]
+
+    with pytest.raises(ValidationError, match="distinct from API"):
         Settings.model_validate(payload)
+
+
+def test_maintenance_database_url_must_differ_from_migration_role() -> None:
+    runtime = Settings.for_test()
+    payload = {
+        "database_url": runtime.database_url,
+        "migration_database_url": runtime.maintenance_database_url,
+        "maintenance_database_url": runtime.maintenance_database_url,
+    }
+
+    with pytest.raises(ValidationError, match="database roles must be distinct"):
+        MigrationSettings.model_validate(payload)
 
 
 def test_app_loads_the_project_root_env_file_from_backend(tmp_path: Path) -> None:
@@ -45,6 +83,7 @@ def test_app_loads_the_project_root_env_file_from_backend(tmp_path: Path) -> Non
     environment_file.write_text(
         """DATABASE_URL=postgresql+psycopg://sourcing_api:api-password@localhost:5432/sourcing
 MIGRATION_DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/sourcing
+MAINTENANCE_DATABASE_URL=postgresql+psycopg://sourcing_maintenance:maintenance-password@localhost:5432/sourcing
 REDIS_URL=redis://localhost:6379/0
 OBJECT_STORE_ENDPOINT=http://localhost:9000
 OIDC_ISSUER=https://issuer.example.com/

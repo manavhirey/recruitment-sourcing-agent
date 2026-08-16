@@ -13,7 +13,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.audit.service import AuditService
-from app.candidates.contacts import ContactCipher
+from app.candidates.contacts import ContactCipher, expire_due_contacts
 from app.candidates.service import CandidateService
 from app.core.config import get_settings
 from app.core.database import session_factory as database_session_factory
@@ -725,7 +725,6 @@ def _enrichment_dependencies(settings: Any):
         settings.object_store_bucket,
         settings.contact_encryption_key.get_secret_value(),
     )
-    snapshots.ensure_lifecycle()
     policy = RegionalContactPolicy(
         settings.apollo_reveal_personal_emails,
         settings.apollo_reveal_phone_numbers,
@@ -880,6 +879,7 @@ def enrich_run(
         gateway.close()
     for submission in submissions:
         with database_session_factory() as session:
+            _apply_tenant_context(session, context.tenant_id)
             request = session.get(EnrichmentRequest, submission.request_id)
             should_poll = request is not None and request.status == "pending"
         if should_poll:
@@ -975,7 +975,7 @@ def reconcile_expired_snapshots() -> None:
     settings = get_settings()
     _, snapshots, _, _ = _enrichment_dependencies(settings)
     maintenance_engine = create_engine(
-        settings.migration_database_url,
+        settings.maintenance_database_url,
         pool_pre_ping=True,
     )
     try:
@@ -988,3 +988,30 @@ def reconcile_expired_snapshots() -> None:
             session.commit()
     finally:
         maintenance_engine.dispose()
+
+
+@celery_app.task(name="sourcing.expire_contact_points")
+def expire_contact_points() -> None:
+    settings = get_settings()
+    maintenance_engine = create_engine(
+        settings.maintenance_database_url,
+        pool_pre_ping=True,
+    )
+    try:
+        maintenance_sessions = sessionmaker(
+            bind=maintenance_engine,
+            expire_on_commit=False,
+        )
+        with maintenance_sessions() as session:
+            expire_due_contacts(session)
+            session.commit()
+    finally:
+        maintenance_engine.dispose()
+
+
+@celery_app.task(name="sourcing.configure_snapshot_lifecycle")
+def configure_snapshot_lifecycle() -> None:
+    """Explicit deployment operation; provider workers never run bucket admin."""
+    settings = get_settings()
+    _, snapshots, _, _ = _enrichment_dependencies(settings)
+    snapshots.ensure_lifecycle()

@@ -6,4 +6,14 @@ BEGIN
 END
 $$;
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_roles WHERE rolname = 'sourcing_maintenance'
+    ) THEN
+        CREATE ROLE sourcing_maintenance LOGIN PASSWORD 'replace-with-maintenance-password';
+    END IF;
+END
+$$;
+
 CREATE DATABASE sourcing_test;

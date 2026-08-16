@@ -56,6 +56,12 @@ class ProviderContact:
 
 
 @dataclass(frozen=True)
+class EnrichedContactSet:
+    provider_person_id: str
+    contacts: tuple[ProviderContact, ...]
+
+
+@dataclass(frozen=True)
 class SearchPage:
     people: tuple[ProviderPerson, ...]
     page: int
@@ -87,8 +93,9 @@ class EnrichmentReceipt:
 class EnrichmentResult:
     provider: str
     request_id: str
-    people: tuple[ProviderPerson, ...]
+    people: tuple[EnrichedContactSet, ...]
     snapshot_payload: dict[str, object] = field(default_factory=dict, repr=False)
+    charged_credits: int | None = None
 
 
 @dataclass(frozen=True)
