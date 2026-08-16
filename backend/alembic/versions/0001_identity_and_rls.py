@@ -101,10 +101,30 @@ def upgrade() -> None:
         "membership_invitations",
         ["tenant_id"],
     )
+    op.create_table(
+        "identity_idempotency_keys",
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("tenant_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("actor_hmac", sa.LargeBinary(length=32), nullable=False),
+        sa.Column("operation", sa.String(length=128), nullable=False),
+        sa.Column("key_hmac", sa.LargeBinary(length=32), nullable=False),
+        sa.Column("request_hmac", sa.LargeBinary(length=32), nullable=False),
+        sa.Column("response_payload", sa.JSON(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["tenant_id"], ["tenants.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("tenant_id", "actor_hmac", "operation", "key_hmac"),
+    )
+    op.create_index(
+        op.f("ix_identity_idempotency_keys_tenant_id"),
+        "identity_idempotency_keys",
+        ["tenant_id"],
+    )
 
     _tenant_policy("tenants", "id")
     _tenant_policy("memberships", "tenant_id")
     _tenant_policy("membership_invitations", "tenant_id")
+    _tenant_policy("identity_idempotency_keys", "tenant_id")
     op.execute(
         """
         DO $$
@@ -112,7 +132,8 @@ def upgrade() -> None:
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sourcing_api') THEN
                 GRANT USAGE ON SCHEMA public TO sourcing_api;
                 GRANT SELECT, INSERT, UPDATE, DELETE
-                    ON tenants, users, memberships, membership_invitations
+                    ON tenants, users, memberships, membership_invitations,
+                       identity_idempotency_keys
                     TO sourcing_api;
             END IF;
         END
@@ -122,6 +143,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.drop_index(
+        op.f("ix_identity_idempotency_keys_tenant_id"),
+        table_name="identity_idempotency_keys",
+    )
+    op.drop_table("identity_idempotency_keys")
     op.drop_index(
         op.f("ix_membership_invitations_tenant_id"),
         table_name="membership_invitations",

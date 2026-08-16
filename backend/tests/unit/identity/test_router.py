@@ -1,16 +1,17 @@
 from collections.abc import Generator
 from typing import Any
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.core.config import Settings
 from app.core.database import Base, get_db
-from app.identity.models import Membership, User
-from app.identity.schemas import IdentityClaims
+from app.identity.models import IdentityIdempotencyKey, Membership, User
+from app.identity.schemas import IdentityClaims, Role
 from app.identity.service import TenantService
 from app.main import create_app
 
@@ -122,6 +123,20 @@ def test_me_hides_tenant_from_authenticated_non_member(
     assert response.json() == {"detail": {"code": "tenant_not_found"}}
 
 
+def test_mutation_requires_idempotency_key(identity_api: dict[str, Any]) -> None:
+    response = identity_api["client"].post(
+        "/api/v1/membership-invitations",
+        headers={
+            "Authorization": "Bearer signed-token",
+            "X-Tenant-ID": str(identity_api["tenant_id"]),
+        },
+        json={"email": "recruiter@agency.test", "role": "recruiter"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"code": "idempotency_key_required"}}
+
+
 def test_owner_can_invite_and_verified_matching_identity_can_claim(
     identity_api: dict[str, Any],
 ) -> None:
@@ -131,10 +146,21 @@ def test_owner_can_invite_and_verified_matching_identity_can_claim(
         headers={
             "Authorization": "Bearer signed-token",
             "X-Tenant-ID": tenant_id,
+            "Idempotency-Key": "invite-recruiter-1",
         },
         json={"email": "recruiter@agency.test", "role": "recruiter"},
     )
     assert invitation_response.status_code == 201
+    invitation_retry = identity_api["client"].post(
+        "/api/v1/membership-invitations",
+        headers={
+            "Authorization": "Bearer signed-token",
+            "X-Tenant-ID": tenant_id,
+            "Idempotency-Key": "invite-recruiter-1",
+        },
+        json={"email": "recruiter@agency.test", "role": "recruiter"},
+    )
+    assert invitation_retry.json() == invitation_response.json()
 
     identity_api["verifier"].claims = IdentityClaims(
         subject="oidc|recruiter-1",
@@ -144,10 +170,21 @@ def test_owner_can_invite_and_verified_matching_identity_can_claim(
     )
     claim_response = identity_api["client"].post(
         f"/api/v1/membership-invitations/{invitation_response.json()['token']}/claim",
-        headers={"Authorization": "Bearer signed-token"},
+        headers={
+            "Authorization": "Bearer signed-token",
+            "Idempotency-Key": "claim-recruiter-1",
+        },
+    )
+    claim_retry = identity_api["client"].post(
+        f"/api/v1/membership-invitations/{invitation_response.json()['token']}/claim",
+        headers={
+            "Authorization": "Bearer signed-token",
+            "Idempotency-Key": "claim-recruiter-1",
+        },
     )
 
     assert claim_response.status_code == 200
+    assert claim_retry.json() == claim_response.json()
     assert claim_response.json()["role"] == "recruiter"
     with Session(identity_api["engine"]) as session:
         recruiter = session.scalar(
@@ -157,5 +194,92 @@ def test_owner_can_invite_and_verified_matching_identity_can_claim(
         membership = session.scalar(
             select(Membership).where(Membership.user_id == recruiter.id)
         )
+        assert membership is not None
+        assert membership.active is True
+        assert (
+            session.scalar(select(func.count()).select_from(IdentityIdempotencyKey))
+            == 2
+        )
+
+
+def test_role_and_deactivation_retries_do_not_repeat_committed_effects(
+    identity_api: dict[str, Any],
+) -> None:
+    tenant_id = str(identity_api["tenant_id"])
+    invite = identity_api["client"].post(
+        "/api/v1/membership-invitations",
+        headers={
+            "Authorization": "Bearer signed-token",
+            "X-Tenant-ID": tenant_id,
+            "Idempotency-Key": "invite-member-for-mutations",
+        },
+        json={"email": "member@agency.test", "role": "recruiter"},
+    )
+    identity_api["verifier"].claims = IdentityClaims(
+        subject="oidc|member-1",
+        email="member@agency.test",
+        name="Member",
+        email_verified=True,
+    )
+    claimed = identity_api["client"].post(
+        f"/api/v1/membership-invitations/{invite.json()['token']}/claim",
+        headers={
+            "Authorization": "Bearer signed-token",
+            "Idempotency-Key": "claim-member-for-mutations",
+        },
+    )
+    membership_id = claimed.json()["membership_id"]
+    identity_api["verifier"].claims = IdentityClaims(
+        subject="oidc|owner-1",
+        email="owner@agency.test",
+        name="Agency Owner",
+        email_verified=True,
+    )
+    headers = {
+        "Authorization": "Bearer signed-token",
+        "X-Tenant-ID": tenant_id,
+    }
+
+    first_role_change = identity_api["client"].patch(
+        f"/api/v1/members/{membership_id}/role",
+        headers={**headers, "Idempotency-Key": "set-member-admin"},
+        json={"role": "admin"},
+    )
+    identity_api["client"].patch(
+        f"/api/v1/members/{membership_id}/role",
+        headers={**headers, "Idempotency-Key": "set-member-recruiter"},
+        json={"role": "recruiter"},
+    )
+    role_retry = identity_api["client"].patch(
+        f"/api/v1/members/{membership_id}/role",
+        headers={**headers, "Idempotency-Key": "set-member-admin"},
+        json={"role": "admin"},
+    )
+
+    assert first_role_change.json()["role"] == "admin"
+    assert role_retry.json() == first_role_change.json()
+    with Session(identity_api["engine"]) as session:
+        membership = session.get(Membership, UUID(membership_id))
+        assert membership is not None
+        assert membership.role is Role.RECRUITER
+
+    first_deactivation = identity_api["client"].delete(
+        f"/api/v1/members/{membership_id}",
+        headers={**headers, "Idempotency-Key": "deactivate-member"},
+    )
+    with Session(identity_api["engine"]) as session:
+        membership = session.get(Membership, UUID(membership_id))
+        assert membership is not None
+        membership.active = True
+        session.commit()
+    deactivation_retry = identity_api["client"].delete(
+        f"/api/v1/members/{membership_id}",
+        headers={**headers, "Idempotency-Key": "deactivate-member"},
+    )
+
+    assert first_deactivation.status_code == 204
+    assert deactivation_retry.status_code == 204
+    with Session(identity_api["engine"]) as session:
+        membership = session.get(Membership, UUID(membership_id))
         assert membership is not None
         assert membership.active is True

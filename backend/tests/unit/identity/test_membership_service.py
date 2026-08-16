@@ -1,12 +1,18 @@
+import json
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
 from app.core.database import Base
-from app.identity.models import Membership, MembershipInvitation, User
+from app.identity.models import (
+    IdentityIdempotencyKey,
+    Membership,
+    MembershipInvitation,
+    User,
+)
 from app.identity.schemas import IdentityClaims, Role
 from app.identity.service import IdentityError, MembershipService, TenantService
 
@@ -68,6 +74,96 @@ def test_invitation_stores_only_hmac_and_expires_after_seven_days(
     assert session.scalar(select(MembershipInvitation)) is invitation
 
 
+def test_invitation_retry_returns_original_token_without_duplicate_row(
+    session: Session,
+) -> None:
+    tenant = TenantService(session).provision("agency", owner_claims())
+    owner = session.scalar(select(User).where(User.oidc_subject == "oidc|owner-1"))
+    assert owner is not None
+    service = MembershipService(session, b"invitation-key")
+
+    first = service.invite(
+        tenant_id=tenant.id,
+        intended_email="recruiter@agency.test",
+        role=Role.RECRUITER,
+        created_by_user_id=owner.id,
+        idempotency_key="invite-recruiter-1",
+    )
+    second = service.invite(
+        tenant_id=tenant.id,
+        intended_email="recruiter@agency.test",
+        role=Role.RECRUITER,
+        created_by_user_id=owner.id,
+        idempotency_key="invite-recruiter-1",
+    )
+
+    assert second[0].id == first[0].id
+    assert second[1] == first[1]
+    assert session.scalar(select(func.count()).select_from(MembershipInvitation)) == 1
+    assert session.scalar(select(func.count()).select_from(IdentityIdempotencyKey)) == 1
+    record = session.scalar(select(IdentityIdempotencyKey))
+    assert record is not None
+    assert record.key_hmac != b"invite-recruiter-1"
+    assert first[1] not in json.dumps(record.response_payload)
+
+
+def test_invitation_key_reuse_with_different_request_is_rejected(
+    session: Session,
+) -> None:
+    tenant = TenantService(session).provision("agency", owner_claims())
+    owner = session.scalar(select(User).where(User.oidc_subject == "oidc|owner-1"))
+    assert owner is not None
+    service = MembershipService(session, b"invitation-key")
+    service.invite(
+        tenant_id=tenant.id,
+        intended_email="first@agency.test",
+        role=Role.RECRUITER,
+        created_by_user_id=owner.id,
+        idempotency_key="invite-key-reuse",
+    )
+
+    with pytest.raises(IdentityError, match="idempotency_conflict"):
+        service.invite(
+            tenant_id=tenant.id,
+            intended_email="second@agency.test",
+            role=Role.ADMIN,
+            created_by_user_id=owner.id,
+            idempotency_key="invite-key-reuse",
+        )
+
+
+def test_invitation_key_is_scoped_to_the_creating_actor(session: Session) -> None:
+    tenant = TenantService(session).provision("agency", owner_claims())
+    owner = session.scalar(select(User).where(User.oidc_subject == "oidc|owner-1"))
+    assert owner is not None
+    second_admin = User(
+        oidc_subject="oidc|admin-2",
+        email="admin@agency.test",
+        display_name="Second Admin",
+    )
+    session.add(second_admin)
+    session.flush()
+    service = MembershipService(session, b"invitation-key")
+
+    first = service.invite(
+        tenant_id=tenant.id,
+        intended_email="first@agency.test",
+        role=Role.RECRUITER,
+        created_by_user_id=owner.id,
+        idempotency_key="shared-client-key",
+    )
+    second = service.invite(
+        tenant_id=tenant.id,
+        intended_email="second@agency.test",
+        role=Role.RECRUITER,
+        created_by_user_id=second_admin.id,
+        idempotency_key="shared-client-key",
+    )
+
+    assert first[0].id != second[0].id
+    assert first[1] != second[1]
+
+
 def test_claim_invitation_requires_verified_matching_email_and_consumes_once(
     session: Session,
 ) -> None:
@@ -97,6 +193,39 @@ def test_claim_invitation_requires_verified_matching_email_and_consumes_once(
     assert invitation.claimed_at == now
     with pytest.raises(IdentityError, match="invitation_invalid"):
         service.claim_invite(token, claims, now=now)
+
+
+def test_claim_retry_returns_original_success_after_response_loss(
+    session: Session,
+) -> None:
+    tenant = TenantService(session).provision("agency", owner_claims())
+    owner = session.scalar(select(User).where(User.oidc_subject == "oidc|owner-1"))
+    assert owner is not None
+    service = MembershipService(session, b"invitation-key")
+    _, token = service.invite(
+        tenant_id=tenant.id,
+        intended_email="recruiter@agency.test",
+        role=Role.RECRUITER,
+        created_by_user_id=owner.id,
+        idempotency_key="invite-recruiter-1",
+    )
+    claims = IdentityClaims(
+        subject="oidc|recruiter-1",
+        email="recruiter@agency.test",
+        name="Recruiter",
+        email_verified=True,
+    )
+
+    first = service.claim_invite(token, claims, idempotency_key="claim-recruiter-1")
+    persisted_membership = session.get(Membership, first.membership_id)
+    assert persisted_membership is not None
+    persisted_membership.role = Role.ADMIN
+    session.flush()
+    retry = service.claim_invite(token, claims, idempotency_key="claim-recruiter-1")
+
+    assert retry.membership_id == first.membership_id
+    assert retry.role is Role.RECRUITER
+    assert retry.active is True
 
 
 @pytest.mark.parametrize(

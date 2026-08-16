@@ -6,7 +6,12 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
-from app.identity.models import Membership, MembershipInvitation, User
+from app.identity.models import (
+    IdentityIdempotencyKey,
+    Membership,
+    MembershipInvitation,
+    User,
+)
 from app.identity.schemas import IdentityClaims, Role
 from app.identity.service import TenantService
 
@@ -79,10 +84,35 @@ def test_child_row_policies_hide_memberships_and_invitations_from_other_tenant(
         created_by_user_id=second_user.id,
         expires_at=datetime.now(UTC) + timedelta(days=7),
     )
+    first_idempotency = IdentityIdempotencyKey(
+        id=uuid4(),
+        tenant_id=first.id,
+        actor_hmac=hashlib.sha256(b"first-actor").digest(),
+        operation="test",
+        key_hmac=hashlib.sha256(b"first-key").digest(),
+        request_hmac=hashlib.sha256(b"first-request").digest(),
+        response_payload={"status": "first"},
+    )
+    second_idempotency = IdentityIdempotencyKey(
+        id=uuid4(),
+        tenant_id=second.id,
+        actor_hmac=hashlib.sha256(b"second-actor").digest(),
+        operation="test",
+        key_hmac=hashlib.sha256(b"second-key").digest(),
+        request_hmac=hashlib.sha256(b"second-request").digest(),
+        response_payload={"status": "second"},
+    )
     owner_session.add_all((first_user, second_user))
     owner_session.flush()
     owner_session.add_all(
-        (first_membership, second_membership, first_invitation, second_invitation)
+        (
+            first_membership,
+            second_membership,
+            first_invitation,
+            second_invitation,
+            first_idempotency,
+            second_idempotency,
+        )
     )
     owner_session.commit()
 
@@ -91,12 +121,18 @@ def test_child_row_policies_hide_memberships_and_invitations_from_other_tenant(
         {"value": str(first.id)},
     )
     membership_ids = session.execute(text("SELECT id FROM memberships")).scalars().all()
-    invitation_ids = session.execute(
-        text("SELECT id FROM membership_invitations")
-    ).scalars().all()
+    invitation_ids = (
+        session.execute(text("SELECT id FROM membership_invitations")).scalars().all()
+    )
+    idempotency_ids = (
+        session.execute(text("SELECT id FROM identity_idempotency_keys"))
+        .scalars()
+        .all()
+    )
 
     assert membership_ids == [first_membership.id]
     assert invitation_ids == [first_invitation.id]
+    assert idempotency_ids == [first_idempotency.id]
 
 
 def test_migration_owner_can_provision_through_forced_policies(owner_engine) -> None:
@@ -104,9 +140,7 @@ def test_migration_owner_can_provision_through_forced_policies(owner_engine) -> 
     migration_password = "sourcing-migration-test"
     with owner_engine.begin() as connection:
         connection.execute(
-            text(
-                f"CREATE ROLE {migration_role} LOGIN PASSWORD '{migration_password}'"
-            )
+            text(f"CREATE ROLE {migration_role} LOGIN PASSWORD '{migration_password}'")
         )
         connection.execute(text(f"ALTER TABLE tenants OWNER TO {migration_role}"))
         connection.execute(text(f"ALTER TABLE users OWNER TO {migration_role}"))
@@ -118,16 +152,16 @@ def test_migration_owner_can_provision_through_forced_policies(owner_engine) -> 
     migration_engine = create_engine(migration_url)
     try:
         with Session(migration_engine) as migration_session, migration_session.begin():
-                tenant = TenantService(migration_session).provision(
+            tenant = TenantService(migration_session).provision(
                 "provisioned",
                 IdentityClaims(
                     subject="oidc|provisioned-owner",
                     email="owner@provisioned.test",
                     name="Provisioned Owner",
-                        email_verified=True,
-                    ),
-                )
-                provisioned_slug = tenant.slug
+                    email_verified=True,
+                ),
+            )
+            provisioned_slug = tenant.slug
         assert provisioned_slug == "provisioned"
     finally:
         migration_engine.dispose()

@@ -50,6 +50,7 @@ def owner_session(owner_engine: Engine) -> Generator[Session, None, None]:
     with factory() as session:
         yield session
         session.rollback()
+        session.execute(text("DELETE FROM identity_idempotency_keys"))
         session.execute(text("DELETE FROM membership_invitations"))
         session.execute(text("DELETE FROM memberships"))
         session.execute(text("DELETE FROM users"))

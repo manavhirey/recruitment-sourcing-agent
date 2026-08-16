@@ -1,8 +1,9 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 
 class Settings(BaseSettings):
@@ -12,7 +13,7 @@ class Settings(BaseSettings):
 
     environment: str = "development"
     database_url: str
-    migration_database_url: str | None = None
+    migration_database_url: str
     redis_url: str
     object_store_endpoint: str
     object_store_bucket: str = "provider-snapshots"
@@ -23,11 +24,25 @@ class Settings(BaseSettings):
     suppression_hmac_key: SecretStr
     webhook_hmac_key: SecretStr
 
+    @model_validator(mode="after")
+    def require_distinct_database_roles(self) -> "Settings":
+        api_role = make_url(self.database_url).username
+        migration_role = make_url(self.migration_database_url).username
+        if api_role is None or migration_role is None or api_role == migration_role:
+            raise ValueError("MIGRATION_DATABASE_URL must use a distinct database role")
+        return self
+
     @classmethod
     def for_test(cls) -> "Settings":
         return cls(
             environment="test",
-            database_url="postgresql+psycopg://postgres:postgres@localhost:5432/sourcing_test",
+            database_url=(
+                "postgresql+psycopg://sourcing_api_test:sourcing-api-test"
+                "@localhost:5432/sourcing_test"
+            ),
+            migration_database_url=(
+                "postgresql+psycopg://postgres:postgres@localhost:5432/sourcing_test"
+            ),
             redis_url="redis://localhost:6379/15",
             object_store_endpoint="http://localhost:9000",
             oidc_issuer="https://issuer.test/",

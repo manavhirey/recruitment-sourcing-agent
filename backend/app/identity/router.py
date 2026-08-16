@@ -10,6 +10,7 @@ from app.core.database import get_db
 from app.identity.dependencies import (
     apply_tenant_context,
     get_app_settings,
+    get_idempotency_key,
     get_identity_claims,
     get_request_context,
     require_role,
@@ -26,7 +27,7 @@ from app.identity.schemas import (
     Role,
     RoleUpdate,
 )
-from app.identity.service import IdentityError, MembershipService
+from app.identity.service import IdentityError, MembershipResult, MembershipService
 
 router = APIRouter(prefix="/api/v1", tags=["identity"])
 manager_context = require_role(Role.OWNER, Role.ADMIN)
@@ -38,9 +39,9 @@ def _allowed_client_ids(membership: Membership) -> frozenset[UUID] | None:
     return frozenset(UUID(value) for value in membership.allowed_client_ids)
 
 
-def _membership_response(membership: Membership) -> MembershipResponse:
+def _membership_response(membership: MembershipResult) -> MembershipResponse:
     return MembershipResponse(
-        membership_id=membership.id,
+        membership_id=membership.membership_id,
         tenant_id=membership.tenant_id,
         user_id=membership.user_id,
         role=membership.role,
@@ -60,6 +61,10 @@ def _raise_identity_error(error: IdentityError) -> NoReturn:
         "invitation_invalid": status.HTTP_404_NOT_FOUND,
         "invitation_email_mismatch": status.HTTP_403_FORBIDDEN,
         "invitation_role_invalid": status.HTTP_400_BAD_REQUEST,
+        "idempotency_key_invalid": status.HTTP_400_BAD_REQUEST,
+        "idempotency_actor_required": status.HTTP_400_BAD_REQUEST,
+        "idempotency_conflict": status.HTTP_409_CONFLICT,
+        "idempotency_result_missing": status.HTTP_409_CONFLICT,
         "last_owner_required": status.HTTP_409_CONFLICT,
     }.get(error.code, status.HTTP_400_BAD_REQUEST)
     raise HTTPException(status_code=status_code, detail={"code": error.code}) from error
@@ -118,6 +123,7 @@ def create_invitation(
     context: Annotated[RequestContext, Depends(manager_context)],
     session: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_app_settings)],
+    idempotency_key: Annotated[str, Depends(get_idempotency_key)],
 ) -> InvitationResponse:
     try:
         invitation, token = _membership_service(session, settings).invite(
@@ -125,6 +131,7 @@ def create_invitation(
             intended_email=str(body.email),
             role=body.role,
             created_by_user_id=context.user_id,
+            idempotency_key=idempotency_key,
         )
     except IdentityError as error:
         _raise_identity_error(error)
@@ -144,12 +151,15 @@ def claim_invitation(
     claims: Annotated[IdentityClaims, Depends(get_identity_claims)],
     session: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_app_settings)],
+    idempotency_key: Annotated[str, Depends(get_idempotency_key)],
 ) -> MembershipResponse:
     try:
         service = _membership_service(session, settings)
         tenant_id = service.invitation_tenant_id(token)
         apply_tenant_context(session, tenant_id)
-        membership = service.claim_invite(token, claims)
+        membership = service.claim_invite(
+            token, claims, idempotency_key=idempotency_key
+        )
     except IdentityError as error:
         _raise_identity_error(error)
     return _membership_response(membership)
@@ -162,6 +172,7 @@ def change_member_role(
     context: Annotated[RequestContext, Depends(manager_context)],
     session: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_app_settings)],
+    idempotency_key: Annotated[str, Depends(get_idempotency_key)],
 ) -> MembershipResponse:
     if body.role is Role.OWNER:
         raise HTTPException(
@@ -185,10 +196,15 @@ def change_member_role(
             detail={"code": "forbidden"},
         )
     try:
-        _membership_service(session, settings).change_role(membership, body.role)
+        result = _membership_service(session, settings).change_role(
+            membership,
+            body.role,
+            idempotency_key=idempotency_key,
+            actor_key=str(context.user_id),
+        )
     except IdentityError as error:
         _raise_identity_error(error)
-    return _membership_response(membership)
+    return _membership_response(result)
 
 
 @router.delete("/members/{membership_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -197,6 +213,7 @@ def deactivate_member(
     context: Annotated[RequestContext, Depends(manager_context)],
     session: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_app_settings)],
+    idempotency_key: Annotated[str, Depends(get_idempotency_key)],
 ) -> Response:
     membership = session.scalar(
         select(Membership).where(
@@ -215,7 +232,11 @@ def deactivate_member(
             detail={"code": "forbidden"},
         )
     try:
-        _membership_service(session, settings).deactivate(membership)
+        _membership_service(session, settings).deactivate(
+            membership,
+            idempotency_key=idempotency_key,
+            actor_key=str(context.user_id),
+        )
     except IdentityError as error:
         _raise_identity_error(error)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

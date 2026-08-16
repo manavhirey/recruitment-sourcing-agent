@@ -23,8 +23,6 @@ def provision_tenant(
     slug: str,
     owner_claims: IdentityClaims,
 ) -> str:
-    if settings.migration_database_url is None:
-        raise RuntimeError("MIGRATION_DATABASE_URL is required for tenant provisioning")
     engine = create_engine(settings.migration_database_url)
     try:
         with Session(engine) as session, session.begin():

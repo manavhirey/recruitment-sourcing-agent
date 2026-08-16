@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -93,6 +94,26 @@ class MembershipInvitation(Base):
     claimed_by_user_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class IdentityIdempotencyKey(Base):
+    __tablename__ = "identity_idempotency_keys"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "actor_hmac", "operation", "key_hmac"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    actor_hmac: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    operation: Mapped[str] = mapped_column(String(128), nullable=False)
+    key_hmac: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    request_hmac: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

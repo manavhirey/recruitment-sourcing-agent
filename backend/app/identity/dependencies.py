@@ -35,6 +35,20 @@ def get_app_settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
+def get_idempotency_key(request: Request) -> str:
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if (
+        idempotency_key is None
+        or not idempotency_key.strip()
+        or len(idempotency_key) > 255
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "idempotency_key_required"},
+        )
+    return idempotency_key
+
+
 def get_identity_claims(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     verifier: Annotated[Verifier, Depends(get_token_verifier)],
