@@ -51,23 +51,44 @@ _LOCATION_ALIASES = {
     "new york ny": "new york ny",
     "nyc": "new york ny",
 }
-_ELIGIBILITY_ALIASES = {
-    "not authorized to work in the united states": "us_not_work_authorized",
-    "not authorized to work in us": "us_not_work_authorized",
-    "not eligible to work in the united states": "us_not_work_authorized",
-    "authorized to work in the united states": "us_work_authorized",
-    "authorized to work in us": "us_work_authorized",
-    "employment eligible in the united states": "us_work_authorized",
-    "employment eligible in us": "us_work_authorized",
-    "us work authorized": "us_work_authorized",
-    "united states work authorized": "us_work_authorized",
-    "authorized to work in india": "india_work_authorized",
-    "legally employable in india": "india_work_authorized",
-    "requires sponsorship in the united states": "us_sponsorship_required",
-    "requires us sponsorship": "us_sponsorship_required",
-    "does not require visa sponsorship": "no_sponsorship_required",
-    "no visa sponsorship needed": "no_sponsorship_required",
-}
+_US = r"(?:the )?(?:united states|us)"
+_CANDIDATE_ELIGIBILITY_PATTERNS = (
+    (
+        r"(?:candidate is )?(?:currently )?not(?: [a-z0-9]+){0,3} "
+        + rf"(?:authorized|eligible) to work in {_US}",
+        "us_not_work_authorized",
+    ),
+    (
+        rf"(?:candidate is )?(?:currently )?(?:authorized|eligible) to work in {_US}",
+        "us_work_authorized",
+    ),
+    (rf"employment eligible in {_US}", "us_work_authorized"),
+    (r"(?:us|united states) work authorized", "us_work_authorized"),
+    (r"authorized to work in india", "india_work_authorized"),
+    (r"legally employable in india", "india_work_authorized"),
+    (rf"requires sponsorship in {_US}", "us_sponsorship_required"),
+    (r"requires us sponsorship", "us_sponsorship_required"),
+    (r"does not require visa sponsorship", "no_sponsorship_required"),
+    (r"no visa sponsorship needed", "no_sponsorship_required"),
+)
+_REQUIREMENT_ELIGIBILITY_PATTERNS = (
+    (
+        rf"\bnot(?: [a-z0-9]+){{0,3}} (?:authorized|eligible) to work in {_US}\b",
+        "us_not_work_authorized",
+    ),
+    (
+        rf"\b(?:authorized|eligible) to work in {_US}\b",
+        "us_work_authorized",
+    ),
+    (rf"\bemployment eligible in {_US}\b", "us_work_authorized"),
+    (r"\b(?:us|united states) work authorized\b", "us_work_authorized"),
+    (r"\bauthorized to work in india\b", "india_work_authorized"),
+    (r"\blegally employable in india\b", "india_work_authorized"),
+    (rf"\brequires sponsorship in {_US}\b", "us_sponsorship_required"),
+    (r"\brequires us sponsorship\b", "us_sponsorship_required"),
+    (r"\bdoes not require visa sponsorship\b", "no_sponsorship_required"),
+    (r"\bno visa sponsorship needed\b", "no_sponsorship_required"),
+)
 _CURRENT_DATE_MARKERS = frozenset({"current", "now", "present"})
 _SENIORITY_LEVELS = {
     "entry": 1,
@@ -466,12 +487,28 @@ def _eligibility_evaluation(
         return _unknown_atom(
             criterion.key, criterion.label, "candidate work-eligibility"
         )
-    candidate_value = _canonical_eligibility(work_eligibility)
+    candidate_value = _canonical_candidate_eligibility(work_eligibility)
+    if candidate_value is None:
+        return _unknown_evidenced_atom(
+            criterion.key,
+            criterion.label,
+            "candidate work-eligibility",
+            evidence=(work_eligibility,),
+            source_refs=("candidate.work_eligibility",),
+        )
     targets = {
-        _canonical_eligibility(criterion.label),
-        _canonical_eligibility(criterion.source_text or ""),
+        target
+        for value in (criterion.label, criterion.source_text or "")
+        if (target := _extract_required_eligibility(value)) is not None
     }
-    targets.discard("")
+    if not targets:
+        return _unknown_evidenced_atom(
+            criterion.key,
+            criterion.label,
+            "confirmed work-eligibility requirement",
+            evidence=(work_eligibility,),
+            source_refs=("candidate.work_eligibility",),
+        )
     return _evidenced_atom(
         key=criterion.key,
         label=criterion.label,
@@ -575,6 +612,24 @@ def _unknown_atom(key: str, label: str, evidence_name: str) -> _AtomicEvaluation
     )
 
 
+def _unknown_evidenced_atom(
+    key: str,
+    label: str,
+    evidence_name: str,
+    *,
+    evidence: tuple[str, ...],
+    source_refs: tuple[str, ...],
+) -> _AtomicEvaluation:
+    return _AtomicEvaluation(
+        key=key,
+        label=label,
+        state=EvidenceState.UNKNOWN,
+        summary=f"{label}: explicit {evidence_name} evidence is unrecognized.",
+        evidence=evidence,
+        source_refs=source_refs,
+    )
+
+
 def _evidenced_atom(
     *,
     key: str,
@@ -660,13 +715,20 @@ def _canonical_location(value: str) -> str:
     return _LOCATION_ALIASES.get(normalized, normalized)
 
 
-def _canonical_eligibility(value: str) -> str:
+def _canonical_candidate_eligibility(value: str) -> str | None:
     normalized = _normalize(value)
-    padded = f" {normalized} "
-    for alias in sorted(_ELIGIBILITY_ALIASES, key=lambda item: (-len(item), item)):
-        if f" {alias} " in padded:
-            return _ELIGIBILITY_ALIASES[alias]
-    return normalized.replace(" ", "_")
+    for pattern, canonical in _CANDIDATE_ELIGIBILITY_PATTERNS:
+        if re.fullmatch(pattern, normalized):
+            return canonical
+    return None
+
+
+def _extract_required_eligibility(value: str) -> str | None:
+    normalized = _normalize(value)
+    for pattern, canonical in _REQUIREMENT_ELIGIBILITY_PATTERNS:
+        if re.search(pattern, normalized):
+            return canonical
+    return None
 
 
 def _parse_date(value: str | None) -> date | None:

@@ -1,5 +1,7 @@
 from collections.abc import Callable
 
+import pytest
+
 from app.candidates.schemas import CandidateProfile
 from app.jobs.schemas import ConfirmedScorecard, CriterionKind, ScorecardCriterion
 from app.matching.engine import MatchingEngine
@@ -170,3 +172,122 @@ def test_source_text_work_eligibility_matches_explicit_candidate_fact(
 
     assert result.classification == "main"
     assert _criterion("candidate_requirement", result).state is EvidenceState.SUPPORTED
+
+
+def test_explicit_negative_work_eligibility_fails_positive_must_have(
+    engine: MatchingEngine,
+    scorecard_factory: Callable[..., ConfirmedScorecard],
+    candidate_factory: Callable[..., CandidateProfile],
+) -> None:
+    scorecard = scorecard_factory(
+        criteria=[
+            ScorecardCriterion(
+                key="work_eligibility",
+                label="Authorized to work in the United States",
+                kind=CriterionKind.MUST_HAVE,
+            )
+        ]
+    )
+
+    result = engine.evaluate(
+        scorecard,
+        candidate_factory(
+            work_eligibility="Not authorized to work in the United States"
+        ),
+    )
+
+    evaluation = _criterion("work_eligibility", result)
+    assert evaluation.state is EvidenceState.FAILED
+    assert evaluation.points == 0
+    assert result.failed_must_haves == ("work_eligibility",)
+    assert result.classification == "near_match"
+
+
+@pytest.mark.parametrize(
+    "candidate_fact",
+    [
+        "Candidate is not currently authorized to work in the United States",
+        "Candidate is currently not authorized to work in the United States",
+    ],
+)
+def test_intervening_negation_never_becomes_positive_authorization(
+    engine: MatchingEngine,
+    scorecard_factory: Callable[..., ConfirmedScorecard],
+    candidate_factory: Callable[..., CandidateProfile],
+    candidate_fact: str,
+) -> None:
+    scorecard = scorecard_factory(
+        criteria=[
+            ScorecardCriterion(
+                key="work_eligibility",
+                label="Authorized to work in the United States",
+                kind=CriterionKind.MUST_HAVE,
+            )
+        ]
+    )
+
+    result = engine.evaluate(
+        scorecard, candidate_factory(work_eligibility=candidate_fact)
+    )
+
+    assert _criterion("work_eligibility", result).state is EvidenceState.FAILED
+    assert result.classification == "near_match"
+
+
+def test_unrecognized_work_eligibility_remains_unknown_with_zero_points(
+    engine: MatchingEngine,
+    scorecard_factory: Callable[..., ConfirmedScorecard],
+    candidate_factory: Callable[..., CandidateProfile],
+) -> None:
+    scorecard = scorecard_factory(
+        criteria=[
+            ScorecardCriterion(
+                key="work_eligibility",
+                label="Authorized to work in the United States",
+                kind=CriterionKind.MUST_HAVE,
+            )
+        ]
+    )
+    candidate_fact = "Eligibility status pending recruiter review"
+
+    result = engine.evaluate(
+        scorecard, candidate_factory(work_eligibility=candidate_fact)
+    )
+
+    evaluation = _criterion("work_eligibility", result)
+    assert evaluation.state is EvidenceState.UNKNOWN
+    assert evaluation.points == 0
+    assert evaluation.evidence == (candidate_fact,)
+    assert "work_eligibility" in result.unknown_keys
+    assert result.failed_must_haves == ()
+    assert result.classification == "main"
+
+
+def test_source_text_requirement_rejects_negated_candidate_fact(
+    engine: MatchingEngine,
+    scorecard_factory: Callable[..., ConfirmedScorecard],
+    candidate_factory: Callable[..., CandidateProfile],
+) -> None:
+    scorecard = scorecard_factory(
+        criteria=[
+            ScorecardCriterion(
+                key="candidate_requirement",
+                label="Candidate requirement",
+                kind=CriterionKind.MUST_HAVE,
+                source_text="Must be authorized to work in the United States",
+            )
+        ]
+    )
+
+    result = engine.evaluate(
+        scorecard,
+        candidate_factory(
+            work_eligibility=(
+                "Candidate is not currently authorized to work in the United States"
+            )
+        ),
+    )
+
+    assert _criterion("candidate_requirement", result).state is EvidenceState.FAILED
+    assert result.failed_must_haves == ("candidate_requirement",)
+    assert result.classification == "near_match"
