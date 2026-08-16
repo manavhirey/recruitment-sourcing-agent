@@ -12,6 +12,7 @@ class Settings(BaseSettings):
 
     environment: str = "development"
     database_url: str
+    migration_database_url: str | None = None
     redis_url: str
     object_store_endpoint: str
     object_store_bucket: str = "provider-snapshots"
