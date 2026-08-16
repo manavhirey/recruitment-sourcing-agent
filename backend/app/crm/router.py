@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.candidates.models import Candidate
+from app.candidates.models import Candidate, ContactPoint
 from app.core.config import Settings
 from app.core.database import get_db
 from app.crm.exports import export_shortlist_csv
@@ -445,6 +445,15 @@ def reveal_contact(
         if error.code == "contact_expired":
             session.commit()
         _raise_crm_error(error)
+    contact = session.get(ContactPoint, contact_point_id)
+    if contact is not None:
+        request.app.state.telemetry.emit(
+            "contact_revealed",
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            candidate_id=contact.candidate_id,
+            outcome="success",
+        )
     return ContactRevealResponse(id=contact_point_id, value=value)
 
 

@@ -89,6 +89,9 @@ def get_request_context(
         )
     )
     if membership is None:
+        metrics = getattr(request.app.state, "metrics", None)
+        if metrics is not None:
+            metrics.cross_tenant_denials.inc()
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "tenant_not_found"},
@@ -99,12 +102,14 @@ def get_request_context(
         if membership.allowed_client_ids is not None
         else None
     )
-    return RequestContext(
+    context = RequestContext(
         tenant_id=tenant_id,
         user_id=membership.user_id,
         role=membership.role,
         allowed_client_ids=allowed_client_ids,
     )
+    request.state.request_context = context
+    return context
 
 
 def require_role(*roles: Role) -> Callable[..., RequestContext]:

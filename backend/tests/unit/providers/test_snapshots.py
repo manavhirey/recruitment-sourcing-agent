@@ -8,6 +8,7 @@ import pytest
 from app.providers.snapshots import (
     SnapshotStore,
     configure_snapshot_lifecycle,
+    purge_snapshot_versions,
     validate_snapshot_reference,
 )
 
@@ -17,6 +18,8 @@ class FakeObjectStore:
         self.objects: dict[tuple[str, str], bytes] = {}
         self.put_calls: list[dict[str, object]] = []
         self.lifecycle: dict[str, object] | None = None
+        self.version_entries: list[dict[str, str]] = []
+        self.deleted_versions: list[str] = []
 
     def put_object(self, **kwargs: object) -> None:
         self.put_calls.append(kwargs)
@@ -25,7 +28,26 @@ class FakeObjectStore:
         )
 
     def delete_object(self, **kwargs: object) -> None:
+        if "VersionId" in kwargs:
+            version_id = str(kwargs["VersionId"])
+            self.deleted_versions.append(version_id)
+            self.version_entries = [
+                entry
+                for entry in self.version_entries
+                if entry["VersionId"] != version_id
+            ]
+            return
         self.objects.pop((str(kwargs["Bucket"]), str(kwargs["Key"])), None)
+
+    def list_object_versions(self, **kwargs: object) -> dict[str, object]:
+        key = str(kwargs["Prefix"])
+        return {
+            "Versions": [
+                entry for entry in self.version_entries if entry["Key"] == key
+            ],
+            "DeleteMarkers": [],
+            "IsTruncated": False,
+        }
 
     def head_object(self, **kwargs: object) -> dict[str, object]:
         key = (str(kwargs["Bucket"]), str(kwargs["Key"]))
@@ -87,6 +109,62 @@ def test_snapshot_path_components_are_validated_and_delete_is_idempotent() -> No
     assert not fake.objects
 
 
+def test_snapshot_delete_purges_every_version_so_privacy_data_cannot_return() -> None:
+    fake = FakeObjectStore()
+    store = _store(fake)
+    reference = f"{uuid4()}/{uuid4()}/apollo/request-versioned"
+    fake.version_entries = [
+        {"Key": reference, "VersionId": "version-1"},
+        {"Key": reference, "VersionId": "version-2"},
+    ]
+
+    store.delete(reference)
+
+    assert fake.version_entries == []
+    assert fake.deleted_versions == ["version-1", "version-2"]
+
+
+def test_version_purge_paginates_and_ignores_prefix_collisions() -> None:
+    fake = FakeObjectStore()
+    reference = f"{uuid4()}/{uuid4()}/apollo/request-versioned"
+    requests: list[dict[str, object]] = []
+
+    def list_versions(**kwargs: object) -> dict[str, object]:
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return {
+                "Versions": [
+                    {"Key": reference, "VersionId": "v1"},
+                    {"Key": f"{reference}-other", "VersionId": "foreign"},
+                ],
+                "IsTruncated": True,
+                "NextKeyMarker": reference,
+                "NextVersionIdMarker": "v1",
+            }
+        return {
+            "DeleteMarkers": [{"Key": reference, "VersionId": "marker"}],
+            "IsTruncated": False,
+        }
+
+    fake.list_object_versions = list_versions  # type: ignore[method-assign]
+
+    purge_snapshot_versions(fake, "snapshots", reference)
+
+    assert requests[1]["KeyMarker"] == reference
+    assert requests[1]["VersionIdMarker"] == "v1"
+    assert fake.deleted_versions == ["v1", "marker"]
+
+
+def test_snapshot_exists_checks_the_exact_encrypted_object() -> None:
+    fake = FakeObjectStore()
+    store = _store(fake)
+    reference = f"{uuid4()}/{uuid4()}/apollo/request"
+
+    assert store.exists(reference) is False
+    fake.objects[("snapshots", reference)] = b"encrypted"
+    assert store.exists(reference) is True
+
+
 def test_snapshot_lifecycle_uses_exactly_30_days() -> None:
     fake = FakeObjectStore()
 
@@ -101,6 +179,7 @@ def test_snapshot_lifecycle_uses_exactly_30_days() -> None:
                     "Status": "Enabled",
                     "Filter": {"Prefix": ""},
                     "Expiration": {"Days": 30},
+                    "NoncurrentVersionExpiration": {"NoncurrentDays": 30},
                 }
             ]
         },

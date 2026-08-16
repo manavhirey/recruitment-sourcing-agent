@@ -330,6 +330,7 @@ def acknowledge_notification(
 )
 def request_candidate_enrichment(
     run_candidate_id: UUID,
+    request: Request,
     context: Annotated[RequestContext, Depends(get_request_context)],
     session: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_app_settings)],
@@ -351,6 +352,9 @@ def request_candidate_enrichment(
         )
         session.commit()
     except SourcingError as error:
+        if error.code == "usage_budget_exhausted":
+            session.commit()
+            request.app.state.metrics.budget_exhaustion.inc()
         _raise_sourcing_error(error)
     if outcome.claim_token is not None:
         requested_by = enrichment.dispatch_requested_by_user_id

@@ -21,6 +21,7 @@ const contentSecurityPolicy = [
 
 const nextConfig: NextConfig = {
   agentRules: false,
+  output: "standalone",
   poweredByHeader: false,
   reactStrictMode: true,
   async headers() {

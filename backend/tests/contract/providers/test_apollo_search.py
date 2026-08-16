@@ -5,7 +5,7 @@ import httpx
 import pytest
 import respx
 
-from app.core.config import Settings
+from app.core.config import WorkerSettings
 from app.providers.apollo import APOLLO_PEOPLE_SEARCH_URL, ApolloGateway
 from app.providers.base import (
     ProviderAuthenticationError,
@@ -30,7 +30,7 @@ def provider_query() -> ProviderQuery:
 
 @pytest.fixture
 def apollo_gateway() -> Iterator[ApolloGateway]:
-    gateway = ApolloGateway(Settings.for_test())
+    gateway = ApolloGateway(WorkerSettings.for_test())
     yield gateway
     gateway.close()
 
@@ -298,9 +298,9 @@ def test_apollo_search_scopes_deduplication_to_a_gateway_run(
         )
     )
 
-    with ApolloGateway(Settings.for_test()) as first_run:
+    with ApolloGateway(WorkerSettings.for_test()) as first_run:
         first = first_run.search(provider_query, page=1)
-    with ApolloGateway(Settings.for_test()) as second_run:
+    with ApolloGateway(WorkerSettings.for_test()) as second_run:
         second = second_run.search(provider_query, page=1)
 
     assert [person.provider_person_id for person in first.people] == ["p1"]
@@ -343,7 +343,7 @@ def test_apollo_search_enforces_timeout_for_injected_client(
     )
 
     with httpx.Client(timeout=1.0) as client:
-        gateway = ApolloGateway(Settings.for_test(), client=client)
+        gateway = ApolloGateway(WorkerSettings.for_test(), client=client)
         gateway.search(provider_query, page=1)
 
     assert route.calls[0].request.extensions["timeout"] == {

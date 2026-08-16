@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -8,13 +9,15 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from app.core.config import LifecycleAdminSettings, Settings
+from app.core.config import LifecycleAdminSettings, WorkerSettings
 from app.maintenance_worker import celery_app as maintenance_celery_app
 from app.privacy import tasks as privacy_tasks
 from app.privacy.tasks import execute_privacy_deletion, resume_privacy_deletions
 from app.providers import snapshot_lifecycle_cli
 from app.providers.base import (
     ProviderAuthenticationError,
+    ProviderError,
+    ProviderPermissionError,
     ProviderRateLimited,
     ProviderTemporaryError,
 )
@@ -91,6 +94,38 @@ def test_clean_maintenance_worker_registers_only_maintenance_tasks() -> None:
     assert probe.returncode == 0, probe.stderr
 
 
+def test_clean_scheduler_process_has_only_broker_configuration() -> None:
+    backend_root = Path(__file__).resolve().parents[3]
+    probe_environment = os.environ.copy()
+    for name in (
+        "DATABASE_URL",
+        "MAINTENANCE_DATABASE_URL",
+        "OBJECT_STORE_DELETE_ACCESS_KEY_ID",
+        "OBJECT_STORE_DELETE_SECRET_ACCESS_KEY",
+        "APOLLO_API_KEY",
+    ):
+        probe_environment.pop(name, None)
+    probe_environment["REDIS_URL"] = "redis://scheduler-only/0"
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from app.scheduler import celery_app; "
+                "assert celery_app.conf.broker_url == 'redis://scheduler-only/0'; "
+                "assert len(celery_app.conf.beat_schedule) == 4"
+            ),
+        ],
+        cwd=backend_root,
+        env=probe_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+
+
 def test_worker_acknowledges_after_commit_and_limits_prefetch() -> None:
     assert celery_app.conf.task_acks_late is True
     assert celery_app.conf.task_acks_on_failure_or_timeout is False
@@ -98,6 +133,8 @@ def test_worker_acknowledges_after_commit_and_limits_prefetch() -> None:
     assert celery_app.conf.worker_prefetch_multiplier == 1
     assert celery_app.conf.task_serializer == "json"
     assert celery_app.conf.accept_content == ["json"]
+    assert getattr(celery_app, "_safe_telemetry_installed", False) is True
+    assert getattr(maintenance_celery_app, "_safe_telemetry_installed", False) is True
 
 
 def test_sourcing_tasks_use_late_acknowledgement_and_bounded_retries() -> None:
@@ -117,6 +154,229 @@ def test_sourcing_tasks_use_late_acknowledgement_and_bounded_retries() -> None:
     assert source_run.retry_jitter is True
 
 
+def test_disabled_platform_connector_short_circuits_source_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    observed: list[str] = []
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: False)
+    monkeypatch.setattr(
+        tasks,
+        "execute_source_run",
+        lambda *args, **kwargs: observed.append("provider_called"),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_mark_source_retry_exhausted",
+        lambda *args: observed.append("run_marked"),
+    )
+
+    source_run.run(str(run_id), str(tenant_id), str(user_id))
+
+    assert observed == ["run_marked"]
+
+
+def test_provider_authentication_failure_disables_shared_connector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    observed: list[tuple[str, str]] = []
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: True)
+    monkeypatch.setattr(tasks, "get_worker_settings", WorkerSettings.for_test)
+    monkeypatch.setattr(
+        tasks,
+        "execute_source_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ProviderAuthenticationError("authentication failed")
+        ),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "disable_provider",
+        lambda _sessions, provider, reason: observed.append((provider, reason)),
+    )
+    monkeypatch.setattr(tasks, "_mark_source_retry_exhausted", lambda *args: None)
+    monkeypatch.setattr(tasks, "_run_is_match_eligible", lambda *args: False)
+
+    source_run.run(str(run_id), str(tenant_id), str(user_id))
+
+    assert observed == [("apollo", "authentication_error")]
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected_disable"),
+    [
+        (ProviderPermissionError("permission denied"), "permission_error"),
+        (ProviderError("provider failed"), None),
+    ],
+)
+def test_source_terminal_provider_failures_mark_work_without_retrying(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_error: ProviderError,
+    expected_disable: str | None,
+) -> None:
+    observed: list[object] = []
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: True)
+    monkeypatch.setattr(tasks, "get_worker_settings", WorkerSettings.for_test)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise provider_error
+
+    monkeypatch.setattr(tasks, "execute_source_run", fail)
+    monkeypatch.setattr(
+        tasks,
+        "disable_provider",
+        lambda _sessions, provider, reason: observed.append((provider, reason)),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_mark_source_retry_exhausted",
+        lambda *args: observed.append("run_marked"),
+    )
+    monkeypatch.setattr(tasks, "_run_is_match_eligible", lambda *args: False)
+
+    source_run.run(str(uuid4()), str(uuid4()), str(uuid4()))
+
+    expected: list[object] = ["run_marked"]
+    if expected_disable is not None:
+        expected.insert(0, ("apollo", expected_disable))
+    assert observed == expected
+
+
+def test_disabled_connector_marks_enrichment_partial_without_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    observed: list[str] = []
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: False)
+    monkeypatch.setattr(
+        tasks,
+        "_mark_enrichment_provider_disabled",
+        lambda *args: observed.append("run_marked"),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "ApolloGateway",
+        lambda *args: observed.append("provider_called"),
+    )
+
+    enrich_run.run(str(run_id), str(tenant_id), str(user_id))
+
+    assert observed == ["run_marked"]
+
+
+def test_disabled_connector_fails_queued_enrichment_without_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    observed: list[str] = []
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: False)
+    monkeypatch.setattr(
+        tasks,
+        "_mark_enrichment_request_provider_disabled",
+        lambda *args: observed.append("request_marked"),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "ApolloGateway",
+        lambda *args: observed.append("provider_called"),
+    )
+
+    enrich_request.run(str(request_id), str(tenant_id), str(user_id))
+
+    assert observed == ["request_marked"]
+
+
+def test_disabled_connector_stops_enrichment_poll_without_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    observed: list[str] = []
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: False)
+    monkeypatch.setattr(
+        tasks,
+        "_mark_enrichment_request_provider_disabled",
+        lambda *args: observed.append("request_marked"),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "ApolloGateway",
+        lambda *args: observed.append("provider_called"),
+    )
+
+    poll_enrichment_result.run(str(request_id), str(tenant_id), str(user_id))
+
+    assert observed == ["request_marked"]
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "reason"),
+    [
+        (ProviderAuthenticationError, "authentication_error"),
+        (ProviderPermissionError, "permission_error"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("task", "operation", "marker"),
+    [
+        (enrich_run, "enqueue_top_enrichment", "_mark_enrichment_provider_disabled"),
+        (
+            enrich_request,
+            "execute_queued_enrichment_request",
+            "_mark_enrichment_request_provider_disabled",
+        ),
+        (
+            poll_enrichment_result,
+            "poll_enrichment_request",
+            "_mark_enrichment_request_provider_disabled",
+        ),
+    ],
+)
+def test_enrichment_authz_failures_disable_platform_before_future_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    task: object,
+    operation: str,
+    marker: str,
+    provider_error: type[Exception],
+    reason: str,
+) -> None:
+    observed: list[object] = []
+
+    class Gateway:
+        def close(self) -> None:
+            observed.append("gateway_closed")
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise provider_error("provider denied request")
+
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: True)
+    monkeypatch.setattr(tasks, "get_worker_settings", WorkerSettings.for_test)
+    monkeypatch.setattr(tasks, "_enrichment_dependencies", lambda *args: (None,) * 4)
+    monkeypatch.setattr(tasks, "ApolloGateway", lambda *args: Gateway())
+    monkeypatch.setattr(tasks, operation, fail)
+    monkeypatch.setattr(
+        tasks,
+        "disable_provider",
+        lambda _sessions, provider, disabled_reason: observed.append(
+            (provider, disabled_reason)
+        ),
+    )
+    monkeypatch.setattr(
+        tasks,
+        marker,
+        lambda *args: observed.append("work_marked"),
+    )
+    identifier, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+
+    task.run(str(identifier), str(tenant_id), str(user_id))
+
+    assert observed == [
+        ("apollo", reason),
+        "work_marked",
+        "gateway_closed",
+    ]
+
+
 def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -129,7 +389,8 @@ def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(
         def close(self) -> None:
             observed["closed"] = True
 
-    monkeypatch.setattr(tasks, "get_settings", Settings.for_test)
+    monkeypatch.setattr(tasks, "get_worker_settings", WorkerSettings.for_test)
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: True)
     monkeypatch.setattr(tasks, "ApolloGateway", lambda settings: Gateway())
     monkeypatch.setattr(
         tasks,
@@ -265,7 +526,7 @@ def test_provider_runtime_dependency_setup_has_no_bucket_admin_side_effect(
 
     monkeypatch.setattr("boto3.client", build_client)
 
-    settings = Settings.for_test()
+    settings = WorkerSettings.for_test()
     tasks._enrichment_dependencies(settings)
 
     assert received["aws_access_key_id"] == "test-writer-key"
@@ -276,10 +537,23 @@ def test_daily_maintenance_worker_uses_delete_only_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     received: dict[str, object] = {}
+    tenant_id, run_id, snapshot_id = uuid4(), uuid4(), uuid4()
+    reference = f"{tenant_id}/{run_id}/apollo/request"
+    claims = [[(snapshot_id, tenant_id, reference)], []]
+    deleted_versions: list[str | None] = []
+    completed: list[object] = []
 
     class DeleteOnlyObjectStore:
         def delete_object(self, **kwargs: object) -> None:
-            del kwargs
+            deleted_versions.append(kwargs.get("VersionId"))  # type: ignore[arg-type]
+
+        def list_object_versions(self, **kwargs: object) -> dict[str, object]:
+            key = str(kwargs["Prefix"])
+            return {
+                "Versions": [{"Key": key, "VersionId": "historical"}],
+                "DeleteMarkers": [{"Key": key, "VersionId": "marker"}],
+                "IsTruncated": False,
+            }
 
     class EmptySession:
         def __init__(self, engine: object) -> None:
@@ -293,7 +567,12 @@ def test_daily_maintenance_worker_uses_delete_only_credentials(
 
         def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
             del args, kwargs
-            return SimpleNamespace(all=list)
+            rows = claims.pop(0)
+            return SimpleNamespace(all=lambda: rows)
+
+        def scalar(self, statement: object, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            completed.append(statement)
 
         def commit(self) -> None:
             return None
@@ -319,6 +598,8 @@ def test_daily_maintenance_worker_uses_delete_only_credentials(
 
     assert received["aws_access_key_id"] == "test-delete-key"
     assert received["aws_secret_access_key"] == "test-delete-secret"
+    assert deleted_versions == ["historical", "marker"]
+    assert len(completed) == 1
     assert not hasattr(DeleteOnlyObjectStore(), "put_bucket_lifecycle_configuration")
 
 
@@ -379,7 +660,9 @@ def test_nonretryable_provider_failure_marks_run_failed(
     user_id = uuid4()
     marked: list[tuple[object, object, str]] = []
 
-    monkeypatch.setattr(tasks, "get_settings", lambda: object())
+    monkeypatch.setattr(tasks, "get_worker_settings", lambda: object())
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: True)
+    monkeypatch.setattr(tasks, "disable_provider", lambda *args: None)
 
     def fail_source(*args: object, **kwargs: object) -> None:
         raise ProviderAuthenticationError("provider authentication failed")
@@ -407,7 +690,8 @@ def test_source_wrapper_dispatches_match_for_eligible_partial_run(
     user_id = uuid4()
     dispatched: list[tuple[str, str, str, str]] = []
 
-    monkeypatch.setattr(tasks, "get_settings", lambda: object())
+    monkeypatch.setattr(tasks, "get_worker_settings", lambda: object())
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: True)
     monkeypatch.setattr(tasks, "execute_source_run", lambda *args, **kwargs: None)
     monkeypatch.setattr(tasks, "_run_is_match_eligible", lambda *args: True)
     monkeypatch.setattr(

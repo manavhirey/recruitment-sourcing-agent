@@ -57,6 +57,9 @@ class MemoryObjectStore:
     def delete_object(self, **kwargs: object) -> None:
         self.objects.pop((str(kwargs["Bucket"]), str(kwargs["Key"])), None)
 
+    def list_object_versions(self, **kwargs: object) -> dict[str, object]:
+        return {"Versions": [], "DeleteMarkers": [], "IsTruncated": False}
+
     def head_object(self, **kwargs: object) -> dict[str, object]:
         return {}
 
@@ -514,6 +517,7 @@ def test_budget_exhaustion_happens_before_provider_call(
         budget.max_enrichments = 0
         session.commit()
     gateway = RecordingGateway(scenario["factory"], scenario["run_id"])
+    budget_exhaustions: list[str] = []
 
     enqueue_top_enrichment(
         scenario["run_id"],
@@ -535,9 +539,11 @@ def test_budget_exhaustion_happens_before_provider_call(
         ),
         policy=RegionalContactPolicy(False, False),
         token_codec=CapabilityTokenCodec(b"webhook-key"),
+        on_budget_exhausted=lambda: budget_exhaustions.append("apollo"),
     )
 
     assert gateway.calls == []
+    assert budget_exhaustions == ["apollo"] * 5
     with scenario["factory"]() as session:
         run = session.get(SourcingRun, scenario["run_id"])
         assert run is not None and run.state is RunState.PARTIALLY_READY

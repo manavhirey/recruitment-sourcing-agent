@@ -12,6 +12,7 @@ from app.crm import models as crm_models  # noqa: F401
 from app.identity import models  # noqa: F401
 from app.jobs import models as job_models  # noqa: F401
 from app.privacy import models as privacy_models  # noqa: F401
+from app.providers import health as provider_health  # noqa: F401
 from app.sourcing import models as sourcing_models  # noqa: F401
 
 config = context.config

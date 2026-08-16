@@ -99,7 +99,7 @@ def test_0010_upgrade_downgrade_upgrade_and_model_parity(
     with owner_engine.begin() as connection:
         _grant_test_privileges(connection)
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0012_enrich_dispatch_recovery"
+            "0013_provider_connector_state"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -590,7 +590,7 @@ def test_contact_maintenance_anchors_shorter_policy_to_last_verified_or_used(
         assert point.encrypted_data_key is None
 
 
-def test_privacy_deletion_retries_after_object_is_already_missing_without_duplicate_audit(
+def test_privacy_deletion_purges_every_object_version_without_duplicate_audit(
     owner_engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -600,10 +600,18 @@ def test_privacy_deletion_retries_after_object_is_already_missing_without_duplic
 
     class AlreadyMissingObjectStore:
         def __init__(self) -> None:
-            self.delete_calls: list[str] = []
+            self.delete_calls: list[dict[str, object]] = []
 
         def delete_object(self, **kwargs: object) -> None:
-            self.delete_calls.append(str(kwargs["Key"]))
+            self.delete_calls.append(kwargs)
+
+        def list_object_versions(self, **kwargs: object) -> dict[str, object]:
+            key = str(kwargs["Prefix"])
+            return {
+                "Versions": [{"Key": key, "VersionId": "historical-v1"}],
+                "DeleteMarkers": [{"Key": key, "VersionId": "delete-marker"}],
+                "IsTruncated": False,
+            }
 
     objects = AlreadyMissingObjectStore()
     monkeypatch.setattr("boto3.client", lambda *args, **kwargs: objects)
@@ -612,7 +620,10 @@ def test_privacy_deletion_retries_after_object_is_already_missing_without_duplic
     privacy_tasks._run_privacy_deletion(settings, request_id, tenant_id)
     privacy_tasks._run_privacy_deletion(settings, request_id, tenant_id)
 
-    assert len(objects.delete_calls) == 1
+    assert {call["VersionId"] for call in objects.delete_calls} == {
+        "historical-v1",
+        "delete-marker",
+    }
     with Session(owner_engine) as session:
         request = session.get(PrivacyRequest, request_id)
         candidate = session.get(Candidate, candidate_id)

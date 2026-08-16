@@ -6,7 +6,7 @@ import httpx
 import pytest
 import respx
 
-from app.core.config import Settings
+from app.core.config import WorkerSettings
 from app.providers.apollo import (
     APOLLO_BULK_ENRICHMENT_URL,
     APOLLO_WEBHOOK_RESULT_URL,
@@ -22,7 +22,7 @@ from app.providers.base import (
 
 @pytest.fixture
 def gateway() -> Iterator[ApolloGateway]:
-    value = ApolloGateway(Settings.for_test())
+    value = ApolloGateway(WorkerSettings.for_test())
     yield value
     value.close()
 
@@ -101,7 +101,7 @@ def test_apollo_bulk_enrichment_sends_headers_flags_details_and_https_callback(
 def test_apollo_applies_configured_shorter_retention_to_normalized_contacts(
     respx_mock: respx.MockRouter,
 ) -> None:
-    settings = Settings.for_test().model_copy(
+    settings = WorkerSettings.for_test().model_copy(
         update={"apollo_contact_retention_days": 45}
     )
     gateway = ApolloGateway(settings)

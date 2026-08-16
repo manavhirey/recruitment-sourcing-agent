@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import MaintenanceSettings, get_maintenance_settings
 from app.maintenance_worker import celery_app
-from app.providers.snapshots import validate_snapshot_reference
+from app.providers.snapshots import purge_snapshot_versions, validate_snapshot_reference
 
 
 @celery_app.task(
@@ -100,14 +100,13 @@ def _run_privacy_deletion(
                     if target_tenant_id != tenant_id:
                         raise ValueError("snapshot target tenant mismatch")
                     validate_snapshot_reference(reference, tenant_id=tenant_id)
-                    client.delete_object(
-                        Bucket=settings.object_store_bucket,
-                        Key=reference,
+                    purge_snapshot_versions(
+                        client, settings.object_store_bucket, reference
                     )
                 except (FileNotFoundError, KeyError):
                     # S3 deletion is idempotent; an already-missing object is erased.
                     pass
-                except (BotoCoreError, ClientError, OSError, ValueError):
+                except (BotoCoreError, ClientError, OSError, TypeError, ValueError):
                     failure = True
                     with Session(engine) as session:
                         session.scalar(

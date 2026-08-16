@@ -1,10 +1,13 @@
+import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Self
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy.engine import make_url
@@ -13,9 +16,17 @@ from app.core.config import (
     LifecycleAdminSettings,
     MaintenanceSettings,
     MigrationSettings,
+    SchedulerSettings,
     Settings,
+    WorkerSettings,
 )
-from app.main import create_app
+from app.main import (
+    _dispatch_enrichment_request,
+    _dispatch_privacy_request,
+    _dispatch_sourcing_run,
+    _production_readiness_checks,
+    create_app,
+)
 
 
 def test_test_settings_supply_all_required_secrets() -> None:
@@ -26,6 +37,14 @@ def test_test_settings_supply_all_required_secrets() -> None:
     assert not hasattr(settings, "maintenance_database_url")
     assert not hasattr(settings, "object_store_delete_secret_access_key")
     assert not hasattr(settings, "object_store_lifecycle_admin_secret_access_key")
+    assert not hasattr(settings, "apollo_api_key")
+    worker = WorkerSettings.for_test()
+    assert hasattr(worker, "apollo_api_key")
+    assert not hasattr(worker, "oidc_issuer")
+    assert not hasattr(worker, "openai_api_key")
+    assert SchedulerSettings(_env_file=None, redis_url="redis://broker/0").model_dump() == {
+        "redis_url": "redis://broker/0"
+    }
 
 
 def test_object_store_capability_settings_expose_only_their_own_credentials() -> None:
@@ -180,6 +199,7 @@ OPENAI_API_KEY=development-openai-key
 APOLLO_API_KEY=development-apollo-key
 CONTACT_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 SUPPRESSION_HMAC_KEY=development-suppression-key
+TELEMETRY_HMAC_KEY=development-telemetry-key
 WEBHOOK_HMAC_KEY=development-webhook-key
 """
     )
@@ -208,3 +228,268 @@ def test_health_reports_ready() -> None:
     response = client.get("/health/ready")
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+def test_readiness_fails_closed_without_leaking_dependency_errors() -> None:
+    def unavailable() -> bool:
+        raise RuntimeError("postgresql://user:secret@database/private")
+
+    client = TestClient(
+        create_app(
+            Settings.for_test(),
+            readiness_checks={"database": unavailable, "broker": lambda: True},
+        )
+    )
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unavailable",
+        "components": {"broker": "ready", "database": "unavailable"},
+    }
+    assert "secret" not in response.text
+
+
+def test_production_readiness_probes_database_broker_and_object_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[str] = []
+
+    class Connection:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def scalar(self, statement: object) -> int:
+            observed.append("database_query")
+            return 1
+
+    class Engine:
+        def connect(self) -> Connection:
+            observed.append("database_connect")
+            return Connection()
+
+        def dispose(self) -> None:
+            observed.append("database_dispose")
+
+    class Broker:
+        def ping(self) -> bool:
+            observed.append("broker_ping")
+            return True
+
+        def close(self) -> None:
+            observed.append("broker_close")
+
+    class ObjectStore:
+        def head_bucket(self, *, Bucket: str) -> None:
+            observed.append(f"object_store:{Bucket}")
+
+    monkeypatch.setattr("sqlalchemy.create_engine", lambda *args, **kwargs: Engine())
+    monkeypatch.setattr("app.main.Redis.from_url", lambda *args, **kwargs: Broker())
+    monkeypatch.setattr("boto3.client", lambda *args, **kwargs: ObjectStore())
+    settings = Settings.for_test().model_copy(update={"environment": "production"})
+
+    checks = _production_readiness_checks(settings)
+
+    assert sorted(checks) == ["broker", "database", "object_store"]
+    assert all(check() for check in checks.values())
+    assert observed == [
+        "broker_ping",
+        "broker_close",
+        "database_connect",
+        "database_query",
+        "database_dispose",
+        "object_store:provider-snapshots",
+    ]
+
+
+def test_production_dispatchers_preserve_durable_task_identity_and_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from uuid import uuid4
+
+    from app.sourcing.tasks import enrich_request, plan_run
+    from app.worker import celery_app
+
+    observed: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        plan_run,
+        "apply_async",
+        lambda **kwargs: observed.append(("source", kwargs)),
+    )
+    monkeypatch.setattr(
+        enrich_request,
+        "apply_async",
+        lambda **kwargs: observed.append(("enrich", kwargs)),
+    )
+    monkeypatch.setattr(
+        celery_app,
+        "send_task",
+        lambda *args, **kwargs: observed.append(("privacy", (args, kwargs))),
+    )
+    identifier, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+
+    _dispatch_sourcing_run(identifier, tenant_id, user_id, "source-task-key")
+    _dispatch_enrichment_request(identifier, tenant_id, user_id, "enrich-task-key")
+    _dispatch_privacy_request(identifier, tenant_id)
+
+    assert observed == [
+        (
+            "source",
+            {
+                "args": (
+                    str(identifier),
+                    str(tenant_id),
+                    str(user_id),
+                    "plan",
+                ),
+                "task_id": "source-task-key",
+            },
+        ),
+        (
+            "enrich",
+            {
+                "args": (str(identifier), str(tenant_id), str(user_id)),
+                "task_id": "enrich-task-key",
+            },
+        ),
+        (
+            "privacy",
+            (
+                ("maintenance.execute_privacy_deletion",),
+                {
+                    "args": (str(identifier), str(tenant_id)),
+                    "queue": "maintenance",
+                },
+            ),
+        ),
+    ]
+
+
+def test_compose_processes_receive_only_their_required_capabilities() -> None:
+    compose_path = Path(__file__).resolve().parents[3] / "compose.yaml"
+    services = yaml.safe_load(compose_path.read_text())["services"]
+    forbidden = {
+        "api": {
+            "APOLLO_API_KEY",
+            "MIGRATION_DATABASE_URL",
+            "MAINTENANCE_DATABASE_URL",
+            "OBJECT_STORE_DELETE_SECRET_ACCESS_KEY",
+            "OBJECT_STORE_LIFECYCLE_ADMIN_SECRET_ACCESS_KEY",
+            "POSTGRES_PASSWORD",
+            "MINIO_ROOT_PASSWORD",
+        },
+        "worker": {
+            "OIDC_ISSUER",
+            "OIDC_AUDIENCE",
+            "OPENAI_API_KEY",
+            "MIGRATION_DATABASE_URL",
+            "MAINTENANCE_DATABASE_URL",
+            "OBJECT_STORE_DELETE_SECRET_ACCESS_KEY",
+            "OBJECT_STORE_LIFECYCLE_ADMIN_SECRET_ACCESS_KEY",
+            "POSTGRES_PASSWORD",
+            "MINIO_ROOT_PASSWORD",
+        },
+        "maintenance-worker": {
+            "DATABASE_URL",
+            "MIGRATION_DATABASE_URL",
+            "OBJECT_STORE_WRITER_SECRET_ACCESS_KEY",
+            "OBJECT_STORE_LIFECYCLE_ADMIN_SECRET_ACCESS_KEY",
+            "APOLLO_API_KEY",
+            "OPENAI_API_KEY",
+            "CONTACT_ENCRYPTION_KEY",
+            "SUPPRESSION_HMAC_KEY",
+            "POSTGRES_PASSWORD",
+            "MINIO_ROOT_PASSWORD",
+        },
+        "scheduler": {
+            "DATABASE_URL",
+            "MIGRATION_DATABASE_URL",
+            "MAINTENANCE_DATABASE_URL",
+            "OBJECT_STORE_WRITER_SECRET_ACCESS_KEY",
+            "OBJECT_STORE_DELETE_SECRET_ACCESS_KEY",
+            "OBJECT_STORE_LIFECYCLE_ADMIN_SECRET_ACCESS_KEY",
+            "APOLLO_API_KEY",
+            "OPENAI_API_KEY",
+            "CONTACT_ENCRYPTION_KEY",
+            "SUPPRESSION_HMAC_KEY",
+            "POSTGRES_PASSWORD",
+            "MINIO_ROOT_PASSWORD",
+        },
+        "web": {
+            "DATABASE_URL",
+            "MIGRATION_DATABASE_URL",
+            "MAINTENANCE_DATABASE_URL",
+            "OBJECT_STORE_WRITER_SECRET_ACCESS_KEY",
+            "OBJECT_STORE_DELETE_SECRET_ACCESS_KEY",
+            "OBJECT_STORE_LIFECYCLE_ADMIN_SECRET_ACCESS_KEY",
+            "APOLLO_API_KEY",
+            "OPENAI_API_KEY",
+            "CONTACT_ENCRYPTION_KEY",
+            "SUPPRESSION_HMAC_KEY",
+            "TELEMETRY_HMAC_KEY",
+            "WEBHOOK_HMAC_KEY",
+            "POSTGRES_PASSWORD",
+            "MINIO_ROOT_PASSWORD",
+        },
+    }
+
+    for service_name, forbidden_names in forbidden.items():
+        service = services[service_name]
+        assert "env_file" not in service
+        assert not forbidden_names.intersection(service.get("environment", {}))
+
+    assert "DATABASE_URL" in services["api"]["environment"]
+    assert "DATABASE_URL" in services["worker"]["environment"]
+    assert "MAINTENANCE_DATABASE_URL" in services["maintenance-worker"][
+        "environment"
+    ]
+    assert "AUTH_SECRET" in services["web"]["environment"]
+    for data_service in ("postgres", "redis", "minio", "prometheus"):
+        assert "ports" not in services[data_service]
+    assert services["scheduler"]["environment"] == {"REDIS_URL": "${REDIS_URL}"}
+    assert "--no-access-log" in services["api"]["command"]
+
+
+def test_rendered_compose_preserves_capability_and_port_isolation() -> None:
+    docker = shutil.which("docker")
+    if docker is None:
+        pytest.skip("Docker is required to resolve the production Compose model")
+    repository = Path(__file__).resolve().parents[3]
+    result = subprocess.run(
+        [
+            docker,
+            "compose",
+            "--env-file",
+            str(repository / ".env.example"),
+            "--profile",
+            "application",
+            "--profile",
+            "observability",
+            "-f",
+            str(repository / "compose.yaml"),
+            "config",
+            "--format",
+            "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    services = json.loads(result.stdout)["services"]
+
+    assert "APOLLO_API_KEY" not in services["api"]["environment"]
+    assert {
+        "OIDC_ISSUER",
+        "OIDC_AUDIENCE",
+        "OPENAI_API_KEY",
+    }.isdisjoint(services["worker"]["environment"])
+    assert "OBJECT_STORE_WRITER_SECRET_ACCESS_KEY" not in services[
+        "maintenance-worker"
+    ]["environment"]
+    assert set(services["scheduler"]["environment"]) == {"REDIS_URL"}
+    for service_name in ("postgres", "redis", "minio", "prometheus"):
+        assert "ports" not in services[service_name]

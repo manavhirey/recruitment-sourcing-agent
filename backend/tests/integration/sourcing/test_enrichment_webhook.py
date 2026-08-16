@@ -66,6 +66,9 @@ class MemoryObjectStore:
     def delete_object(self, **kwargs: object) -> None:
         self.objects.pop((str(kwargs["Bucket"]), str(kwargs["Key"])), None)
 
+    def list_object_versions(self, **kwargs: object) -> dict[str, object]:
+        return {"Versions": [], "DeleteMarkers": [], "IsTruncated": False}
+
     def head_object(self, **kwargs: object) -> dict[str, object]:
         if (str(kwargs["Bucket"]), str(kwargs["Key"])) not in self.objects:
             raise KeyError

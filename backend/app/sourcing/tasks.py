@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.audit.service import AuditService
 from app.candidates.contacts import ContactCipher
 from app.candidates.service import CandidateService
-from app.core.config import get_settings
+from app.core.config import get_worker_settings
 from app.core.database import session_factory as database_session_factory
 from app.crm.service import materialize_run_matches
 from app.identity.schemas import RequestContext, Role
@@ -23,17 +23,21 @@ from app.jobs.service import JobService
 from app.matching.engine import MatchingEngine
 from app.providers.apollo import ApolloGateway
 from app.providers.base import (
+    ProviderAuthenticationError,
     ProviderError,
+    ProviderPermissionError,
     ProviderQuery,
     ProviderRateLimited,
     ProviderTemporaryError,
     SearchPage,
 )
+from app.providers.health import disable_provider, is_provider_enabled
 from app.providers.query_planner import QueryPlanner
 from app.providers.snapshots import SnapshotStore
 from app.sourcing.enrichment import (
     DeferredEnrichment,
     RegionalContactPolicy,
+    _fail_request,
     enqueue_top_enrichment,
     execute_queued_enrichment_request,
     poll_enrichment_request,
@@ -71,6 +75,26 @@ def _provider_retry_countdown(
         return error.retry_after
     upper = min(300, 2 ** (retries + 1))
     return (jitter or (lambda value: random.randint(0, value)))(upper)
+
+
+def _record_provider_outcome(endpoint: str, outcome: str) -> None:
+    metrics = getattr(celery_app, "_platform_metrics", None)
+    if metrics is not None:
+        metrics.provider_requests.labels("apollo", endpoint, outcome).inc()
+    telemetry = getattr(celery_app, "_telemetry", None)
+    if telemetry is not None:
+        telemetry.emit(
+            "provider_request_completed",
+            provider="apollo",
+            provider_endpoint=endpoint,
+            outcome=outcome,
+        )
+
+
+def _record_budget_exhaustion() -> None:
+    metrics = getattr(celery_app, "_platform_metrics", None)
+    if metrics is not None:
+        metrics.budget_exhaustion.inc()
 
 
 def _apply_tenant_context(session: Session, tenant_id: UUID) -> None:
@@ -604,6 +628,7 @@ def _execute_source_run(
                         if error.code != "usage_budget_exhausted":
                             raise
                         budget_exhausted = True
+                        _record_budget_exhaustion()
                     session.commit()
                 if budget_exhausted:
                     page_number = None
@@ -688,6 +713,30 @@ def _mark_source_retry_exhausted(
             error=True,
         )
         session.commit()
+
+
+def _mark_enrichment_provider_disabled(run_id: UUID, context: RequestContext) -> None:
+    with database_session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        run = _load_run(session, run_id, context.tenant_id, for_update=True)
+        if run.state in (RunState.ENRICHING, RunState.PARTIALLY_READY):
+            if run.state is RunState.ENRICHING:
+                run.state = transition_run(run.state, RunState.PARTIALLY_READY)
+            run.current_stage = RunState.PARTIALLY_READY.value
+            run.error_code = "provider_connector_disabled"
+            run.error_message = "Contact enrichment is temporarily unavailable."
+        session.commit()
+
+
+def _mark_enrichment_request_provider_disabled(
+    request_id: UUID, context: RequestContext
+) -> None:
+    _fail_request(
+        database_session_factory,
+        context,
+        request_id,
+        error_code="provider_connector_disabled",
+    )
 
 
 def _run_is_match_eligible(
@@ -806,7 +855,11 @@ def source_run(
     idempotency_key: str = "source",
 ) -> None:
     context = _context(tenant_id, user_id)
-    settings = get_settings()
+    if not is_provider_enabled(database_session_factory, "apollo"):
+        _record_provider_outcome("people_search_run", "connector_disabled")
+        _mark_source_retry_exhausted(UUID(run_id), context, idempotency_key)
+        return
+    settings = get_worker_settings()
     try:
         execute_source_run(
             database_session_factory,
@@ -816,7 +869,24 @@ def source_run(
             idempotency_key=idempotency_key,
             propagate_provider_errors=True,
         )
+        _record_provider_outcome("people_search_run", "success")
+    except ProviderAuthenticationError:
+        disable_provider(
+            database_session_factory, "apollo", "authentication_error"
+        )
+        _record_provider_outcome("people_search_run", "authentication_error")
+        _mark_source_retry_exhausted(UUID(run_id), context, idempotency_key)
+    except ProviderPermissionError:
+        disable_provider(database_session_factory, "apollo", "permission_error")
+        _record_provider_outcome("people_search_run", "permission_error")
+        _mark_source_retry_exhausted(UUID(run_id), context, idempotency_key)
     except (ProviderRateLimited, ProviderTemporaryError) as error:
+        _record_provider_outcome(
+            "people_search_run",
+            "rate_limited"
+            if isinstance(error, ProviderRateLimited)
+            else "temporary_error",
+        )
         if self.request.retries >= self.max_retries:
             _mark_source_retry_exhausted(UUID(run_id), context, idempotency_key)
         else:
@@ -828,6 +898,7 @@ def source_run(
                 ),
             ) from error
     except ProviderError:
+        _record_provider_outcome("people_search_run", "provider_error")
         _mark_source_retry_exhausted(UUID(run_id), context, idempotency_key)
     if _run_is_match_eligible(database_session_factory, UUID(run_id), context):
         match_run.delay(run_id, tenant_id, user_id, "match")
@@ -880,8 +951,12 @@ def enrich_run(
     user_id: str,
     limit: int = 50,
 ) -> None:
-    settings = get_settings()
     context = _context(tenant_id, user_id)
+    if not is_provider_enabled(database_session_factory, "apollo"):
+        _record_provider_outcome("people_enrichment", "connector_disabled")
+        _mark_enrichment_provider_disabled(UUID(run_id), context)
+        return
+    settings = get_worker_settings()
     cipher, snapshots, policy, codec = _enrichment_dependencies(settings)
     gateway = ApolloGateway(settings)
     try:
@@ -896,7 +971,21 @@ def enrich_run(
             snapshot_store=snapshots,
             policy=policy,
             token_codec=codec,
+            on_budget_exhausted=_record_budget_exhaustion,
         )
+        _record_provider_outcome("people_enrichment", "success")
+    except ProviderAuthenticationError:
+        disable_provider(
+            database_session_factory, "apollo", "authentication_error"
+        )
+        _record_provider_outcome("people_enrichment", "authentication_error")
+        _mark_enrichment_provider_disabled(UUID(run_id), context)
+        return
+    except ProviderPermissionError:
+        disable_provider(database_session_factory, "apollo", "permission_error")
+        _record_provider_outcome("people_enrichment", "permission_error")
+        _mark_enrichment_provider_disabled(UUID(run_id), context)
+        return
     finally:
         gateway.close()
     for submission in submissions:
@@ -932,8 +1021,12 @@ def enrich_request(
     tenant_id: str,
     user_id: str,
 ) -> None:
-    settings = get_settings()
     context = _context(tenant_id, user_id)
+    if not is_provider_enabled(database_session_factory, "apollo"):
+        _record_provider_outcome("people_enrichment", "connector_disabled")
+        _mark_enrichment_request_provider_disabled(UUID(request_id), context)
+        return
+    settings = get_worker_settings()
     cipher, snapshots, policy, codec = _enrichment_dependencies(settings)
     gateway = ApolloGateway(settings)
     try:
@@ -948,6 +1041,19 @@ def enrich_request(
             policy=policy,
             token_codec=codec,
         )
+        _record_provider_outcome("people_enrichment", "success")
+    except ProviderAuthenticationError:
+        disable_provider(
+            database_session_factory, "apollo", "authentication_error"
+        )
+        _record_provider_outcome("people_enrichment", "authentication_error")
+        _mark_enrichment_request_provider_disabled(UUID(request_id), context)
+        return
+    except ProviderPermissionError:
+        disable_provider(database_session_factory, "apollo", "permission_error")
+        _record_provider_outcome("people_enrichment", "permission_error")
+        _mark_enrichment_request_provider_disabled(UUID(request_id), context)
+        return
     finally:
         gateway.close()
     if isinstance(submission, DeferredEnrichment):
@@ -975,19 +1081,37 @@ def poll_enrichment_result(
     tenant_id: str,
     user_id: str,
 ) -> None:
-    settings = get_settings()
+    context = _context(tenant_id, user_id)
+    if not is_provider_enabled(database_session_factory, "apollo"):
+        _record_provider_outcome("enrichment_poll", "connector_disabled")
+        _mark_enrichment_request_provider_disabled(UUID(request_id), context)
+        return
+    settings = get_worker_settings()
     cipher, snapshots, _, codec = _enrichment_dependencies(settings)
     gateway = ApolloGateway(settings)
     try:
         retry_after = poll_enrichment_request(
             database_session_factory,
             UUID(request_id),
-            _context(tenant_id, user_id),
+            context,
             gateway=gateway,
             token_codec=codec,
             snapshot_store=snapshots,
             contact_cipher=cipher,
         )
+        _record_provider_outcome("enrichment_poll", "success")
+    except ProviderAuthenticationError:
+        disable_provider(
+            database_session_factory, "apollo", "authentication_error"
+        )
+        _record_provider_outcome("enrichment_poll", "authentication_error")
+        _mark_enrichment_request_provider_disabled(UUID(request_id), context)
+        return
+    except ProviderPermissionError:
+        disable_provider(database_session_factory, "apollo", "permission_error")
+        _record_provider_outcome("enrichment_poll", "permission_error")
+        _mark_enrichment_request_provider_disabled(UUID(request_id), context)
+        return
     finally:
         gateway.close()
     if retry_after is not None:

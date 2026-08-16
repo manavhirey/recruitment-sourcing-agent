@@ -15,7 +15,10 @@ from starlette.concurrency import run_in_threadpool
 from app.audit.service import AuditService
 from app.candidates.contacts import ContactCipher, ContactService
 from app.candidates.models import SourceIdentity
-from app.core.config import Settings, get_settings
+from app.core.config import (
+    Settings,
+    get_enrichment_policy_settings,
+)
 from app.core.database import get_db
 from app.identity.dependencies import get_app_settings
 from app.identity.schemas import RequestContext, Role
@@ -380,10 +383,11 @@ def apply_enrichment_payload(
     if enrichment.provider_request_id is None:
         raise WebhookError("webhook_request_not_ready", 409)
     try:
+        policy_settings = get_enrichment_policy_settings()
         result = normalize_enrichment_payload(
             payload,
             expected_request_id=enrichment.provider_request_id,
-            contact_retention_days=get_settings().apollo_contact_retention_days,
+            contact_retention_days=policy_settings.apollo_contact_retention_days,
         )
     except (ProviderPayloadError, ValueError) as error:
         raise WebhookError("webhook_payload_invalid") from error
@@ -410,10 +414,11 @@ def apply_enrichment_payload(
         if terminal:
             _terminalize_existing_delivery(session, enrichment, result, existing.source)
         return
+    policy_settings = get_enrichment_policy_settings()
     suppression = suppression_service or SuppressionService(
         session,
-        get_settings().suppression_hmac_key.get_secret_value().encode(),
-        key_version=get_settings().suppression_hmac_key_version,
+        policy_settings.suppression_hmac_key.get_secret_value().encode(),
+        key_version=policy_settings.suppression_hmac_key_version,
     )
     suppressed: list[tuple[object, SuppressionIdentifier]] = []
     allowed_people = []

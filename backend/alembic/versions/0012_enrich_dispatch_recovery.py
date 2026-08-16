@@ -8,8 +8,9 @@ Create Date: 2026-08-16
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision: str = "0012_enrich_dispatch_recovery"
 down_revision: str | None = "0011_sourcing_dispatch_recovery"

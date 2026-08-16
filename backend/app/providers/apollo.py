@@ -7,7 +7,7 @@ from typing import Any, Self
 import httpx
 
 from app.clients.taxonomy import IndustryTaxonomy
-from app.core.config import Settings
+from app.core.config import WorkerSettings
 from app.core.log_redaction import install_sensitive_data_log_filters
 from app.providers.base import (
     EnrichedContactSet,
@@ -40,7 +40,7 @@ class ApolloGateway:
 
     def __init__(
         self,
-        settings: Settings,
+        settings: WorkerSettings,
         client: httpx.Client | None = None,
     ) -> None:
         install_sensitive_data_log_filters()

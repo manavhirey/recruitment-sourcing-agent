@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -7,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.audit.models import AuditEvent
 from app.candidates.contacts import ContactService
 from app.candidates.models import ContactPoint
+from app.core.telemetry import Telemetry, identifier_digest
 from app.crm.models import ActivityEvent
 from app.identity.models import IdentityIdempotencyKey
 from app.identity.schemas import RequestContext, Role
@@ -16,6 +18,10 @@ from app.providers.base import ProviderContact
 def test_reveal_updates_legitimate_use_audits_once_and_never_caches_plaintext(
     crm_api,
 ) -> None:
+    captured: list[dict[str, object]] = []
+    crm_api["api"].app.state.telemetry = Telemetry(
+        hmac_key=b"telemetry-test-key", sink=captured.append
+    )
     headers = {**crm_api["headers"], "Idempotency-Key": "reveal-priya-work-email"}
     url = f"/api/v1/contact-points/{crm_api['work_email_id']}/reveal"
 
@@ -65,6 +71,15 @@ def test_reveal_updates_legitimate_use_audits_once_and_never_caches_plaintext(
         )
         assert ledger is not None
         assert "priya@example.test" not in str(ledger.response_payload)
+    reveal_events = [event for event in captured if event["event"] == "contact_revealed"]
+    assert reveal_events
+    assert reveal_events[0]["user_hash"] == identifier_digest(
+        crm_api["recruiter_id"], b"telemetry-test-key"
+    )
+    assert reveal_events[0]["candidate_hash"] == identifier_digest(
+        crm_api["priya_id"], b"telemetry-test-key"
+    )
+    assert "priya@example.test" not in json.dumps(captured)
 
 
 def test_reveal_hides_ungranted_contact_existence_and_rejects_exact_expiry(

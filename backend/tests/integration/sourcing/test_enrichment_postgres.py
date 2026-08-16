@@ -126,7 +126,7 @@ def test_0007_to_head_upgrade_downgrade_and_model_parity(owner_engine: Engine) -
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0012_enrich_dispatch_recovery"
+            "0013_provider_connector_state"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -263,6 +263,7 @@ def test_maintenance_role_can_only_erase_due_contacts(
         ("maintenance_delete_claimed_snapshot", "EXECUTE"),
         ("maintenance_erase_due_contacts", "EXECUTE"),
         ("maintenance_record_snapshot_delete_failure", "EXECUTE"),
+        ("maintenance_stuck_run_count", "EXECUTE"),
         ("maintenance_claim_pending_sourcing_dispatches", "EXECUTE"),
         ("maintenance_complete_sourcing_dispatch", "EXECUTE"),
         ("maintenance_release_sourcing_dispatch", "EXECUTE"),
@@ -460,6 +461,9 @@ class ThreadSafeObjectStore:
     def delete_object(self, **kwargs: object) -> None:
         with self.lock:
             self.objects.pop((str(kwargs["Bucket"]), str(kwargs["Key"])), None)
+
+    def list_object_versions(self, **kwargs: object) -> dict[str, object]:
+        return {"Versions": [], "DeleteMarkers": [], "IsTruncated": False}
 
     def head_object(self, **kwargs: object) -> dict[str, object]:
         return {}
@@ -926,7 +930,7 @@ def _patch_celery_entry_dependencies(
     )
     monkeypatch.setattr(
         tasks,
-        "get_settings",
+        "get_worker_settings",
         lambda: type("S", (), {"webhook_base_url": "https://api.example.test"})(),
     )
     monkeypatch.setattr(tasks, "ApolloGateway", lambda settings: gateway)

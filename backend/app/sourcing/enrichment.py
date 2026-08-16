@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -141,6 +141,7 @@ def enqueue_top_enrichment(
     snapshot_store: SnapshotStore,
     policy: RegionalContactPolicy,
     token_codec: CapabilityTokenCodec,
+    on_budget_exhausted: Callable[[], None] | None = None,
 ) -> list[SubmittedEnrichment]:
     if not callback_base_url.startswith("https://"):
         raise ValueError("callback base URL must use HTTPS")
@@ -193,6 +194,7 @@ def enqueue_top_enrichment(
             reveal_personal,
             reveal_phone,
             codec,
+            on_budget_exhausted,
         )
         if prepared is None:
             continue
@@ -549,6 +551,7 @@ def _prepare_request(
     reveal_personal: bool,
     reveal_phone: bool,
     codec: CapabilityTokenCodec,
+    on_budget_exhausted: Callable[[], None] | None,
 ) -> tuple[UUID, str] | None:
     with _tenant_session(session_factory, context.tenant_id) as session:
         existing = session.scalar(
@@ -592,11 +595,15 @@ def _prepare_request(
                     "estimated_credits": len(candidate_ids) * 9,
                 },
             )
-        except SourcingError:
+        except SourcingError as error:
+            if error.code != "usage_budget_exhausted":
+                raise
             request.status = "failed"
             request.error_code = "usage_budget_exhausted"
             request.completed_at = datetime.now(UTC)
             session.commit()
+            if on_budget_exhausted is not None:
+                on_budget_exhausted()
             return None
         session.execute(
             update(RunCandidate)

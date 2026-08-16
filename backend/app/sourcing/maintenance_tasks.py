@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import MaintenanceSettings, get_maintenance_settings
 from app.maintenance_worker import celery_app
-from app.providers.snapshots import validate_snapshot_reference
+from app.providers.snapshots import purge_snapshot_versions, validate_snapshot_reference
 
 
 @celery_app.task(name="maintenance.reconcile_expired_snapshots", shared=False)
@@ -59,13 +59,15 @@ def _run_snapshot_reconciliation(settings: MaintenanceSettings) -> None:
             for snapshot_id, tenant_id, reference in rows:
                 try:
                     validate_snapshot_reference(reference, tenant_id=tenant_id)
-                    client.delete_object(
-                        Bucket=settings.object_store_bucket,
-                        Key=reference,
+                    purge_snapshot_versions(
+                        client, settings.object_store_bucket, reference
                     )
                 except (FileNotFoundError, KeyError):
                     pass
-                except (BotoCoreError, ClientError, OSError, ValueError):
+                except (BotoCoreError, ClientError, OSError, TypeError, ValueError):
+                    metrics = getattr(celery_app, "_platform_metrics", None)
+                    if metrics is not None:
+                        metrics.snapshot_expiry_failures.inc()
                     with Session(engine) as session:
                         session.scalar(
                             text(

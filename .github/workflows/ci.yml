@@ -1,0 +1,234 @@
+name: Release gates
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DATABASE_URL: postgresql+psycopg://sourcing_api:sourcing-api-test@127.0.0.1:5432/sourcing_test
+  MIGRATION_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/sourcing_test
+  MAINTENANCE_DATABASE_URL: postgresql+psycopg://sourcing_maintenance:sourcing-maintenance-test@127.0.0.1:5432/sourcing_test
+  TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/sourcing_test
+  TASK4_OWNER_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/sourcing_test
+  TASK4_API_DATABASE_URL: postgresql+psycopg://sourcing_api:sourcing-api-test@127.0.0.1:5432/sourcing_test
+  TASK6_OWNER_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/sourcing_test
+  TASK6_API_DATABASE_URL: postgresql+psycopg://sourcing_api:sourcing-api-test@127.0.0.1:5432/sourcing_test
+  TASK8_OWNER_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/sourcing_test
+  TASK8_API_DATABASE_URL: postgresql+psycopg://sourcing_api:sourcing-api-test@127.0.0.1:5432/sourcing_test
+  TASK9_OWNER_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/sourcing_test
+  TASK9_API_DATABASE_URL: postgresql+psycopg://sourcing_api:sourcing-api-test@127.0.0.1:5432/sourcing_test
+  TASK9_MAINTENANCE_DATABASE_URL: postgresql+psycopg://sourcing_maintenance:sourcing-maintenance-test@127.0.0.1:5432/sourcing_test
+  TASK10_OWNER_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/sourcing_test
+  TASK10_API_DATABASE_URL: postgresql+psycopg://sourcing_api:sourcing-api-test@127.0.0.1:5432/sourcing_test
+  TASK11_OWNER_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/sourcing_test
+  TASK11_API_DATABASE_URL: postgresql+psycopg://sourcing_api:sourcing-api-test@127.0.0.1:5432/sourcing_test
+  TASK11_MAINTENANCE_DATABASE_URL: postgresql+psycopg://sourcing_maintenance:sourcing-maintenance-test@127.0.0.1:5432/sourcing_test
+  TASK12_OWNER_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/sourcing_test
+  TASK12_API_DATABASE_URL: postgresql+psycopg://sourcing_api:sourcing-api-test@127.0.0.1:5432/sourcing_test
+  TASK12_MAINTENANCE_DATABASE_URL: postgresql+psycopg://sourcing_maintenance:sourcing-maintenance-test@127.0.0.1:5432/sourcing_test
+  REDIS_URL: redis://127.0.0.1:6379/15
+  OBJECT_STORE_ENDPOINT: http://127.0.0.1:9000
+  OBJECT_STORE_WRITER_ACCESS_KEY_ID: ci-writer
+  OBJECT_STORE_WRITER_SECRET_ACCESS_KEY: ci-writer-secret
+  OBJECT_STORE_DELETE_ACCESS_KEY_ID: ci-delete
+  OBJECT_STORE_DELETE_SECRET_ACCESS_KEY: ci-delete-secret
+  OBJECT_STORE_LIFECYCLE_ADMIN_ACCESS_KEY_ID: ci-lifecycle
+  OBJECT_STORE_LIFECYCLE_ADMIN_SECRET_ACCESS_KEY: ci-lifecycle-secret
+  OIDC_ISSUER: https://issuer.ci.invalid/
+  OIDC_AUDIENCE: sourcing-api
+  OPENAI_API_KEY: ci-not-a-live-key
+  APOLLO_API_KEY: ci-not-a-live-key
+  CONTACT_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  SUPPRESSION_HMAC_KEY: ci-suppression-key
+  TELEMETRY_HMAC_KEY: ci-telemetry-key
+  WEBHOOK_HMAC_KEY: ci-webhook-key
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sourcing_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d sourcing_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7.4.0-alpine@sha256:c35af3bbcef51a62c8bae5a9a563c6f1b60d7ebaea4cb5a3ccbcc157580ae098
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          version: "0.8.13"
+          enable-cache: true
+      - name: Create least-privilege database roles
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h 127.0.0.1 -U postgres -d sourcing_test -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE sourcing_api LOGIN PASSWORD 'sourcing-api-test';
+          CREATE ROLE sourcing_maintenance LOGIN PASSWORD 'sourcing-maintenance-test';
+          SQL
+      - run: uv sync --project backend --frozen
+      - name: Migration upgrade, one-step downgrade, and re-upgrade
+        working-directory: backend
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade -1
+          uv run alembic upgrade head
+      - run: uv run ruff check .
+        working-directory: backend
+      - run: uv run mypy app
+        working-directory: backend
+      - name: Backend tests and coverage
+        working-directory: backend
+        run: uv run pytest -v --cov=app --cov-report=term-missing --cov-fail-under=90
+      - name: Local isolated restore proof
+        env:
+          RESTORE_SOURCE_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/sourcing_test
+          RESTORE_ADMIN_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+          RESTORE_DATABASE_NAME: sourcing_restore_ci_${{ github.run_id }}
+        run: uv run --project backend python backend/scripts/restore_rehearsal.py
+
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          version: "0.8.13"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: uv sync --project backend --frozen
+      - run: npm ci
+        working-directory: web
+      - run: npm run lint
+        working-directory: web
+      - run: npm run typecheck
+        working-directory: web
+      - run: npm test -- --run
+        working-directory: web
+      - run: npm run test:a11y
+        working-directory: web
+      - run: npm run api:check
+        working-directory: web
+      - run: npx playwright install --with-deps chromium
+        working-directory: web
+      - run: npm run e2e
+        working-directory: web
+      - run: npm run e2e:production-preview
+        working-directory: web
+
+  evaluation-mechanics:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          version: "0.8.13"
+      - run: uv sync --project backend --frozen
+      - run: uv run --project backend pytest evaluation/test_evaluation_schema.py -v
+      - name: Synthetic mechanics baseline (not launch evidence)
+        run: >-
+          uv run --project backend python evaluation/evaluate_matching.py
+          --jobs evaluation/fixtures/synthetic_jobs.jsonl
+          --judgments evaluation/fixtures/synthetic_judgments.jsonl
+          --baseline evaluation/fixtures/synthetic-baseline.json
+          --fail-on-regression
+      - name: Validate Prometheus configuration and alert rules
+        run: >-
+          docker run --rm --entrypoint promtool
+          -v "$PWD/ops/prometheus:/etc/prometheus:ro"
+          prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+          check config /etc/prometheus/prometheus.yml
+      - name: Validate 25-tenant load scenario mechanics
+        run: |
+          node loadtests/test-tenant-mapping.mjs
+          node --check loadtests/k6-sourcing.js
+          docker run --rm -v "$PWD/loadtests:/loadtests:ro" grafana/k6@sha256:70af91f86cd8e142e0544a4edaf79835a80033f71974b92edd5ac36fd4442a7b inspect /loadtests/k6-sourcing.js
+
+  launch-evidence:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          version: "0.8.13"
+      - run: uv sync --project backend --frozen
+      - name: Require authentic recruiter-panel quality evidence
+        run: >-
+          uv run --project backend python evaluation/evaluate_matching.py
+          --require-recruiter-panel --fail-on-regression
+
+  supply-chain:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          version: "0.8.13"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.22.2"
+      - run: npm ci
+        working-directory: web
+      - run: npm audit --audit-level=high
+        working-directory: web
+      - name: Audit frozen Python dependency resolution
+        run: |
+          uv export --project backend --frozen --no-dev --no-emit-project --format requirements-txt --output-file /tmp/backend-requirements.txt
+          uvx --from pip-audit==2.9.0 pip-audit --requirement /tmp/backend-requirements.txt
+      - name: Secret scan
+        run: docker run --rm -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.28.0@sha256:cdbb7c955abce02001a9f6c9f602fb195b7fadc1e812065883f695d1eeaba854 detect --source=/repo --config=/repo/.gitleaks.toml --no-git --no-banner
+      - name: Build production images
+        run: |
+          docker build --pull -t sourcing-api:ci backend
+          docker build --pull -t sourcing-web:ci web
+      - name: Prove non-root and read-only runtime
+        run: |
+          test "$(docker image inspect sourcing-api:ci --format '{{.Config.User}}')" = "10001:10001"
+          test "$(docker image inspect sourcing-web:ci --format '{{.Config.User}}')" = "10001:10001"
+          docker run --rm --read-only --tmpfs /tmp --entrypoint python sourcing-api:ci -c 'import os; assert os.getuid() == 10001; open("/tmp/runtime-check", "w").write("ok")'
+          docker run --rm --read-only --tmpfs /tmp --entrypoint node sourcing-web:ci -e 'if (process.getuid() !== 10001) process.exit(1)'
+      - name: Container vulnerability scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.66.0@sha256:086971aaf400beebd94e8300fd8ea623774419597169156cec56eec5b00dfb1e image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed sourcing-api:ci
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.66.0@sha256:086971aaf400beebd94e8300fd8ea623774419597169156cec56eec5b00dfb1e image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed sourcing-web:ci
+      - run: git diff --check

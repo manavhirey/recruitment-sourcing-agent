@@ -24,6 +24,7 @@ SAFE_GENERATION_ENV = {
     "APOLLO_API_KEY": "openapi-generation-key",
     "CONTACT_ENCRYPTION_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     "SUPPRESSION_HMAC_KEY": "openapi-generation-suppression-key",
+    "TELEMETRY_HMAC_KEY": "openapi-generation-telemetry-key",
     "WEBHOOK_HMAC_KEY": "openapi-generation-webhook-key",
 }
 

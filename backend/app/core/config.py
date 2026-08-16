@@ -13,9 +13,9 @@ class _ObjectStoreAccessKeyIdentities(BaseSettings):
         env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
     )
 
-    object_store_writer_access_key_id: SecretStr
-    object_store_delete_access_key_id: SecretStr
-    object_store_lifecycle_admin_access_key_id: SecretStr
+    object_store_writer_access_key_id: SecretStr | None = None
+    object_store_delete_access_key_id: SecretStr | None = None
+    object_store_lifecycle_admin_access_key_id: SecretStr | None = None
 
 
 def _require_distinct_object_store_identity(
@@ -26,7 +26,9 @@ def _require_distinct_object_store_identity(
     identities = _ObjectStoreAccessKeyIdentities()
     supplied = identity.get_secret_value()
     other_values = {
-        getattr(identities, field).get_secret_value() for field in other_capabilities
+        value.get_secret_value()
+        for field in other_capabilities
+        if (value := getattr(identities, field)) is not None
     }
     if supplied in other_values:
         raise ValueError("object-store access-key identities must be distinct")
@@ -48,17 +50,14 @@ class Settings(BaseSettings):
     oidc_audience: str
     openai_api_key: SecretStr
     scorecard_model: str = "gpt-5-mini"
-    apollo_api_key: SecretStr
     contact_encryption_key: SecretStr
     suppression_hmac_key: SecretStr
+    telemetry_hmac_key: SecretStr
     suppression_hmac_key_version: str = "v1"
     webhook_hmac_key: SecretStr
     webhook_base_url: str = "https://localhost"
     webhook_max_body_bytes: int = 262_144
     webhook_trusted_proxy_ips: str = ""
-    apollo_reveal_personal_emails: bool = False
-    apollo_reveal_phone_numbers: bool = False
-    apollo_contact_retention_days: int = Field(default=180, ge=1, le=180)
 
     @model_validator(mode="after")
     def require_dedicated_writer_identity(self) -> "Settings":
@@ -86,11 +85,69 @@ class Settings(BaseSettings):
             oidc_issuer="https://issuer.test/",
             oidc_audience="sourcing-api",
             openai_api_key="test-openai-key",
-            apollo_api_key="test-apollo-key",
             contact_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             suppression_hmac_key="test-suppression-key",
+            telemetry_hmac_key="test-telemetry-key",
             webhook_hmac_key="test-webhook-key",
         )
+
+
+class WorkerSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
+    )
+
+    environment: str = "development"
+    database_url: str
+    redis_url: str
+    object_store_endpoint: str
+    object_store_bucket: str = "provider-snapshots"
+    object_store_writer_access_key_id: SecretStr
+    object_store_writer_secret_access_key: SecretStr
+    apollo_api_key: SecretStr
+    contact_encryption_key: SecretStr
+    suppression_hmac_key: SecretStr
+    telemetry_hmac_key: SecretStr
+    suppression_hmac_key_version: str = "v1"
+    webhook_hmac_key: SecretStr
+    webhook_base_url: str = "https://localhost"
+    apollo_reveal_personal_emails: bool = False
+    apollo_reveal_phone_numbers: bool = False
+    apollo_contact_retention_days: int = Field(default=180, ge=1, le=180)
+
+    @model_validator(mode="after")
+    def require_dedicated_writer_identity(self) -> "WorkerSettings":
+        _require_distinct_object_store_identity(
+            self.object_store_writer_access_key_id,
+            other_capabilities=(
+                "object_store_delete_access_key_id",
+                "object_store_lifecycle_admin_access_key_id",
+            ),
+        )
+        return self
+
+    @classmethod
+    def for_test(cls) -> "WorkerSettings":
+        values = Settings.for_test().model_dump()
+        return cls(**values, apollo_api_key="test-apollo-key")
+
+
+class EnrichmentPolicySettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
+    )
+
+    suppression_hmac_key: SecretStr
+    suppression_hmac_key_version: str = "v1"
+    apollo_contact_retention_days: int = Field(default=180, ge=1, le=180)
+
+
+class SchedulerSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
+    )
+
+    redis_url: str
 
 
 class MaintenanceSettings(BaseSettings):
@@ -104,6 +161,7 @@ class MaintenanceSettings(BaseSettings):
     object_store_bucket: str = "provider-snapshots"
     object_store_delete_access_key_id: SecretStr
     object_store_delete_secret_access_key: SecretStr
+    telemetry_hmac_key: SecretStr
 
     @model_validator(mode="after")
     def require_dedicated_maintenance_role(self) -> "MaintenanceSettings":
@@ -132,6 +190,7 @@ class MaintenanceSettings(BaseSettings):
             object_store_endpoint="http://localhost:9000",
             object_store_delete_access_key_id="test-delete-key",
             object_store_delete_secret_access_key="test-delete-secret",
+            telemetry_hmac_key="test-telemetry-key",
         )
 
 
@@ -194,6 +253,21 @@ class MigrationSettings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+@lru_cache
+def get_worker_settings() -> WorkerSettings:
+    return WorkerSettings()
+
+
+@lru_cache
+def get_enrichment_policy_settings() -> EnrichmentPolicySettings:
+    return EnrichmentPolicySettings()
+
+
+@lru_cache
+def get_scheduler_settings() -> SchedulerSettings:
+    return SchedulerSettings()
 
 
 @lru_cache

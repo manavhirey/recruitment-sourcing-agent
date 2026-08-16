@@ -23,6 +23,7 @@ from app.sourcing.models import (
     RunCandidate,
     SourcingRun,
     TenantNotification,
+    UsageBudget,
     UsageLedger,
 )
 from app.sourcing.state_machine import RunState
@@ -176,6 +177,7 @@ def sourcing_api(
             "job_id": job_id,
             "dispatcher": dispatcher,
             "enrichment_dispatcher": enrichment_dispatcher,
+            "metrics": app.state.metrics,
         }
     engine.dispose()
 
@@ -576,6 +578,78 @@ def test_on_demand_enrichment_is_authorized_budgeted_and_idempotent(
     with Session(sourcing_api["engine"]) as session:
         assert session.scalar(select(func.count()).select_from(EnrichmentRequest)) == 1
         assert session.scalar(select(func.count()).select_from(UsageLedger)) == 2
+
+
+def test_on_demand_budget_exhaustion_is_committed_and_counted(
+    sourcing_api: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api: TestClient = sourcing_api["api"]
+    headers = _headers(sourcing_api)
+    created = api.post(
+        f"/api/v1/jobs/{sourcing_api['job_id']}/runs",
+        headers={**headers, "Idempotency-Key": "budget-exhausted-run"},
+        json={},
+    )
+    run_id = UUID(created.json()["id"])
+    with Session(sourcing_api["engine"]) as session:
+        run = session.get(SourcingRun, run_id)
+        assert run is not None
+        run.state = RunState.READY
+        run.current_stage = RunState.READY.value
+        candidate = Candidate(
+            tenant_id=sourcing_api["tenant_id"],
+            full_name="Budget Exhausted Candidate",
+            normalized_name="budget exhausted candidate",
+        )
+        session.add(candidate)
+        session.flush()
+        row = RunCandidate(
+            tenant_id=sourcing_api["tenant_id"],
+            run_id=run.id,
+            candidate_id=candidate.id,
+            scorecard_version_id=run.scorecard_version_id,
+            match_score=1,
+            classification="main",
+            enrichment_status="failed",
+        )
+        session.add_all(
+            (
+                row,
+                UsageBudget(
+                    tenant_id=sourcing_api["tenant_id"],
+                    max_search_pages=None,
+                    max_enrichments=0,
+                    max_estimated_credits=None,
+                ),
+            )
+        )
+        session.commit()
+        run_candidate_id = row.id
+
+    monkeypatch.setattr(
+        "app.sourcing.service.SourcingService._has_usage_capacity",
+        lambda *args, **kwargs: True,
+    )
+    response = api.post(
+        f"/api/v1/job-candidates/{run_candidate_id}/enrich",
+        headers={**headers, "Idempotency-Key": "budget-exhausted-enrichment"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"code": "usage_budget_exhausted"}}
+    assert sourcing_api["metrics"].budget_exhaustion._value.get() == 1
+    assert sourcing_api["enrichment_dispatcher"].calls == []
+    with Session(sourcing_api["engine"]) as session:
+        run = session.get(SourcingRun, run_id)
+        assert run is not None and run.error_code == "usage_budget_exhausted"
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(TenantNotification)
+                .where(TenantNotification.run_id == run_id)
+            )
+            == 2
+        )
 
 
 def test_on_demand_enrichment_retries_pending_dispatch_with_the_same_key(

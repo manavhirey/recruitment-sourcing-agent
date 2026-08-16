@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -21,6 +22,8 @@ class ObjectStoreClient(Protocol):
     def delete_object(self, **kwargs: object) -> object: ...
 
     def head_object(self, **kwargs: object) -> object: ...
+
+    def list_object_versions(self, **kwargs: object) -> object: ...
 
     def put_bucket_lifecycle_configuration(self, **kwargs: object) -> object: ...
 
@@ -100,8 +103,7 @@ class SnapshotStore:
         return SnapshotReceipt(reference, checksum, timestamp, expires_at)
 
     def delete(self, reference: str) -> None:
-        validate_snapshot_reference(reference)
-        self._client.delete_object(Bucket=self._bucket, Key=reference)
+        purge_snapshot_versions(self._client, self._bucket, reference)
 
     def exists(self, reference: str) -> bool:
         validate_snapshot_reference(reference)
@@ -129,10 +131,50 @@ def configure_snapshot_lifecycle(client: ObjectStoreClient, bucket: str) -> None
                     "Status": "Enabled",
                     "Filter": {"Prefix": ""},
                     "Expiration": {"Days": _RETENTION_DAYS},
+                    "NoncurrentVersionExpiration": {
+                        "NoncurrentDays": _RETENTION_DAYS
+                    },
                 }
             ]
         },
     )
+
+
+def purge_snapshot_versions(
+    client: ObjectStoreClient, bucket: str, reference: str
+) -> None:
+    """Permanently remove the exact snapshot key, including hidden versions."""
+    validate_snapshot_reference(reference)
+    versions: list[str] = []
+    request: dict[str, object] = {"Bucket": bucket, "Prefix": reference}
+    while True:
+        response = client.list_object_versions(**request)
+        if not isinstance(response, Mapping):
+            raise TypeError("snapshot_version_listing_invalid")
+        for group in ("Versions", "DeleteMarkers"):
+            entries = response.get(group, [])
+            if not isinstance(entries, list):
+                raise TypeError("snapshot_version_listing_invalid")
+            for entry in entries:
+                if not isinstance(entry, Mapping) or entry.get("Key") != reference:
+                    continue
+                version_id = entry.get("VersionId")
+                if not isinstance(version_id, str) or not version_id:
+                    raise TypeError("snapshot_version_listing_invalid")
+                versions.append(version_id)
+        if response.get("IsTruncated") is not True:
+            break
+        next_key = response.get("NextKeyMarker")
+        next_version = response.get("NextVersionIdMarker")
+        if not isinstance(next_key, str) or not isinstance(next_version, str):
+            raise TypeError("snapshot_version_listing_invalid")
+        request["KeyMarker"] = next_key
+        request["VersionIdMarker"] = next_version
+    if not versions:
+        client.delete_object(Bucket=bucket, Key=reference)
+        return
+    for version_id in versions:
+        client.delete_object(Bucket=bucket, Key=reference, VersionId=version_id)
 
 
 def validate_snapshot_reference(

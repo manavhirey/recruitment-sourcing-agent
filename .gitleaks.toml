@@ -1,0 +1,16 @@
+title = "Recruitment sourcing secret scan"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Generated/ignored build and task-planning output only"
+paths = [
+  '''web/\.next/''',
+  '''\.superpowers/''',
+  '''web/playwright\.config\.ts$''',
+  '''web/playwright\.production\.config\.ts$''',
+  '''web/e2e/task-13-review\.spec\.ts$''',
+  '''web/tests/security/auth\.test\.ts$''',
+  '''web/tests/security/production-env\.test\.ts$''',
+]
