@@ -80,7 +80,7 @@ def test_0009_upgrade_downgrade_and_model_parity(owner_engine: Engine) -> None:
     with owner_engine.begin() as connection:
         _grant_api(connection)
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0009_crm"
+            "0010_privacy"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)

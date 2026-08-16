@@ -344,8 +344,14 @@ def _record_source_page(
         return
     service = CandidateService(session)
     remaining = max(0, _MAX_RUN_CANDIDATES - _candidate_count(session, run))
+    persisted_provider_ids: set[str] = set()
     for person in people[:remaining]:
         resolution = service.ingest(context, person)
+        if resolution.suppressed:
+            continue
+        if resolution.candidate_id is None:
+            raise RuntimeError("candidate ingestion did not return an identity")
+        persisted_provider_ids.add(person.provider_person_id)
         existing = session.scalar(
             select(RunCandidate.id).where(
                 RunCandidate.tenant_id == run.tenant_id,
@@ -368,7 +374,8 @@ def _record_source_page(
     checkpoint.completed_at = datetime.now(UTC)
     checkpoint.payload = {
         "candidate_count": run.candidate_count,
-        "provider_person_ids": sorted({person.provider_person_id for person in people}),
+        "provider_person_ids": sorted(persisted_provider_ids),
+        "suppressed_count": len(people[:remaining]) - len(persisted_provider_ids),
     }
 
 

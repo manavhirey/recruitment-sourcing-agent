@@ -48,6 +48,7 @@ class ApolloGateway:
         self._client = client or httpx.Client(timeout=20.0)
         self._owns_client = client is None
         self._seen_provider_ids: set[str] = set()
+        self._contact_retention_days = settings.apollo_contact_retention_days
 
     def __enter__(self) -> Self:
         return self
@@ -161,7 +162,11 @@ class ApolloGateway:
         _raise_for_status(response)
         document = _response_document(response)
         request_id = _enrichment_request_id(document)
-        result = normalize_enrichment_payload(document, expected_request_id=request_id)
+        result = normalize_enrichment_payload(
+            document,
+            expected_request_id=request_id,
+            contact_retention_days=self._contact_retention_days,
+        )
         charged_credits = _charged_credits(document, len(people))
         assert charged_credits is not None
         return EnrichmentReceipt(
@@ -205,7 +210,11 @@ class ApolloGateway:
             if error_code in allowed:
                 raise ProviderPayloadError(f"provider enrichment {error_code}")
         _raise_for_status(response)
-        return normalize_enrichment_payload(document, expected_request_id=request_id)
+        return normalize_enrichment_payload(
+            document,
+            expected_request_id=request_id,
+            contact_retention_days=self._contact_retention_days,
+        )
 
 
 def _request_id(headers: httpx.Headers) -> str | None:
@@ -248,7 +257,10 @@ def _charged_credits(document: Mapping[str, Any], fallback: int | None) -> int |
 
 
 def normalize_enrichment_payload(
-    payload: Mapping[str, Any], *, expected_request_id: str
+    payload: Mapping[str, Any],
+    *,
+    expected_request_id: str,
+    contact_retention_days: int = 180,
 ) -> EnrichmentResult:
     supplied_request_id = payload.get("request_id")
     actual_request_id = (
@@ -259,7 +271,9 @@ def normalize_enrichment_payload(
     if supplied_request_id is not None and actual_request_id != expected_request_id:
         raise ProviderPayloadError("provider enrichment request ID does not match")
     raw_people = _enriched_people(payload)
-    people = tuple(_enriched_person(value) for value in raw_people)
+    people = tuple(
+        _enriched_person(value, contact_retention_days) for value in raw_people
+    )
     return EnrichmentResult(
         provider="apollo",
         request_id=actual_request_id,
@@ -282,7 +296,7 @@ def _enriched_people(document: Mapping[str, Any]) -> list[object]:
     return []
 
 
-def _enriched_person(value: object) -> EnrichedContactSet:
+def _enriched_person(value: object, retention_days: int) -> EnrichedContactSet:
     if not isinstance(value, dict):
         raise ProviderPayloadError("provider enriched person must be an object")
     nested = value.get("person")
@@ -290,7 +304,9 @@ def _enriched_person(value: object) -> EnrichedContactSet:
         if not isinstance(nested, dict):
             raise ProviderPayloadError("provider enriched person must be an object")
         value = nested
-    contacts = tuple(_email_contacts(value) + _phone_contacts(value))
+    contacts = tuple(
+        _email_contacts(value, retention_days) + _phone_contacts(value, retention_days)
+    )
     return EnrichedContactSet(
         provider_person_id=_required_string(value, "id"),
         contacts=contacts,
@@ -306,7 +322,9 @@ def _enriched_company(person: Mapping[str, object]) -> str | None:
     return _optional_string(organization, "name")
 
 
-def _email_contacts(person: Mapping[str, object]) -> list[ProviderContact]:
+def _email_contacts(
+    person: Mapping[str, object], retention_days: int
+) -> list[ProviderContact]:
     contacts: list[ProviderContact] = []
     primary = _optional_string(person, "email")
     if primary:
@@ -316,6 +334,7 @@ def _email_contacts(person: Mapping[str, object]) -> list[ProviderContact]:
                 value=primary,
                 classification="work",
                 verification_state=_verification(person.get("email_status")),
+                retention_days=retention_days,
             )
         )
     raw_personal = person.get("personal_emails", [])
@@ -330,12 +349,15 @@ def _email_contacts(person: Mapping[str, object]) -> list[ProviderContact]:
                 value=value.strip(),
                 classification="personal",
                 verification_state="verified",
+                retention_days=retention_days,
             )
         )
     return contacts
 
 
-def _phone_contacts(person: Mapping[str, object]) -> list[ProviderContact]:
+def _phone_contacts(
+    person: Mapping[str, object], retention_days: int
+) -> list[ProviderContact]:
     raw_phones = person.get("phone_numbers", [])
     if not isinstance(raw_phones, list):
         raise ProviderPayloadError("provider phone numbers must be a list")
@@ -365,6 +387,7 @@ def _phone_contacts(person: Mapping[str, object]) -> list[ProviderContact]:
                 verification_state=_verification(
                     phone.get("status_cd", phone.get("status"))
                 ),
+                retention_days=retention_days,
             )
         )
     return contacts

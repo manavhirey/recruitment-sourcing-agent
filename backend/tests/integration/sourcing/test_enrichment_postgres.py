@@ -126,7 +126,7 @@ def test_0007_to_head_upgrade_downgrade_and_model_parity(owner_engine: Engine) -
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0009_crm"
+            "0010_privacy"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -262,6 +262,7 @@ def test_maintenance_role_can_only_erase_due_contacts(
         ("maintenance_claim_expired_snapshots", "EXECUTE"),
         ("maintenance_delete_claimed_snapshot", "EXECUTE"),
         ("maintenance_erase_due_contacts", "EXECUTE"),
+        ("maintenance_record_snapshot_delete_failure", "EXECUTE"),
     }
 
 
@@ -872,7 +873,7 @@ def test_maintenance_snapshot_functions_only_claim_and_delete_due_references(
     with Session(engine) as session:
         claimed = session.execute(
             text(
-                "SELECT snapshot_id, object_reference "
+                "SELECT snapshot_id, tenant_id, object_reference "
                 "FROM maintenance_claim_expired_snapshots(100)"
             )
         ).all()
@@ -880,6 +881,7 @@ def test_maintenance_snapshot_functions_only_claim_and_delete_due_references(
         assert claimed == [
             (
                 expired_id,
+                tenant_id,
                 f"{tenant_id}/{run_id}/apollo/expired-snapshot",
             )
         ]

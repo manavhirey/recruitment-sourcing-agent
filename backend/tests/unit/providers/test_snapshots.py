@@ -3,7 +3,13 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from app.providers.snapshots import SnapshotStore, configure_snapshot_lifecycle
+import pytest
+
+from app.providers.snapshots import (
+    SnapshotStore,
+    configure_snapshot_lifecycle,
+    validate_snapshot_reference,
+)
 
 
 class FakeObjectStore:
@@ -99,3 +105,12 @@ def test_snapshot_lifecycle_uses_exactly_30_days() -> None:
             ]
         },
     }
+
+
+def test_snapshot_reference_can_be_bound_to_expected_tenant_namespace() -> None:
+    expected_tenant = uuid4()
+    other_tenant = uuid4()
+    reference = f"{other_tenant}/{uuid4()}/apollo/request-1"
+
+    with pytest.raises(ValueError, match="tenant namespace"):
+        validate_snapshot_reference(reference, tenant_id=expected_tenant)

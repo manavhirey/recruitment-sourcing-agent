@@ -135,12 +135,16 @@ def configure_snapshot_lifecycle(client: ObjectStoreClient, bucket: str) -> None
     )
 
 
-def validate_snapshot_reference(reference: str) -> None:
+def validate_snapshot_reference(
+    reference: str, *, tenant_id: UUID | None = None
+) -> None:
     components = reference.split("/")
     if len(components) != 4:
         raise ValueError("snapshot reference is invalid")
-    UUID(components[0])
+    reference_tenant_id = UUID(components[0])
     UUID(components[1])
+    if tenant_id is not None and reference_tenant_id != tenant_id:
+        raise ValueError("snapshot reference tenant namespace is invalid")
     if not all(_SAFE_PATH_COMPONENT.fullmatch(value) for value in components[2:]):
         raise ValueError("snapshot reference is invalid")
 

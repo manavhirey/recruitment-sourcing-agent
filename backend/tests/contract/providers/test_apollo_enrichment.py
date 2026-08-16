@@ -98,6 +98,40 @@ def test_apollo_bulk_enrichment_sends_headers_flags_details_and_https_callback(
     assert dict(receipt.charged_units)["estimated_credits"] == 2
 
 
+def test_apollo_applies_configured_shorter_retention_to_normalized_contacts(
+    respx_mock: respx.MockRouter,
+) -> None:
+    settings = Settings.for_test().model_copy(
+        update={"apollo_contact_retention_days": 45}
+    )
+    gateway = ApolloGateway(settings)
+    respx_mock.post(APOLLO_BULK_ENRICHMENT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "request_id": 123,
+                "matches": [
+                    {
+                        "id": "person-0",
+                        "email": "configured@example.test",
+                        "email_status": "verified",
+                    }
+                ],
+            },
+        )
+    )
+
+    try:
+        receipt = gateway.enrich_batch(
+            _people(1), "https://callbacks.test/webhooks/apollo/opaque"
+        )
+    finally:
+        gateway.close()
+
+    assert receipt.result is not None
+    assert receipt.result.people[0].contacts[0].retention_days == 45
+
+
 def test_apollo_bulk_enrichment_rejects_non_https_callback(
     gateway: ApolloGateway,
 ) -> None:

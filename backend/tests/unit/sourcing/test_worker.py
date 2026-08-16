@@ -10,6 +10,8 @@ from sqlalchemy.exc import OperationalError
 
 from app.core.config import LifecycleAdminSettings, Settings
 from app.maintenance_worker import celery_app as maintenance_celery_app
+from app.privacy import tasks as privacy_tasks
+from app.privacy.tasks import execute_privacy_deletion, resume_privacy_deletions
 from app.providers import snapshot_lifecycle_cli
 from app.providers.base import (
     ProviderAuthenticationError,
@@ -70,7 +72,9 @@ def test_clean_maintenance_worker_registers_only_maintenance_tasks() -> None:
             (
                 "from app.maintenance_worker import celery_app; "
                 "required={'maintenance.reconcile_expired_snapshots',"
-                "'maintenance.expire_contact_points'}; "
+                "'maintenance.expire_contact_points',"
+                "'maintenance.execute_privacy_deletion',"
+                "'maintenance.resume_privacy_deletions'}; "
                 "missing=required-set(celery_app.tasks); "
                 "assert not missing, sorted(missing); "
                 "assert 'sourcing.plan_run' not in celery_app.tasks"
@@ -115,6 +119,8 @@ def test_maintenance_tasks_are_isolated_on_a_dedicated_worker_and_queue() -> Non
     assert celery_app.conf.beat_schedule == {}
     assert "maintenance.reconcile_expired_snapshots" in maintenance_celery_app.tasks
     assert "maintenance.expire_contact_points" in maintenance_celery_app.tasks
+    assert "maintenance.execute_privacy_deletion" in maintenance_celery_app.tasks
+    assert "maintenance.resume_privacy_deletions" in maintenance_celery_app.tasks
     assert "sourcing.plan_run" not in maintenance_celery_app.tasks
 
     entry = maintenance_celery_app.conf.beat_schedule[
@@ -128,7 +134,12 @@ def test_maintenance_tasks_are_isolated_on_a_dedicated_worker_and_queue() -> Non
         "contact-point-expiration"
     ]
     assert contact_entry["task"] == expire_contact_points.name
-    assert str(contact_entry["schedule"]) == "<crontab: 15 2 * * * (m/h/dM/MY/d)>"
+    assert str(contact_entry["schedule"]) == "<crontab: 0 2 * * * (m/h/dM/MY/d)>"
+    privacy_entry = maintenance_celery_app.conf.beat_schedule[
+        "privacy-deletion-resumption"
+    ]
+    assert privacy_entry["task"] == resume_privacy_deletions.name
+    assert str(privacy_entry["schedule"]) == "<crontab: 0 2 * * * (m/h/dM/MY/d)>"
     assert maintenance_celery_app.conf.task_routes == {
         "maintenance.*": {"queue": "maintenance"}
     }
@@ -158,6 +169,38 @@ def test_maintenance_tasks_use_only_narrow_maintenance_database_url(
     expire_contact_points.run()
 
     assert opened == [settings.maintenance_database_url] * 2
+
+
+def test_privacy_deletion_task_retries_indefinitely_when_cleanup_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id, tenant_id = uuid4(), uuid4()
+    observed: dict[str, object] = {}
+
+    class RetryRequested(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        privacy_tasks,
+        "get_maintenance_settings",
+        privacy_tasks.MaintenanceSettings.for_test,
+    )
+    monkeypatch.setattr(
+        privacy_tasks,
+        "_run_privacy_deletion",
+        lambda *_args: False,
+    )
+
+    def retry(**kwargs: object) -> None:
+        observed.update(kwargs)
+        raise RetryRequested
+
+    monkeypatch.setattr(execute_privacy_deletion, "retry", retry)
+
+    with pytest.raises(RetryRequested):
+        execute_privacy_deletion.run(str(request_id), str(tenant_id))
+
+    assert observed == {"countdown": 60, "max_retries": None}
 
 
 def test_provider_runtime_dependency_setup_has_no_bucket_admin_side_effect(

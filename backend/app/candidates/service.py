@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.audit.service import AuditService
 from app.candidates.models import (
     Candidate,
     CandidateExperience,
@@ -24,7 +25,9 @@ from app.candidates.schemas import (
     CandidateProfile,
     ResolutionResult,
 )
+from app.core.config import get_settings
 from app.identity.schemas import RequestContext
+from app.privacy.service import SuppressionService
 from app.providers.base import ProviderExperience, ProviderPerson
 
 _DISPLAY_FIELDS = (
@@ -37,9 +40,19 @@ _DISPLAY_FIELDS = (
 
 
 class CandidateService:
-    def __init__(self, session: Session) -> None:
+    def __init__(
+        self,
+        session: Session,
+        *,
+        suppression_service: SuppressionService | None = None,
+    ) -> None:
         self.session = session
         self.resolver = CandidateResolver(session)
+        self.suppression = suppression_service or SuppressionService(
+            session,
+            get_settings().suppression_hmac_key.get_secret_value().encode(),
+            key_version=get_settings().suppression_hmac_key_version,
+        )
 
     def ingest(
         self,
@@ -51,6 +64,24 @@ class CandidateService:
     ) -> ResolutionResult:
         if not 0 <= confidence <= 1:
             raise ValueError("confidence must be between 0 and 1")
+        suppressed_by = self.suppression.match_person(
+            context.tenant_id, provider_person
+        )
+        if suppressed_by is not None:
+            AuditService(self.session).record(
+                tenant_id=context.tenant_id,
+                actor_user_id=context.user_id,
+                event_key=f"suppressed-import:{suppressed_by.id}",
+                action="candidate.import_suppressed",
+                entity_type="suppression_identifier",
+                entity_id=suppressed_by.id,
+                payload={
+                    "identifier_type": suppressed_by.identifier_type,
+                    "key_version": suppressed_by.key_version,
+                },
+            )
+            self.session.flush()
+            return ResolutionResult.suppressed_result()
         timestamp = _as_utc(source_timestamp or datetime.now(UTC))
         normalized_url = normalize_profile_url(provider_person.linkedin_url)
         self._lock_identity(

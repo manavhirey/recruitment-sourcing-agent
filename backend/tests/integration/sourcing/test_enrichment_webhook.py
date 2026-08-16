@@ -23,18 +23,24 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
 
+from app.audit.models import AuditEvent
 from app.candidates.contacts import ContactCipher
 from app.candidates.models import Candidate, ContactPoint, SourceIdentity
 from app.clients.models import ClientCompany
 from app.core.config import Settings
 from app.core.database import Base, get_db
 from app.identity.models import Tenant, User
+from app.identity.schemas import RequestContext, Role
 from app.jobs.models import Job, ScorecardVersion
 from app.main import create_app
+from app.privacy.models import PrivacyRequest, SuppressionIdentifier
+from app.privacy.schemas import PrivacyRequestState, PrivacyRequestType
+from app.privacy.service import PrivacyService, SuppressionService
 from app.providers.snapshots import SnapshotStore
 from app.sourcing import webhooks as webhooks_module
 from app.sourcing.models import (
     EnrichmentRequest,
+    ProviderSnapshot,
     RunCandidate,
     SourcingRun,
     WebhookDelivery,
@@ -283,6 +289,173 @@ def test_duplicate_webhook_is_applied_once(
     assert all(
         b"2125550112" not in body for body in scenario["objects"].objects.values()
     )
+
+
+def test_suppressed_webhook_is_fenced_before_snapshot_or_contact_persistence(
+    webhook_scenario: dict[str, Any], apollo_phone_payload: dict[str, object]
+) -> None:
+    scenario = webhook_scenario
+    settings = Settings.for_test()
+    with Session(scenario["engine"]) as session:
+        enrichment = session.get(EnrichmentRequest, scenario["request_id"])
+        candidate = session.get(Candidate, scenario["candidate_id"])
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert enrichment is not None and candidate is not None and run is not None
+        request = PrivacyRequest(
+            tenant_id=enrichment.tenant_id,
+            candidate_id=candidate.id,
+            request_type=PrivacyRequestType.DELETION,
+            state=PrivacyRequestState.COMPLETED,
+            submitted_by_user_id=run.started_by_user_id,
+        )
+        session.add(request)
+        session.flush()
+        suppression = SuppressionService(
+            session,
+            settings.suppression_hmac_key.get_secret_value().encode(),
+        )
+        session.add(
+            SuppressionIdentifier(
+                tenant_id=enrichment.tenant_id,
+                privacy_request_id=request.id,
+                identifier_type="phone",
+                key_version=suppression.key_version,
+                digest=suppression.digest_bytes(
+                    enrichment.tenant_id, "phone", "+1 212 555 0112"
+                ),
+            )
+        )
+        session.commit()
+
+    response = scenario["api"].post(
+        f"/webhooks/apollo/{scenario['token']}",
+        json=apollo_phone_payload,
+    )
+
+    assert response.status_code == 202
+    with Session(scenario["engine"]) as session:
+        assert session.scalar(select(func.count()).select_from(ContactPoint)) == 0
+        assert session.scalar(select(func.count()).select_from(ProviderSnapshot)) == 0
+        assert session.scalar(select(func.count()).select_from(WebhookDelivery)) == 1
+        audit = session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "candidate.import_suppressed")
+        )
+        assert audit is not None
+        serialized = json.dumps(audit.payload).casefold()
+        assert "2125550112" not in serialized
+        assert "person-1" not in serialized
+    assert scenario["objects"].objects == {}
+
+
+def test_mixed_suppressed_webhook_preserves_unsuppressed_batch_member(
+    webhook_scenario: dict[str, Any], apollo_phone_payload: dict[str, object]
+) -> None:
+    scenario = webhook_scenario
+    settings = Settings.for_test()
+    with Session(scenario["engine"]) as session:
+        enrichment = session.get(EnrichmentRequest, scenario["request_id"])
+        run = session.get(SourcingRun, scenario["run_id"])
+        candidate = session.get(Candidate, scenario["candidate_id"])
+        assert enrichment is not None and run is not None and candidate is not None
+        second = Candidate(
+            tenant_id=enrichment.tenant_id,
+            full_name="Allowed Candidate",
+            normalized_name="allowed candidate",
+        )
+        session.add(second)
+        session.flush()
+        session.add_all(
+            (
+                SourceIdentity(
+                    tenant_id=enrichment.tenant_id,
+                    candidate_id=second.id,
+                    provider="apollo",
+                    provider_person_id="person-2",
+                    source_timestamp=datetime.now(UTC),
+                    confidence=1,
+                ),
+                RunCandidate(
+                    tenant_id=enrichment.tenant_id,
+                    run_id=run.id,
+                    candidate_id=second.id,
+                    scorecard_version_id=run.scorecard_version_id,
+                    match_score=90,
+                    classification="main",
+                    enrichment_status="pending",
+                ),
+            )
+        )
+        enrichment.candidate_ids = [str(candidate.id), str(second.id)]
+        privacy = PrivacyService(
+            session,
+            settings.suppression_hmac_key.get_secret_value().encode(),
+            scenario["contact_cipher"],
+        )
+        context = RequestContext(
+            tenant_id=enrichment.tenant_id,
+            user_id=run.started_by_user_id,
+            role=Role.OWNER,
+        )
+        request = privacy.submit(
+            context,
+            candidate_id=candidate.id,
+            request_type=PrivacyRequestType.DELETION,
+            idempotency_key="late-mixed-submit",
+        )
+        privacy.verify(context, request.id, idempotency_key="late-mixed-verify")
+        privacy.approve(context, request.id, idempotency_key="late-mixed-approve")
+        completed = privacy.execute_delete(
+            context,
+            request.id,
+            idempotency_key="late-mixed-execute",
+        )
+        assert completed.state is PrivacyRequestState.COMPLETED
+        assert (
+            session.scalar(
+                select(SourceIdentity).where(
+                    SourceIdentity.candidate_id == candidate.id
+                )
+            )
+            is None
+        )
+        second_id = second.id
+
+    people = apollo_phone_payload["people"]
+    assert isinstance(people, list)
+    people.append(
+        {
+            "id": "person-2",
+            "phone_numbers": [
+                {
+                    "raw_number": "+1 646 555 0199",
+                    "type_cd": "work",
+                    "status_cd": "valid_number",
+                }
+            ],
+        }
+    )
+    response = scenario["api"].post(
+        f"/webhooks/apollo/{scenario['token']}", json=apollo_phone_payload
+    )
+
+    assert response.status_code == 202
+    with Session(scenario["engine"]) as session:
+        points = session.scalars(select(ContactPoint)).all()
+        assert len(points) == 1
+        assert points[0].candidate_id == second_id
+        rows = {
+            row.candidate_id: row for row in session.scalars(select(RunCandidate)).all()
+        }
+        assert rows[scenario["candidate_id"]].enrichment_status == "unavailable"
+        assert rows[second_id].enrichment_status == "available"
+        snapshot = session.scalar(select(ProviderSnapshot))
+        assert snapshot is not None
+        payload = _decrypt_snapshot(
+            snapshot.object_reference,
+            scenario["objects"].objects[("snapshots", snapshot.object_reference)],
+        )
+        assert "person-1" not in json.dumps(payload)
+        assert "person-2" in json.dumps(payload)
 
 
 def test_webhook_rejects_provider_person_outside_bound_request(

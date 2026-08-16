@@ -8,17 +8,19 @@ from typing import Annotated, Any, Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.audit.service import AuditService
 from app.candidates.contacts import ContactCipher, ContactService
 from app.candidates.models import SourceIdentity
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.database import get_db
 from app.identity.dependencies import get_app_settings
 from app.identity.schemas import RequestContext, Role
+from app.privacy.models import SuppressionIdentifier
+from app.privacy.service import SuppressionService
 from app.providers.apollo import normalize_enrichment_payload
 from app.providers.base import EnrichmentResult, ProviderPayloadError
 from app.providers.snapshots import SnapshotStore
@@ -293,6 +295,11 @@ def _process_webhook_delivery(
             payload,
             snapshot_store=_snapshot_store(request),
             contact_cipher=_contact_cipher(request),
+            suppression_service=SuppressionService(
+                session,
+                settings.suppression_hmac_key.get_secret_value().encode(),
+                key_version=settings.suppression_hmac_key_version,
+            ),
             source="webhook",
         )
         session.commit()
@@ -311,6 +318,7 @@ def apply_capability_payload(
     *,
     snapshot_store: SnapshotStore,
     contact_cipher: ContactCipher,
+    suppression_service: SuppressionService | None = None,
     source: str,
 ) -> None:
     tenant_id = codec.tenant_id(token)
@@ -337,6 +345,7 @@ def apply_capability_payload(
         codec=codec,
         snapshot_store=snapshot_store,
         contact_cipher=contact_cipher,
+        suppression_service=suppression_service,
         source=source,
     )
 
@@ -349,6 +358,7 @@ def apply_enrichment_payload(
     codec: CapabilityTokenCodec,
     snapshot_store: SnapshotStore,
     contact_cipher: ContactCipher,
+    suppression_service: SuppressionService | None = None,
     source: str,
     terminal: bool = True,
 ) -> None:
@@ -371,7 +381,9 @@ def apply_enrichment_payload(
         raise WebhookError("webhook_request_not_ready", 409)
     try:
         result = normalize_enrichment_payload(
-            payload, expected_request_id=enrichment.provider_request_id
+            payload,
+            expected_request_id=enrichment.provider_request_id,
+            contact_retention_days=get_settings().apollo_contact_retention_days,
         )
     except (ProviderPayloadError, ValueError) as error:
         raise WebhookError("webhook_payload_invalid") from error
@@ -386,11 +398,6 @@ def apply_enrichment_payload(
     identity_by_provider_id = {
         identity.provider_person_id: identity for identity in identities
     }
-    if any(
-        person.provider_person_id not in identity_by_provider_id
-        for person in result.people
-    ):
-        raise WebhookError("webhook_payload_invalid")
     payload_hmac = codec.payload_digest(payload, enrichment.tenant_id)
     existing = session.scalar(
         select(WebhookDelivery).where(
@@ -403,6 +410,45 @@ def apply_enrichment_payload(
         if terminal:
             _terminalize_existing_delivery(session, enrichment, result, existing.source)
         return
+    suppression = suppression_service or SuppressionService(
+        session,
+        get_settings().suppression_hmac_key.get_secret_value().encode(),
+        key_version=get_settings().suppression_hmac_key_version,
+    )
+    suppressed: list[tuple[object, SuppressionIdentifier]] = []
+    allowed_people = []
+    for person in result.people:
+        digests = suppression.identifiers_for_enrichment(
+            enrichment.tenant_id,
+            enrichment.provider,
+            person,
+        )
+        suppressed_by = suppression.match_digests(
+            enrichment.tenant_id,
+            digests,
+        )
+        if suppressed_by is None:
+            allowed_people.append(person)
+        else:
+            if person.provider_person_id not in identity_by_provider_id:
+                provider_type = f"provider_id:{enrichment.provider.casefold()}"
+                provider_suppression = suppression.match_digests(
+                    enrichment.tenant_id,
+                    tuple(
+                        item
+                        for item in digests
+                        if item.identifier_type == provider_type
+                    ),
+                )
+                if provider_suppression is None:
+                    raise WebhookError("webhook_payload_invalid")
+                suppressed_by = provider_suppression
+            suppressed.append((person, suppressed_by))
+    if any(
+        person.provider_person_id not in identity_by_provider_id
+        for person in allowed_people
+    ):
+        raise WebhookError("webhook_payload_invalid")
     delivery = WebhookDelivery(
         tenant_id=enrichment.tenant_id,
         enrichment_request_id=enrichment.id,
@@ -411,12 +457,28 @@ def apply_enrichment_payload(
     )
     session.add(delivery)
     session.flush()
+    if not allowed_people and suppressed:
+        _apply_suppressed_enrichment(
+            session,
+            enrichment,
+            result,
+            delivery,
+            suppressed[0][1],
+            source=source,
+            terminal=terminal,
+        )
+        return
+    allowed_provider_ids = {person.provider_person_id for person in allowed_people}
     snapshot = snapshot_store.put(
         tenant_id=enrichment.tenant_id,
         run_id=enrichment.run_id,
         provider=enrichment.provider,
         request_id=enrichment.provider_request_id,
-        payload=_snapshot_payload_for_request(result.snapshot_payload, enrichment),
+        payload=_snapshot_payload_for_request(
+            result.snapshot_payload,
+            enrichment,
+            allowed_provider_ids=allowed_provider_ids,
+        ),
     )
     reference = session.scalar(
         select(ProviderSnapshot).where(
@@ -453,7 +515,7 @@ def apply_enrichment_payload(
         user_id=_run_actor(session, enrichment),
         role=Role.OWNER,
     )
-    for person in result.people:
+    for person in allowed_people:
         identity = identity_by_provider_id[person.provider_person_id]
         for contact in person.contacts:
             if contact.kind == "phone" and not enrichment.reveal_phone_number:
@@ -498,11 +560,81 @@ def apply_enrichment_payload(
         entity_id=enrichment.id,
         payload={"source": source, "candidate_count": len(found_candidates)},
     )
+    if suppressed:
+        _record_suppressed_enrichment_audit(
+            session,
+            enrichment,
+            delivery,
+            [row for _person, row in suppressed],
+        )
+    session.flush()
+
+
+def _record_suppressed_enrichment_audit(
+    session: Session,
+    enrichment: EnrichmentRequest,
+    delivery: WebhookDelivery,
+    suppressed_by: list[SuppressionIdentifier],
+) -> None:
+    first = suppressed_by[0]
+    AuditService(session).record(
+        tenant_id=enrichment.tenant_id,
+        run_id=enrichment.run_id,
+        actor_user_id=None,
+        event_key=f"suppressed-enrichment:{enrichment.id}:{delivery.payload_hmac}",
+        action="candidate.import_suppressed",
+        entity_type="suppression_identifier",
+        entity_id=first.id,
+        payload={
+            "identifier_types": sorted({row.identifier_type for row in suppressed_by}),
+            "key_versions": sorted({row.key_version for row in suppressed_by}),
+            "suppressed_count": len(suppressed_by),
+        },
+    )
+
+
+def _apply_suppressed_enrichment(
+    session: Session,
+    enrichment: EnrichmentRequest,
+    result: EnrichmentResult,
+    delivery: WebhookDelivery,
+    suppressed_by: SuppressionIdentifier,
+    *,
+    source: str,
+    terminal: bool,
+) -> None:
+    context = RequestContext(
+        tenant_id=enrichment.tenant_id,
+        user_id=_run_actor(session, enrichment),
+        role=Role.OWNER,
+    )
+    now = datetime.now(UTC)
+    session.execute(
+        update(RunCandidate)
+        .where(
+            RunCandidate.tenant_id == enrichment.tenant_id,
+            RunCandidate.run_id == enrichment.run_id,
+            RunCandidate.candidate_id.in_(
+                [UUID(value) for value in enrichment.candidate_ids]
+            ),
+        )
+        .values(enrichment_status="unavailable", enriched_at=now)
+    )
+    delivery.applied_at = now
+    enrichment.status = "completed" if terminal else "pending"
+    enrichment.completed_at = now if terminal else None
+    if terminal:
+        _reconcile_terminal_usage(session, enrichment, context, result, source)
+        _finalize_run(session, enrichment)
+    _record_suppressed_enrichment_audit(session, enrichment, delivery, [suppressed_by])
     session.flush()
 
 
 def _snapshot_payload_for_request(
-    payload: dict[str, object], enrichment: EnrichmentRequest
+    payload: dict[str, object],
+    enrichment: EnrichmentRequest,
+    *,
+    allowed_provider_ids: set[str] | None = None,
 ) -> dict[str, object]:
     denied_keys: set[str] = set()
     if not enrichment.reveal_personal_emails:
@@ -525,7 +657,32 @@ def _snapshot_payload_for_request(
 
     sanitized = sanitize(payload)
     assert isinstance(sanitized, dict)
+    if allowed_provider_ids is not None:
+        for key in ("people", "matches"):
+            raw_people = sanitized.get(key)
+            if isinstance(raw_people, list):
+                sanitized[key] = [
+                    person
+                    for person in raw_people
+                    if _snapshot_person_id(person) in allowed_provider_ids
+                ]
+        raw_person = sanitized.get("person")
+        if (
+            raw_person is not None
+            and _snapshot_person_id(raw_person) not in allowed_provider_ids
+        ):
+            sanitized.pop("person", None)
     return sanitized
+
+
+def _snapshot_person_id(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    nested = value.get("person")
+    if isinstance(nested, dict):
+        value = nested
+    identifier = value.get("id")
+    return identifier if isinstance(identifier, str) else None
 
 
 def _terminalize_existing_delivery(

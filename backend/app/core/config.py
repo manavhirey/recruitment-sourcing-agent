@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 
@@ -51,12 +51,14 @@ class Settings(BaseSettings):
     apollo_api_key: SecretStr
     contact_encryption_key: SecretStr
     suppression_hmac_key: SecretStr
+    suppression_hmac_key_version: str = "v1"
     webhook_hmac_key: SecretStr
     webhook_base_url: str = "https://localhost"
     webhook_max_body_bytes: int = 262_144
     webhook_trusted_proxy_ips: str = ""
     apollo_reveal_personal_emails: bool = False
     apollo_reveal_phone_numbers: bool = False
+    apollo_contact_retention_days: int = Field(default=180, ge=1, le=180)
 
     @model_validator(mode="after")
     def require_dedicated_writer_identity(self) -> "Settings":

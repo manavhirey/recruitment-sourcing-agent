@@ -55,6 +55,7 @@ class ProviderContact:
     verification_state: str = "unverified"
     confidence: float = 1.0
     observed_at: datetime | None = None
+    retention_days: int | None = None
 
 
 @dataclass(frozen=True)

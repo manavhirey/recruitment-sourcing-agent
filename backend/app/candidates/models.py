@@ -319,6 +319,10 @@ class ContactPoint(Base):
             "confidence >= 0 AND confidence <= 1",
             name="ck_contact_points_confidence",
         ),
+        CheckConstraint(
+            "retention_days >= 1 AND retention_days <= 180",
+            name="ck_contact_points_retention_days",
+        ),
         CheckConstraint("schema_version > 0", name="ck_contact_points_schema_version"),
     )
 
@@ -346,6 +350,7 @@ class ContactPoint(Base):
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
+    retention_days: Mapped[int] = mapped_column(Integer, nullable=False, default=180)
     expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False

@@ -7,7 +7,7 @@ settings = get_maintenance_settings()
 celery_app = Celery(
     "recruitment_sourcing_maintenance",
     broker=settings.redis_url,
-    include=("app.sourcing.maintenance_tasks",),
+    include=("app.sourcing.maintenance_tasks", "app.privacy.tasks"),
 )
 celery_app.conf.update(
     accept_content=["json"],
@@ -28,9 +28,14 @@ celery_app.conf.update(
         },
         "contact-point-expiration": {
             "task": "maintenance.expire_contact_points",
-            "schedule": crontab(hour=2, minute=15),
+            "schedule": crontab(hour=2, minute=0),
+        },
+        "privacy-deletion-resumption": {
+            "task": "maintenance.resume_privacy_deletions",
+            "schedule": crontab(hour=2, minute=0),
         },
     },
 )
 
+from app.privacy import tasks as _privacy_tasks  # noqa: F401
 from app.sourcing import maintenance_tasks as _maintenance_tasks  # noqa: F401

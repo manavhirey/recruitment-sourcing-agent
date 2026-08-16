@@ -28,6 +28,7 @@ from app.providers.base import ProviderContact
 
 _SCHEMA_VERSION = 1
 _CONTACT_RETENTION = timedelta(days=180)
+_MAX_CONTACT_RETENTION_DAYS = 180
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,7 @@ class ContactService:
         last_verified_at = (
             observed_at if contact.verification_state == "verified" else None
         )
+        retention_days = _retention_days(contact.retention_days)
         if point is not None and processing_time >= _utc(point.expires_at):
             tombstone = _erase_contact(self.session, point, processing_time)
         if tombstone is not None and tombstone.retired_at is not None:
@@ -250,7 +252,9 @@ class ContactService:
                 schema_version=encrypted.schema_version,
                 observed_at=observed_at,
                 last_verified_at=last_verified_at,
-                expires_at=(last_verified_at or observed_at) + _CONTACT_RETENTION,
+                expires_at=(last_verified_at or observed_at)
+                + timedelta(days=retention_days),
+                retention_days=retention_days,
             )
             self.session.add(point)
             self.session.flush()
@@ -276,10 +280,12 @@ class ContactService:
             point.observed_at = observed_at
             point.last_verified_at = observed_at
             point.last_used_at = None
-            point.expires_at = observed_at + _CONTACT_RETENTION
+            point.retention_days = min(point.retention_days, retention_days)
+            point.expires_at = observed_at + timedelta(days=point.retention_days)
             point.expired_at = None
             tombstone.retired_at = None
         elif observed_at >= _utc(point.observed_at):
+            previous_expiry = _utc(point.expires_at)
             point.classification = contact.classification
             point.verification_state = contact.verification_state
             point.confidence = contact.confidence
@@ -290,19 +296,26 @@ class ContactService:
             point.key_nonce = encrypted.key_nonce
             point.schema_version = encrypted.schema_version
             point.observed_at = observed_at
+            point.retention_days = min(point.retention_days, retention_days)
             if last_verified_at is not None and (
                 point.last_verified_at is None
                 or last_verified_at > _utc(point.last_verified_at)
             ):
                 point.last_verified_at = last_verified_at
-                point.expires_at = (
-                    max(
-                        value
-                        for value in (point.last_verified_at, point.last_used_at)
-                        if value is not None
-                    )
-                    + _CONTACT_RETENTION
+                point.expires_at = _retention_anchor(point) + timedelta(
+                    days=point.retention_days
                 )
+            else:
+                point.expires_at = min(
+                    previous_expiry,
+                    _retention_anchor(point) + timedelta(days=point.retention_days),
+                )
+        elif retention_days < point.retention_days:
+            point.retention_days = retention_days
+            point.expires_at = min(
+                _utc(point.expires_at),
+                _retention_anchor(point) + timedelta(days=point.retention_days),
+            )
         self.session.flush()
         return ContactResolution(
             candidate_id=candidate.id,
@@ -360,7 +373,9 @@ class ContactService:
         )
         if record_use:
             point.last_used_at = use_time
-            point.expires_at = point.last_used_at + _CONTACT_RETENTION
+            point.expires_at = _retention_anchor(point) + timedelta(
+                days=point.retention_days
+            )
             self.session.flush()
         return value
 
@@ -621,6 +636,25 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _retention_days(provider_days: int | None) -> int:
+    if provider_days is None:
+        return _MAX_CONTACT_RETENTION_DAYS
+    if isinstance(provider_days, bool) or provider_days <= 0:
+        raise ValueError("contact retention days must be positive")
+    return min(provider_days, _MAX_CONTACT_RETENTION_DAYS)
+
+
+def _retention_anchor(point: ContactPoint) -> datetime:
+    verified_or_used = tuple(
+        _utc(value)
+        for value in (point.last_verified_at, point.last_used_at)
+        if value is not None
+    )
+    if verified_or_used:
+        return max(verified_or_used)
+    return _utc(point.observed_at)
 
 
 def reveal_candidate_contact(

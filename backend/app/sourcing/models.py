@@ -304,6 +304,17 @@ class ProviderSnapshot(Base):
     maintenance_claimed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True
     )
+    next_delete_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    delete_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    delete_failure_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_delete_failure_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_delete_error_code: Mapped[str | None] = mapped_column(String(64))
 
 
 class UsageBudget(Base):

@@ -57,8 +57,19 @@ class ResolutionDecision:
 
 @dataclass(frozen=True)
 class ResolutionResult:
-    candidate_id: UUID
-    source_identity_id: UUID
+    candidate_id: UUID | None
+    source_identity_id: UUID | None
     created: bool
     matched_by: str | None
     duplicate_suggestion_id: UUID | None = None
+    suppressed: bool = False
+
+    @classmethod
+    def suppressed_result(cls) -> "ResolutionResult":
+        return cls(
+            candidate_id=None,
+            source_identity_id=None,
+            created=False,
+            matched_by=None,
+            suppressed=True,
+        )

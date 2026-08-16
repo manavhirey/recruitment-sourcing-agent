@@ -15,6 +15,7 @@ from app.crm.router import router as crm_router
 from app.identity.router import router as identity_router
 from app.jobs.llm import OpenAIResponsesScorecardGateway, ScorecardGateway
 from app.jobs.router import router as jobs_router
+from app.privacy.router import router as privacy_router
 from app.sourcing.router import router as sourcing_router
 from app.sourcing.webhooks import (
     RedisWebhookRateLimiter,
@@ -29,6 +30,7 @@ if False:  # pragma: no cover - imported only for static typing
 
 SourcingDispatcher = Callable[[UUID, UUID, UUID], None]
 EnrichmentDispatcher = Callable[[UUID, UUID, UUID], None]
+PrivacyDispatcher = Callable[[UUID, UUID], None]
 
 
 def _dispatch_sourcing_run(run_id: UUID, tenant_id: UUID, user_id: UUID) -> None:
@@ -45,12 +47,23 @@ def _dispatch_enrichment_request(
     enrich_request.delay(str(request_id), str(tenant_id), str(user_id))
 
 
+def _dispatch_privacy_request(request_id: UUID, tenant_id: UUID) -> None:
+    from app.worker import celery_app
+
+    celery_app.send_task(
+        "maintenance.execute_privacy_deletion",
+        args=(str(request_id), str(tenant_id)),
+        queue="maintenance",
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     *,
     scorecard_gateway: ScorecardGateway | None = None,
     sourcing_dispatcher: SourcingDispatcher | None = None,
     enrichment_dispatcher: EnrichmentDispatcher | None = None,
+    privacy_dispatcher: PrivacyDispatcher | None = None,
     snapshot_store: "SnapshotStore | None" = None,
     contact_cipher: "ContactCipher | None" = None,
     webhook_rate_limiter: WebhookRateLimiter | None = None,
@@ -66,6 +79,7 @@ def create_app(
     app.state.enrichment_dispatcher = (
         enrichment_dispatcher or _dispatch_enrichment_request
     )
+    app.state.privacy_dispatcher = privacy_dispatcher or _dispatch_privacy_request
     app.state.snapshot_store = snapshot_store
     app.state.contact_cipher = contact_cipher or ContactCipher(
         app.state.settings.contact_encryption_key.get_secret_value(),
@@ -81,6 +95,7 @@ def create_app(
     app.include_router(sourcing_router)
     app.include_router(crm_router)
     app.include_router(candidates_router)
+    app.include_router(privacy_router)
     app.include_router(webhooks_router)
 
     @app.get("/health/ready")

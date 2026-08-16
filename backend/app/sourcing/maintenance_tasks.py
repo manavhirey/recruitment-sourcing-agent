@@ -1,3 +1,7 @@
+from botocore.exceptions import (  # type: ignore[import-untyped]
+    BotoCoreError,
+    ClientError,
+)
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
@@ -44,7 +48,7 @@ def _run_snapshot_reconciliation(settings: MaintenanceSettings) -> None:
             with Session(engine) as session:
                 rows = session.execute(
                     text(
-                        "SELECT snapshot_id, object_reference "
+                        "SELECT snapshot_id, tenant_id, object_reference "
                         "FROM maintenance_claim_expired_snapshots(:batch_size)"
                     ),
                     {"batch_size": 100},
@@ -52,9 +56,29 @@ def _run_snapshot_reconciliation(settings: MaintenanceSettings) -> None:
                 session.commit()
             if not rows:
                 break
-            for snapshot_id, reference in rows:
-                validate_snapshot_reference(reference)
-                client.delete_object(Bucket=settings.object_store_bucket, Key=reference)
+            for snapshot_id, tenant_id, reference in rows:
+                try:
+                    validate_snapshot_reference(reference, tenant_id=tenant_id)
+                    client.delete_object(
+                        Bucket=settings.object_store_bucket,
+                        Key=reference,
+                    )
+                except (FileNotFoundError, KeyError):
+                    pass
+                except (BotoCoreError, ClientError, OSError, ValueError):
+                    with Session(engine) as session:
+                        session.scalar(
+                            text(
+                                "SELECT maintenance_record_snapshot_delete_failure("
+                                ":snapshot_id, :error_code)"
+                            ),
+                            {
+                                "snapshot_id": snapshot_id,
+                                "error_code": "object_delete_failed",
+                            },
+                        )
+                        session.commit()
+                    continue
                 with Session(engine) as session:
                     session.scalar(
                         text(
