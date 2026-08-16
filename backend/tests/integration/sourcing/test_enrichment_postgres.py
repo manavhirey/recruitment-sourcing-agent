@@ -39,6 +39,7 @@ from app.providers.base import (
 from app.providers.health import ProviderConnectorState
 from app.providers.snapshots import SnapshotStore
 from app.sourcing import tasks
+from app.sourcing.dispatch_recovery import recover_pending_enrichment_dispatches
 from app.sourcing.enrichment import RegionalContactPolicy
 from app.sourcing.models import (
     EnrichmentRequest,
@@ -769,6 +770,35 @@ class AuthenticationFailureGateway(CeleryEntryGateway):
         raise ProviderAuthenticationError("provider rejected credentials")
 
 
+class BlockingAcceptedGateway(CeleryEntryGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def enrich_batch(
+        self,
+        people: tuple[EnrichmentInput, ...],
+        webhook_url: str,
+        *,
+        reveal_personal_emails: bool = False,
+        reveal_phone_number: bool = False,
+    ) -> EnrichmentReceipt:
+        del webhook_url, reveal_personal_emails, reveal_phone_number
+        self.calls += 1
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("test did not release provider")
+        return EnrichmentReceipt(
+            provider="apollo",
+            request_id="accepted-on-demand",
+            submitted_count=len(people),
+            result=None,
+            charged_units=(("enrichments", len(people)), ("estimated_credits", 1)),
+        )
+
+
 def _seed_celery_entry_run(
     owner_engine: Engine, *, suffix: str
 ) -> tuple[UUID, UUID, UUID, UUID]:
@@ -994,6 +1024,44 @@ def _patch_celery_entry_dependencies(
     )
 
 
+def _queue_celery_on_demand_request(
+    owner_engine: Engine,
+    tenant_id: UUID,
+    user_id: UUID,
+    run_candidate_id: UUID,
+    *,
+    idempotency_key: str,
+) -> tuple[UUID, UUID]:
+    context = RequestContext(tenant_id=tenant_id, user_id=user_id, role=Role.OWNER)
+    with Session(owner_engine, expire_on_commit=False) as session:
+        run_candidate = session.get(RunCandidate, run_candidate_id)
+        assert run_candidate is not None
+        run = session.get(SourcingRun, run_candidate.run_id)
+        assert run is not None
+        run.state = RunState.READY
+        run.current_stage = RunState.READY.value
+        run_candidate.enrichment_status = "unavailable"
+        session.commit()
+        service = SourcingService(session, b"test-key")
+        outcome = service.queue_on_demand_enrichment(
+            context,
+            run_candidate_id,
+            idempotency_key=idempotency_key,
+        )
+        assert outcome.claim_token is not None
+        request_id = outcome.request.id
+        run_id = outcome.request.run_id
+        session.commit()
+        assert service.finish_enrichment_dispatch(
+            context,
+            request_id,
+            outcome.claim_token,
+            published=True,
+        )
+        session.commit()
+        return request_id, run_id
+
+
 def test_auto_enrichment_celery_entry_binds_tenant_before_forced_rls(
     owner_engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1156,6 +1224,157 @@ def test_cross_run_auth_circuit_sweeps_disabled_retry_generation(
             for reservation_key in ("circuit-accepted", "circuit-ambiguous"):
                 assert charges[(reservation_key, "enrichments")] == 1
                 assert charges[(reservation_key, "estimated_credits")] == 9
+    finally:
+        api_engine.dispose()
+        with Session(owner_engine) as session:
+            connector = session.get(ProviderConnectorState, "apollo")
+            if connector is not None:
+                session.delete(connector)
+            session.commit()
+
+
+def test_on_demand_submission_serializes_disabled_run_sweep(
+    owner_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert API_DATABASE_URL is not None
+    tenant_id, user_id, run_id, run_candidate_id = _seed_celery_entry_run(
+        owner_engine, suffix="demand-race"
+    )
+    request_id, queued_run_id = _queue_celery_on_demand_request(
+        owner_engine,
+        tenant_id,
+        user_id,
+        run_candidate_id,
+        idempotency_key="serialized-provider-call",
+    )
+    assert queued_run_id == run_id
+    gateway = BlockingAcceptedGateway()
+    outcomes: queue.Queue[BaseException | None] = queue.Queue()
+    api_engine = create_engine(API_DATABASE_URL)
+    _patch_celery_entry_dependencies(
+        monkeypatch, api_engine, gateway, reveal_phone=False
+    )
+
+    def submit_on_demand() -> None:
+        try:
+            tasks.enrich_request.run(str(request_id), str(tenant_id), str(user_id))
+            outcomes.put(None)
+        except BaseException as error:  # noqa: BLE001 - asserted in parent thread
+            outcomes.put(error)
+
+    worker = threading.Thread(target=submit_on_demand)
+    try:
+        worker.start()
+        assert gateway.entered.wait(timeout=5)
+        tasks.disable_provider(
+            tasks.database_session_factory, "apollo", "authentication_error"
+        )
+
+        tasks.enrich_run.run(str(run_id), str(tenant_id), str(user_id), 50)
+        with Session(owner_engine) as session:
+            request = session.get(EnrichmentRequest, request_id)
+            assert request is not None and request.status == "submitting"
+            assert all(
+                row.charged_units is None
+                for row in session.scalars(
+                    select(UsageLedger).where(
+                        UsageLedger.tenant_id == tenant_id,
+                        UsageLedger.run_id == run_id,
+                        UsageLedger.reservation_key == request.reservation_key,
+                    )
+                )
+            )
+
+        gateway.release.set()
+        worker.join(timeout=8)
+        assert not worker.is_alive()
+        assert outcomes.get_nowait() is None
+
+        tasks.enrich_run.run(str(run_id), str(tenant_id), str(user_id), 50)
+        with Session(owner_engine) as session:
+            request = session.get(EnrichmentRequest, request_id)
+            assert request is not None and request.status == "completed"
+            assert request.provider_request_id == "accepted-on-demand"
+            assert request.usage_reconciled_at is not None
+            assert request.dispatch_pending is False
+            assert request.dispatch_claim_token is None
+            charges = {
+                row.unit_type: row.charged_units
+                for row in session.scalars(
+                    select(UsageLedger).where(
+                        UsageLedger.tenant_id == tenant_id,
+                        UsageLedger.run_id == run_id,
+                        UsageLedger.reservation_key == request.reservation_key,
+                    )
+                )
+            }
+            assert charges == {"enrichments": 1, "estimated_credits": 1}
+        assert gateway.calls == 1
+    finally:
+        gateway.release.set()
+        worker.join(timeout=8)
+        api_engine.dispose()
+        with Session(owner_engine) as session:
+            connector = session.get(ProviderConnectorState, "apollo")
+            if connector is not None:
+                session.delete(connector)
+            session.commit()
+
+
+def test_on_demand_lock_contention_recovers_without_client_retry(
+    owner_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert API_DATABASE_URL is not None and MAINTENANCE_DATABASE_URL is not None
+    tenant_id, user_id, run_id, run_candidate_id = _seed_celery_entry_run(
+        owner_engine, suffix="recover"
+    )
+    request_id, queued_run_id = _queue_celery_on_demand_request(
+        owner_engine,
+        tenant_id,
+        user_id,
+        run_candidate_id,
+        idempotency_key="recover-contended-delivery",
+    )
+    assert queued_run_id == run_id
+    gateway = BlockingAcceptedGateway()
+    gateway.release.set()
+    api_engine = create_engine(API_DATABASE_URL)
+    _patch_celery_entry_dependencies(
+        monkeypatch, api_engine, gateway, reveal_phone=False
+    )
+    try:
+        with tasks._enrichment_execution_lock(
+            tasks.database_session_factory, tenant_id, run_id
+        ) as acquired:
+            assert acquired
+            tasks.enrich_request.run(str(request_id), str(tenant_id), str(user_id))
+        assert gateway.calls == 0
+        with Session(owner_engine) as session:
+            request = session.get(EnrichmentRequest, request_id)
+            assert request is not None and request.status == "queued"
+            assert request.dispatch_pending is True
+            assert request.dispatch_claim_token is None
+
+        published = []
+        recover_pending_enrichment_dispatches(
+            MAINTENANCE_DATABASE_URL,
+            published.append,
+        )
+        claim = next(item for item in published if item.request_id == request_id)
+        assert claim.dispatch_key == f"enrichment-request-{request_id}"
+        tasks.enrich_request.run(
+            str(claim.request_id), str(claim.tenant_id), str(claim.user_id)
+        )
+
+        with Session(owner_engine) as session:
+            request = session.get(EnrichmentRequest, request_id)
+            assert request is not None and request.status == "completed"
+            assert request.provider_request_id == "accepted-on-demand"
+            assert request.dispatch_pending is False
+            assert request.dispatch_claimed_at is None
+            assert request.dispatch_claim_token is None
+            assert request.usage_reconciled_at is not None
+        assert gateway.calls == 1
     finally:
         api_engine.dispose()
         with Session(owner_engine) as session:

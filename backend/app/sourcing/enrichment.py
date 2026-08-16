@@ -468,6 +468,7 @@ def execute_queued_enrichment_request(
         if run.cancellation_requested or run.state is RunState.CANCELLED:
             enrichment.status = "cancelled"
             enrichment.completed_at = datetime.now(UTC)
+            _clear_enrichment_dispatch(enrichment)
             _reconcile_receipt_usage(
                 session,
                 enrichment,
@@ -786,6 +787,12 @@ def _prepare_request(
         return request.id, token
 
 
+def _clear_enrichment_dispatch(enrichment: EnrichmentRequest) -> None:
+    enrichment.dispatch_pending = False
+    enrichment.dispatch_claimed_at = None
+    enrichment.dispatch_claim_token = None
+
+
 def _record_receipt(
     session_factory: sessionmaker[Session],
     context: RequestContext,
@@ -808,7 +815,9 @@ def _record_receipt(
         )
         if enrichment is None:
             raise LookupError("enrichment request not found")
+        _clear_enrichment_dispatch(enrichment)
         if enrichment.status in ("completed", "failed", "cancelled"):
+            session.commit()
             return
         run = _load_run(session, context, enrichment.run_id, for_update=True)
         if run.cancellation_requested or run.state is RunState.CANCELLED:
@@ -987,6 +996,7 @@ def _mark_request_failed(
     enrichment.status = "failed"
     enrichment.error_code = error_code
     enrichment.completed_at = datetime.now(UTC)
+    _clear_enrichment_dispatch(enrichment)
     session.execute(
         update(RunCandidate)
         .where(

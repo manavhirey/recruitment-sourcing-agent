@@ -779,6 +779,52 @@ def _mark_enrichment_provider_disabled(run_id: UUID, context: RequestContext) ->
         session.commit()
 
 
+def _enrichment_request_run_id(
+    request_id: UUID, context: RequestContext
+) -> UUID | None:
+    with database_session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        run_id = session.scalar(
+            select(EnrichmentRequest.run_id).where(
+                EnrichmentRequest.id == request_id,
+                EnrichmentRequest.tenant_id == context.tenant_id,
+                EnrichmentRequest.dispatch_requested_by_user_id == context.user_id,
+            )
+        )
+        session.rollback()
+        return run_id
+
+
+def _requeue_enrichment_dispatch(request_id: UUID, context: RequestContext) -> bool:
+    with database_session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        request = session.scalar(
+            select(EnrichmentRequest)
+            .where(
+                EnrichmentRequest.id == request_id,
+                EnrichmentRequest.tenant_id == context.tenant_id,
+            )
+            .with_for_update()
+        )
+        if request is None:
+            session.rollback()
+            return False
+        if request.dispatch_requested_by_user_id != context.user_id:
+            session.rollback()
+            return False
+        if request.status not in ("queued", "submitting"):
+            request.dispatch_pending = False
+            request.dispatch_claimed_at = None
+            request.dispatch_claim_token = None
+            session.commit()
+            return False
+        request.dispatch_pending = True
+        request.dispatch_claimed_at = None
+        request.dispatch_claim_token = None
+        session.commit()
+        return True
+
+
 def _mark_enrichment_request_provider_disabled(
     request_id: UUID, context: RequestContext
 ) -> None:
@@ -1598,48 +1644,61 @@ def enrich_request(
     user_id: str,
 ) -> None:
     context = _context(tenant_id, user_id)
-    if not is_provider_enabled(database_session_factory, "apollo"):
-        _record_provider_outcome("people_enrichment", "connector_disabled")
-        _mark_enrichment_request_provider_disabled(UUID(request_id), context)
+    parsed_request_id = UUID(request_id)
+    run_id = _enrichment_request_run_id(parsed_request_id, context)
+    if run_id is None:
         return
-    settings = get_worker_settings()
-    cipher, snapshots, policy, codec = _enrichment_dependencies(settings)
-    gateway = ApolloGateway(settings)
-    try:
-        submission = execute_queued_enrichment_request(
-            database_session_factory,
-            UUID(request_id),
-            context,
-            gateway=gateway,
-            callback_base_url=settings.webhook_base_url,
-            contact_cipher=cipher,
-            snapshot_store=snapshots,
-            policy=policy,
-            token_codec=codec,
+    with _enrichment_execution_lock(
+        database_session_factory,
+        context.tenant_id,
+        run_id,
+    ) as acquired:
+        if not acquired:
+            if _requeue_enrichment_dispatch(parsed_request_id, context):
+                _record_provider_outcome("people_enrichment", "retry_scheduled")
+            return
+        if not is_provider_enabled(database_session_factory, "apollo"):
+            _record_provider_outcome("people_enrichment", "connector_disabled")
+            _mark_enrichment_request_provider_disabled(parsed_request_id, context)
+            return
+        settings = get_worker_settings()
+        cipher, snapshots, policy, codec = _enrichment_dependencies(settings)
+        gateway = ApolloGateway(settings)
+        try:
+            submission = execute_queued_enrichment_request(
+                database_session_factory,
+                parsed_request_id,
+                context,
+                gateway=gateway,
+                callback_base_url=settings.webhook_base_url,
+                contact_cipher=cipher,
+                snapshot_store=snapshots,
+                policy=policy,
+                token_codec=codec,
+            )
+        except ProviderAuthenticationError:
+            disable_provider(database_session_factory, "apollo", "authentication_error")
+            _record_provider_outcome("people_enrichment", "authentication_error")
+            _mark_enrichment_request_provider_disabled(parsed_request_id, context)
+            return
+        except ProviderPermissionError:
+            disable_provider(database_session_factory, "apollo", "permission_error")
+            _record_provider_outcome("people_enrichment", "permission_error")
+            _mark_enrichment_request_provider_disabled(parsed_request_id, context)
+            return
+        finally:
+            gateway.close()
+        if isinstance(submission, DeferredEnrichment):
+            _record_provider_outcome("people_enrichment", "retry_scheduled")
+            raise self.retry(countdown=submission.retry_after_seconds)
+        _record_provider_outcome(
+            "people_enrichment",
+            "provider_error" if isinstance(submission, FailedEnrichment) else "success",
         )
-    except ProviderAuthenticationError:
-        disable_provider(database_session_factory, "apollo", "authentication_error")
-        _record_provider_outcome("people_enrichment", "authentication_error")
-        _mark_enrichment_request_provider_disabled(UUID(request_id), context)
-        return
-    except ProviderPermissionError:
-        disable_provider(database_session_factory, "apollo", "permission_error")
-        _record_provider_outcome("people_enrichment", "permission_error")
-        _mark_enrichment_request_provider_disabled(UUID(request_id), context)
-        return
-    finally:
-        gateway.close()
-    if isinstance(submission, DeferredEnrichment):
-        _record_provider_outcome("people_enrichment", "retry_scheduled")
-        raise self.retry(countdown=submission.retry_after_seconds)
-    _record_provider_outcome(
-        "people_enrichment",
-        "provider_error" if isinstance(submission, FailedEnrichment) else "success",
-    )
-    if submission is not None:
-        poll_enrichment_result.apply_async(
-            args=(request_id, tenant_id, user_id), countdown=300
-        )
+        if submission is not None:
+            poll_enrichment_result.apply_async(
+                args=(request_id, tenant_id, user_id), countdown=300
+            )
 
 
 @celery_app.task(

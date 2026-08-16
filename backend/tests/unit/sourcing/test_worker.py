@@ -53,6 +53,19 @@ def _allow_enrichment_run(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _allow_enrichment_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = uuid4()
+
+    @contextmanager
+    def acquired(*args: object):
+        yield True
+
+    monkeypatch.setattr(
+        tasks, "_enrichment_request_run_id", lambda *args: run_id, raising=False
+    )
+    monkeypatch.setattr(tasks, "_enrichment_execution_lock", acquired)
+
+
 def test_clean_worker_process_registers_sourcing_tasks() -> None:
     backend_root = Path(__file__).resolve().parents[3]
     probe = subprocess.run(
@@ -324,6 +337,7 @@ def test_disabled_connector_fails_queued_enrichment_without_provider_call(
 ) -> None:
     request_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
     observed: list[str] = []
+    _allow_enrichment_request(monkeypatch)
     monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: False)
     monkeypatch.setattr(
         tasks,
@@ -402,6 +416,8 @@ def test_enrichment_authz_failures_disable_platform_before_future_calls(
             "fail_active_enrichment_requests",
             lambda *args, **kwargs: observed.append("requests_swept") or 1,
         )
+    elif task is enrich_request:
+        _allow_enrichment_request(monkeypatch)
 
     class Gateway:
         def close(self) -> None:
@@ -442,6 +458,7 @@ def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed: dict[str, object] = {}
+    _allow_enrichment_request(monkeypatch)
 
     class RetryRequested(RuntimeError):
         pass
@@ -483,6 +500,45 @@ def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(
         "countdown": 37,
         "outcome": ("people_enrichment", "retry_scheduled"),
     }
+
+
+def test_enrichment_request_lock_contention_rearms_durable_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id, run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4(), uuid4()
+    observed: list[object] = []
+
+    @contextmanager
+    def contended(*args: object):
+        yield False
+
+    monkeypatch.setattr(
+        tasks, "_enrichment_request_run_id", lambda *args: run_id, raising=False
+    )
+    monkeypatch.setattr(tasks, "_enrichment_execution_lock", contended)
+    monkeypatch.setattr(
+        tasks,
+        "_requeue_enrichment_dispatch",
+        lambda *args: observed.append("dispatch_rearmed") or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_record_provider_outcome",
+        lambda endpoint, outcome: observed.append((endpoint, outcome)),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "is_provider_enabled",
+        lambda *args: pytest.fail("contended delivery must not inspect provider state"),
+    )
+
+    enrich_request.run(str(request_id), str(tenant_id), str(user_id))
+
+    assert observed == [
+        "dispatch_rearmed",
+        ("people_enrichment", "retry_scheduled"),
+    ]
 
 
 def test_exhausted_batch_schedules_one_fresh_run_delivery_for_later_batches(
@@ -667,6 +723,8 @@ def test_terminal_enrichment_failure_is_not_reported_as_success(
     request_id = uuid4()
     if task is enrich_run:
         _allow_enrichment_run(monkeypatch)
+    elif task is enrich_request:
+        _allow_enrichment_request(monkeypatch)
 
     class Gateway:
         def close(self) -> None:
