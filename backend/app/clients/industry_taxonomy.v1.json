@@ -1,0 +1,20 @@
+{
+  "version": "v1",
+  "industries": [
+    {"code": "technology", "label": "Technology", "parent_code": null, "default_adjacency": []},
+    {"code": "technology.fintech", "label": "Fintech", "parent_code": "technology", "default_adjacency": ["financial_services.banking"]},
+    {"code": "financial_services", "label": "Financial Services", "parent_code": null, "default_adjacency": []},
+    {"code": "financial_services.banking", "label": "Banking", "parent_code": "financial_services", "default_adjacency": ["technology.fintech"]},
+    {"code": "healthcare", "label": "Healthcare", "parent_code": null, "default_adjacency": ["pharmaceuticals"]},
+    {"code": "pharmaceuticals", "label": "Pharmaceuticals", "parent_code": null, "default_adjacency": ["healthcare"]},
+    {"code": "consumer", "label": "Consumer", "parent_code": null, "default_adjacency": ["retail"]},
+    {"code": "retail", "label": "Retail", "parent_code": null, "default_adjacency": ["consumer"]},
+    {"code": "manufacturing", "label": "Manufacturing", "parent_code": null, "default_adjacency": ["logistics"]},
+    {"code": "professional_services", "label": "Professional Services", "parent_code": null, "default_adjacency": []},
+    {"code": "logistics", "label": "Logistics", "parent_code": null, "default_adjacency": ["manufacturing"]},
+    {"code": "education", "label": "Education", "parent_code": null, "default_adjacency": []},
+    {"code": "telecommunications", "label": "Telecommunications", "parent_code": null, "default_adjacency": ["technology"]},
+    {"code": "energy", "label": "Energy", "parent_code": null, "default_adjacency": []},
+    {"code": "government", "label": "Government", "parent_code": null, "default_adjacency": []}
+  ]
+}

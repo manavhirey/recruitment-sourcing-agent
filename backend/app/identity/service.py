@@ -424,6 +424,30 @@ class MembershipService:
         record.response_payload = response_payload
         self._session.flush()
 
+    def begin_idempotent_mutation(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_key: str,
+        operation: str,
+        idempotency_key: str,
+        request_payload: dict[str, Any],
+    ) -> IdentityIdempotencyKey:
+        return self._begin_idempotent_mutation(
+            tenant_id=tenant_id,
+            actor_key=actor_key,
+            operation=operation,
+            idempotency_key=idempotency_key,
+            request_payload=request_payload,
+        )
+
+    def complete_idempotent_mutation(
+        self,
+        record: IdentityIdempotencyKey,
+        response_payload: dict[str, Any],
+    ) -> None:
+        self._complete_idempotent_mutation(record, response_payload)
+
     def _namespaced_hmac(self, namespace: str, value: str) -> bytes:
         return hmac.digest(
             self._hmac_key,
