@@ -182,6 +182,117 @@ class RunCandidate(Base):
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     matched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    enrichment_status: Mapped[str] = mapped_column(
+        String(24), default="not_requested", nullable=False
+    )
+    enriched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class EnrichmentRequest(Base):
+    __tablename__ = "enrichment_requests"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "run_id", "reservation_key"),
+        ForeignKeyConstraint(
+            ("tenant_id", "run_id"),
+            ("sourcing_runs.tenant_id", "sourcing_runs.id"),
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'submitting', 'pending', 'completed', 'failed', "
+            "'cancelled')",
+            name="ck_enrichment_requests_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_request_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    candidate_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    capability_token_hmac: Mapped[str | None] = mapped_column(String(64), index=True)
+    reservation_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    reveal_personal_emails: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    reveal_phone_number: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    stage_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    poll_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WebhookDelivery(Base):
+    __tablename__ = "enrichment_webhook_deliveries"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "enrichment_request_id", "payload_hmac"),
+        ForeignKeyConstraint(
+            ("tenant_id", "enrichment_request_id"),
+            ("enrichment_requests.tenant_id", "enrichment_requests.id"),
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "source IN ('webhook', 'poll', 'synchronous')",
+            name="ck_webhook_deliveries_source",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    enrichment_request_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload_hmac: Mapped[str] = mapped_column(String(64), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ProviderSnapshot(Base):
+    __tablename__ = "provider_snapshot_references"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "enrichment_request_id"),
+        ForeignKeyConstraint(
+            ("tenant_id", "run_id"),
+            ("sourcing_runs.tenant_id", "sourcing_runs.id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "enrichment_request_id"),
+            ("enrichment_requests.tenant_id", "enrichment_requests.id"),
+            ondelete="CASCADE",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    enrichment_request_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    object_reference: Mapped[str] = mapped_column(String(1024), nullable=False)
+    checksum_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
 
 class UsageBudget(Base):

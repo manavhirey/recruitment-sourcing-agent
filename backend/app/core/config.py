@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     contact_encryption_key: SecretStr
     suppression_hmac_key: SecretStr
     webhook_hmac_key: SecretStr
+    webhook_base_url: str = "https://localhost"
+    apollo_reveal_personal_emails: bool = False
+    apollo_reveal_phone_numbers: bool = False
 
     @model_validator(mode="after")
     def require_distinct_database_roles(self) -> "Settings":

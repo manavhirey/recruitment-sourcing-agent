@@ -16,6 +16,7 @@ from app.identity.dependencies import (
 from app.identity.schemas import RequestContext
 from app.sourcing.models import SourcingRun, TenantNotification
 from app.sourcing.schemas import (
+    EnrichmentRequestResponse,
     NotificationResponse,
     RunActivityResponse,
     RunResponse,
@@ -25,10 +26,15 @@ from app.sourcing.service import SourcingError, SourcingService
 
 router = APIRouter(tags=["sourcing"])
 SourcingDispatcher = Callable[[UUID, UUID, UUID], None]
+EnrichmentDispatcher = Callable[[UUID, UUID, UUID], None]
 
 
 def get_sourcing_dispatcher(request: Request) -> SourcingDispatcher:
     return request.app.state.sourcing_dispatcher
+
+
+def get_enrichment_dispatcher(request: Request) -> EnrichmentDispatcher:
+    return request.app.state.enrichment_dispatcher
 
 
 def _service(session: Session, settings: Settings) -> SourcingService:
@@ -40,6 +46,8 @@ def _service(session: Session, settings: Settings) -> SourcingService:
 def _raise_sourcing_error(error: SourcingError) -> NoReturn:
     status_code = {
         "run_not_found": status.HTTP_404_NOT_FOUND,
+        "run_candidate_not_found": status.HTTP_404_NOT_FOUND,
+        "enrichment_request_not_found": status.HTTP_404_NOT_FOUND,
         "notification_not_found": status.HTTP_404_NOT_FOUND,
         "active_run_exists": status.HTTP_409_CONFLICT,
         "scorecard_required": status.HTTP_409_CONFLICT,
@@ -210,3 +218,36 @@ def acknowledge_notification(
     except SourcingError as error:
         _raise_sourcing_error(error)
     return _notification_response(notification)
+
+
+@router.post(
+    "/api/v1/job-candidates/{run_candidate_id}/enrich",
+    response_model=EnrichmentRequestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def request_candidate_enrichment(
+    run_candidate_id: UUID,
+    context: Annotated[RequestContext, Depends(get_request_context)],
+    session: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    idempotency_key: Annotated[str, Depends(get_idempotency_key)],
+    dispatcher: Annotated[EnrichmentDispatcher, Depends(get_enrichment_dispatcher)],
+) -> EnrichmentRequestResponse:
+    service = _service(session, settings)
+    try:
+        enrichment, created = service.queue_on_demand_enrichment(
+            context,
+            run_candidate_id,
+            idempotency_key=idempotency_key,
+        )
+        response = EnrichmentRequestResponse(
+            id=enrichment.id,
+            run_id=enrichment.run_id,
+            status=enrichment.status,
+        )
+        session.commit()
+    except SourcingError as error:
+        _raise_sourcing_error(error)
+    if created:
+        dispatcher(enrichment.id, context.tenant_id, context.user_id)
+    return response

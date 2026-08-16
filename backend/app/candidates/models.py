@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    LargeBinary,
     String,
     UniqueConstraint,
     text,
@@ -230,4 +231,64 @@ class DuplicateSuggestion(Base):
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class ContactPoint(Base):
+    __tablename__ = "candidate_contact_points"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "candidate_id", "kind", "lookup_hmac"),
+        ForeignKeyConstraint(
+            ("tenant_id", "candidate_id"),
+            ("candidates.tenant_id", "candidates.id"),
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("kind IN ('email', 'phone')", name="ck_contact_points_kind"),
+        CheckConstraint(
+            "classification IN ('work', 'personal')",
+            name="ck_contact_points_classification",
+        ),
+        CheckConstraint(
+            "verification_state IN "
+            "('verified', 'unverified', 'unavailable', 'failed', 'expired')",
+            name="ck_contact_points_verification_state",
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_contact_points_confidence",
+        ),
+        CheckConstraint("schema_version > 0", name="ck_contact_points_schema_version"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    candidate_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    classification: Mapped[str] = mapped_column(String(16), nullable=False)
+    verification_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    lookup_hmac: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    value_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary)
+    value_nonce: Mapped[bytes | None] = mapped_column(LargeBinary)
+    encrypted_data_key: Mapped[bytes | None] = mapped_column(LargeBinary)
+    key_nonce: Mapped[bytes | None] = mapped_column(LargeBinary)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )

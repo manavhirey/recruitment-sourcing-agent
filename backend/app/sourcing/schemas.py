@@ -47,3 +47,9 @@ class NotificationResponse(BaseModel):
     message: str
     acknowledged_at: datetime | None
     created_at: datetime
+
+
+class EnrichmentRequestResponse(BaseModel):
+    id: UUID
+    run_id: UUID
+    status: str

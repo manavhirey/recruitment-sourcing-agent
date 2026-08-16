@@ -6,8 +6,14 @@ from typing import Any, Self
 import httpx
 
 from app.core.config import Settings
+from app.core.log_redaction import install_sensitive_data_log_filters
 from app.providers.base import (
+    EnrichmentInput,
+    EnrichmentPending,
+    EnrichmentReceipt,
+    EnrichmentResult,
     ProviderAuthenticationError,
+    ProviderContact,
     ProviderExperience,
     ProviderPayloadError,
     ProviderPermissionError,
@@ -19,6 +25,8 @@ from app.providers.base import (
 )
 
 APOLLO_PEOPLE_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
+APOLLO_BULK_ENRICHMENT_URL = "https://api.apollo.io/api/v1/people/bulk_match"
+APOLLO_WEBHOOK_RESULT_URL = "https://api.apollo.io/api/v1/webhook_result"
 _MAX_PEOPLE_PER_PAGE = 100
 _MAX_UNIQUE_PEOPLE = 300
 
@@ -31,6 +39,7 @@ class ApolloGateway:
         settings: Settings,
         client: httpx.Client | None = None,
     ) -> None:
+        install_sensitive_data_log_filters()
         self._api_key = settings.apollo_api_key.get_secret_value()
         self._client = client or httpx.Client(timeout=20.0)
         self._owns_client = client is None
@@ -76,8 +85,8 @@ class ApolloGateway:
                 json=_search_payload(query, page),
                 timeout=20.0,
             )
-        except httpx.HTTPError as error:
-            raise ProviderTemporaryError("provider request failed") from error
+        except httpx.HTTPError:
+            raise ProviderTemporaryError("provider request failed") from None
 
         _raise_for_status(response)
         document = _response_document(response)
@@ -115,12 +124,247 @@ class ApolloGateway:
             provider_request_id=_request_id(response.headers),
         )
 
+    def enrich_batch(
+        self,
+        people: tuple[EnrichmentInput, ...],
+        webhook_url: str,
+        *,
+        reveal_personal_emails: bool = False,
+        reveal_phone_number: bool = False,
+    ) -> EnrichmentReceipt:
+        if not people:
+            raise ValueError("enrichment batch must not be empty")
+        if len(people) > 10:
+            raise ValueError("enrichment batch may contain at most 10 people")
+        if not webhook_url.startswith("https://"):
+            raise ValueError("enrichment callback must use HTTPS")
+        parameters: dict[str, str | bool] = {
+            "reveal_personal_emails": reveal_personal_emails,
+            "reveal_phone_number": reveal_phone_number,
+        }
+        if reveal_phone_number:
+            parameters["webhook_url"] = webhook_url
+        try:
+            response = self._client.post(
+                APOLLO_BULK_ENRICHMENT_URL,
+                headers={"accept": "application/json", "x-api-key": self._api_key},
+                params=parameters,
+                json={"details": [_enrichment_input(person) for person in people]},
+                timeout=20.0,
+            )
+        except httpx.HTTPError:
+            raise ProviderTemporaryError("provider request failed") from None
+        _raise_for_status(response)
+        document = _response_document(response)
+        request_id = _enrichment_request_id(document)
+        result = normalize_enrichment_payload(document, expected_request_id=request_id)
+        return EnrichmentReceipt(
+            provider="apollo",
+            request_id=request_id,
+            submitted_count=len(people),
+            result=result,
+            charged_units=(
+                ("enrichments", len(people)),
+                ("estimated_credits", _charged_credits(document, len(people))),
+            ),
+        )
+
+    def poll_enrichment(self, request_id: str) -> EnrichmentResult | EnrichmentPending:
+        if not request_id or not request_id.lstrip("-").isdigit():
+            raise ValueError("provider request ID must be a signed integer")
+        try:
+            response = self._client.get(
+                f"{APOLLO_WEBHOOK_RESULT_URL}/{request_id}",
+                headers={"accept": "application/json", "x-api-key": self._api_key},
+                timeout=20.0,
+            )
+        except httpx.HTTPError:
+            raise ProviderTemporaryError("provider request failed") from None
+        document = _response_document(response)
+        if (
+            response.status_code == 404
+            and document.get("error_code") == "result_pending"
+        ):
+            retry_after = document.get("retry_after_seconds")
+            if (
+                not isinstance(retry_after, int)
+                or isinstance(retry_after, bool)
+                or retry_after < 0
+            ):
+                raise ProviderPayloadError("provider pending retry interval is invalid")
+            return EnrichmentPending(retry_after)
+        if response.status_code in (400, 404, 410):
+            error_code = document.get("error_code")
+            allowed = {"invalid_request_id", "request_id_unknown", "request_id_expired"}
+            if error_code in allowed:
+                raise ProviderPayloadError(f"provider enrichment {error_code}")
+        _raise_for_status(response)
+        return normalize_enrichment_payload(document, expected_request_id=request_id)
+
 
 def _request_id(headers: httpx.Headers) -> str | None:
     value = headers.get("x-request-id") or headers.get("request-id")
     if value is None:
         return None
     return value.strip()[:255] or None
+
+
+def _enrichment_input(value: EnrichmentInput) -> dict[str, str]:
+    detail = {"id": value.provider_person_id}
+    if value.linkedin_url:
+        detail["linkedin_url"] = value.linkedin_url
+    return detail
+
+
+def _enrichment_request_id(document: Mapping[str, Any]) -> str:
+    value = document.get("request_id")
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        raise ProviderPayloadError("provider enrichment request ID is missing")
+    normalized = str(value).strip()
+    if not normalized or len(normalized) > 255:
+        raise ProviderPayloadError("provider enrichment request ID is invalid")
+    return normalized
+
+
+def _charged_credits(document: Mapping[str, Any], submitted_count: int) -> int:
+    value = document.get("credits_consumed", submitted_count)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ProviderPayloadError("provider credit usage is invalid")
+    return value
+
+
+def normalize_enrichment_payload(
+    payload: Mapping[str, Any], *, expected_request_id: str
+) -> EnrichmentResult:
+    actual_request_id = _enrichment_request_id(payload)
+    if actual_request_id != expected_request_id:
+        raise ProviderPayloadError("provider enrichment request ID does not match")
+    raw_people = _enriched_people(payload)
+    people = tuple(_enriched_person(value) for value in raw_people)
+    return EnrichmentResult(
+        provider="apollo",
+        request_id=actual_request_id,
+        people=people,
+        snapshot_payload=dict(payload),
+    )
+
+
+def _enriched_people(document: Mapping[str, Any]) -> list[object]:
+    for key in ("people", "matches"):
+        value = document.get(key)
+        if value is not None:
+            if not isinstance(value, list):
+                raise ProviderPayloadError("provider enrichment people must be a list")
+            return value
+    person = document.get("person")
+    if person is not None:
+        return [person]
+    person_id = document.get("person_id")
+    if person_id is not None:
+        native_webhook = dict(document)
+        native_webhook["id"] = person_id
+        native_webhook.setdefault("name", "Unknown Candidate")
+        return [native_webhook]
+    return []
+
+
+def _enriched_person(value: object) -> ProviderPerson:
+    if not isinstance(value, dict):
+        raise ProviderPayloadError("provider enriched person must be an object")
+    nested = value.get("person")
+    if nested is not None:
+        if not isinstance(nested, dict):
+            raise ProviderPayloadError("provider enriched person must be an object")
+        value = nested
+    contacts = tuple(_email_contacts(value) + _phone_contacts(value))
+    return ProviderPerson(
+        provider="apollo",
+        provider_person_id=_required_string(value, "id"),
+        full_name=_full_name(value),
+        current_title=_optional_string(value, "title"),
+        current_company=_enriched_company(value),
+        location=_location(value),
+        linkedin_url=_optional_string(value, "linkedin_url"),
+        experiences=_experiences(value.get("employment_history", [])),
+        contacts=contacts,
+    )
+
+
+def _enriched_company(person: Mapping[str, object]) -> str | None:
+    organization = person.get("organization")
+    if organization is None:
+        return None
+    if not isinstance(organization, dict):
+        raise ProviderPayloadError("provider organization must be an object")
+    return _optional_string(organization, "name")
+
+
+def _email_contacts(person: Mapping[str, object]) -> list[ProviderContact]:
+    contacts: list[ProviderContact] = []
+    primary = _optional_string(person, "email")
+    if primary:
+        contacts.append(
+            ProviderContact(
+                kind="email",
+                value=primary,
+                classification="work",
+                verification_state=_verification(person.get("email_status")),
+            )
+        )
+    raw_personal = person.get("personal_emails", [])
+    if not isinstance(raw_personal, list):
+        raise ProviderPayloadError("provider personal emails must be a list")
+    for value in raw_personal:
+        if not isinstance(value, str) or not value.strip():
+            raise ProviderPayloadError("provider personal email is invalid")
+        contacts.append(
+            ProviderContact(
+                kind="email",
+                value=value.strip(),
+                classification="personal",
+                verification_state="verified",
+            )
+        )
+    return contacts
+
+
+def _phone_contacts(person: Mapping[str, object]) -> list[ProviderContact]:
+    raw_phones = person.get("phone_numbers", [])
+    if not isinstance(raw_phones, list):
+        raise ProviderPayloadError("provider phone numbers must be a list")
+    contacts: list[ProviderContact] = []
+    for phone in raw_phones:
+        if not isinstance(phone, dict):
+            raise ProviderPayloadError("provider phone number must be an object")
+        raw = (
+            _optional_string(phone, "raw_number")
+            or _optional_string(phone, "sanitized_number")
+            or _optional_string(phone, "number")
+        )
+        if raw is None:
+            raise ProviderPayloadError("provider phone number value is missing")
+        phone_type = (_optional_string(phone, "type") or "work").casefold()
+        contacts.append(
+            ProviderContact(
+                kind="phone",
+                value=raw,
+                classification="personal"
+                if phone_type in {"mobile", "personal"}
+                else "work",
+                verification_state=_verification(phone.get("status")),
+            )
+        )
+    return contacts
+
+
+def _verification(value: object) -> str:
+    if not isinstance(value, str):
+        return "unverified"
+    return (
+        "verified"
+        if value.casefold() in {"verified", "valid", "enrichment_successful"}
+        else "unverified"
+    )
 
 
 def _search_payload(query: ProviderQuery, page: int) -> dict[str, object]:

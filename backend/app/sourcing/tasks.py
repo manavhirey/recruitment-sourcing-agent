@@ -8,11 +8,12 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import UUID
 
-from sqlalchemy import func, select, text
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.audit.service import AuditService
+from app.candidates.contacts import ContactCipher
 from app.candidates.service import CandidateService
 from app.core.config import get_settings
 from app.core.database import session_factory as database_session_factory
@@ -28,9 +29,23 @@ from app.providers.base import (
     SearchPage,
 )
 from app.providers.query_planner import QueryPlanner
-from app.sourcing.models import RunCandidate, RunCheckpoint, SourcingRun
+from app.providers.snapshots import SnapshotStore
+from app.sourcing.enrichment import (
+    RegionalContactPolicy,
+    enqueue_top_enrichment,
+    execute_queued_enrichment_request,
+    poll_enrichment_request,
+    reconcile_snapshot_references,
+)
+from app.sourcing.models import (
+    EnrichmentRequest,
+    RunCandidate,
+    RunCheckpoint,
+    SourcingRun,
+)
 from app.sourcing.service import SourcingError, SourcingService
 from app.sourcing.state_machine import RunState, transition_run
+from app.sourcing.webhooks import CapabilityTokenCodec
 from app.worker import celery_app
 
 _MAX_RUN_CANDIDATES = 300
@@ -682,6 +697,43 @@ def _run_is_match_eligible(
     return eligible
 
 
+def _run_is_enrich_eligible(
+    session_factory: sessionmaker[Session],
+    run_id: UUID,
+    context: RequestContext,
+) -> bool:
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        run = _load_run(session, run_id, context.tenant_id)
+        eligible = not run.cancellation_requested and run.state in (
+            RunState.ENRICHING,
+            RunState.PARTIALLY_READY,
+        )
+        session.rollback()
+    return eligible
+
+
+def _enrichment_dependencies(settings: Any):
+    import boto3  # type: ignore[import-untyped]
+
+    cipher = ContactCipher(
+        settings.contact_encryption_key.get_secret_value(),
+        settings.suppression_hmac_key.get_secret_value().encode(),
+    )
+    snapshots = SnapshotStore(
+        boto3.client("s3", endpoint_url=settings.object_store_endpoint),
+        settings.object_store_bucket,
+        settings.contact_encryption_key.get_secret_value(),
+    )
+    snapshots.ensure_lifecycle()
+    policy = RegionalContactPolicy(
+        settings.apollo_reveal_personal_emails,
+        settings.apollo_reveal_phone_numbers,
+    )
+    codec = CapabilityTokenCodec(settings.webhook_hmac_key.get_secret_value().encode())
+    return cipher, snapshots, policy, codec
+
+
 def _context(tenant_id: str, user_id: str) -> RequestContext:
     return RequestContext(
         tenant_id=UUID(tenant_id),
@@ -785,3 +837,154 @@ def match_run(
         _context(tenant_id, user_id),
         idempotency_key=idempotency_key,
     )
+    context = _context(tenant_id, user_id)
+    if _run_is_enrich_eligible(database_session_factory, UUID(run_id), context):
+        enrich_run.delay(run_id, tenant_id, user_id, 50)
+
+
+@celery_app.task(
+    bind=True,
+    name="sourcing.enrich_run",
+    acks_late=True,
+    reject_on_worker_lost=True,
+    max_retries=5,
+    autoretry_for=(OperationalError,),
+    retry_backoff=True,
+    retry_jitter=True,
+)
+def enrich_run(
+    self: Any,
+    run_id: str,
+    tenant_id: str,
+    user_id: str,
+    limit: int = 50,
+) -> None:
+    settings = get_settings()
+    context = _context(tenant_id, user_id)
+    cipher, snapshots, policy, codec = _enrichment_dependencies(settings)
+    gateway = ApolloGateway(settings)
+    try:
+        submissions = enqueue_top_enrichment(
+            UUID(run_id),
+            limit,
+            session_factory=database_session_factory,
+            context=context,
+            gateway=gateway,
+            callback_base_url=settings.webhook_base_url,
+            contact_cipher=cipher,
+            snapshot_store=snapshots,
+            policy=policy,
+            token_codec=codec,
+        )
+    finally:
+        gateway.close()
+    for submission in submissions:
+        with database_session_factory() as session:
+            request = session.get(EnrichmentRequest, submission.request_id)
+            should_poll = request is not None and request.status == "pending"
+        if should_poll:
+            poll_enrichment_result.apply_async(
+                args=(
+                    str(submission.request_id),
+                    tenant_id,
+                    user_id,
+                ),
+                countdown=300,
+            )
+
+
+@celery_app.task(
+    bind=True,
+    name="sourcing.enrich_request",
+    acks_late=True,
+    reject_on_worker_lost=True,
+    max_retries=5,
+    autoretry_for=(OperationalError,),
+    retry_backoff=True,
+    retry_jitter=True,
+)
+def enrich_request(
+    self: Any,
+    request_id: str,
+    tenant_id: str,
+    user_id: str,
+) -> None:
+    settings = get_settings()
+    context = _context(tenant_id, user_id)
+    cipher, snapshots, policy, codec = _enrichment_dependencies(settings)
+    gateway = ApolloGateway(settings)
+    try:
+        submission = execute_queued_enrichment_request(
+            database_session_factory,
+            UUID(request_id),
+            context,
+            gateway=gateway,
+            callback_base_url=settings.webhook_base_url,
+            contact_cipher=cipher,
+            snapshot_store=snapshots,
+            policy=policy,
+            token_codec=codec,
+        )
+    finally:
+        gateway.close()
+    if submission is not None:
+        poll_enrichment_result.apply_async(
+            args=(request_id, tenant_id, user_id), countdown=300
+        )
+
+
+@celery_app.task(
+    bind=True,
+    name="sourcing.poll_enrichment_result",
+    acks_late=True,
+    reject_on_worker_lost=True,
+    max_retries=5,
+    autoretry_for=(OperationalError,),
+    retry_backoff=True,
+    retry_jitter=True,
+)
+def poll_enrichment_result(
+    self: Any,
+    request_id: str,
+    tenant_id: str,
+    user_id: str,
+) -> None:
+    settings = get_settings()
+    cipher, snapshots, _, codec = _enrichment_dependencies(settings)
+    gateway = ApolloGateway(settings)
+    try:
+        retry_after = poll_enrichment_request(
+            database_session_factory,
+            UUID(request_id),
+            _context(tenant_id, user_id),
+            gateway=gateway,
+            token_codec=codec,
+            snapshot_store=snapshots,
+            contact_cipher=cipher,
+        )
+    finally:
+        gateway.close()
+    if retry_after is not None:
+        poll_enrichment_result.apply_async(
+            args=(request_id, tenant_id, user_id), countdown=retry_after
+        )
+
+
+@celery_app.task(name="sourcing.reconcile_expired_snapshots")
+def reconcile_expired_snapshots() -> None:
+    settings = get_settings()
+    _, snapshots, _, _ = _enrichment_dependencies(settings)
+    maintenance_engine = create_engine(
+        settings.migration_database_url,
+        pool_pre_ping=True,
+    )
+    try:
+        maintenance_sessions = sessionmaker(
+            bind=maintenance_engine,
+            expire_on_commit=False,
+        )
+        with maintenance_sessions() as session:
+            reconcile_snapshot_references(session, snapshots)
+            session.commit()
+    finally:
+        maintenance_engine.dispose()

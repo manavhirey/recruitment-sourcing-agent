@@ -14,6 +14,8 @@ from app.identity.service import IdentityError, MembershipService
 from app.jobs.models import ScorecardVersion
 from app.jobs.service import JobError, JobService
 from app.sourcing.models import (
+    EnrichmentRequest,
+    RunCandidate,
     SourcingRun,
     TenantNotification,
     UsageBudget,
@@ -206,6 +208,74 @@ class SourcingService:
         totals = {unit_type: 0 for unit_type in _UNIT_CAP_COLUMNS}
         totals.update({str(unit_type): int(total) for unit_type, total in rows})
         return totals
+
+    def queue_on_demand_enrichment(
+        self,
+        context: RequestContext,
+        run_candidate_id: UUID,
+        *,
+        idempotency_key: str,
+    ) -> tuple[EnrichmentRequest, bool]:
+        run_candidate = self.session.scalar(
+            select(RunCandidate)
+            .where(
+                RunCandidate.id == run_candidate_id,
+                RunCandidate.tenant_id == context.tenant_id,
+            )
+            .with_for_update()
+        )
+        if run_candidate is None:
+            raise SourcingError("run_candidate_not_found")
+        run = self.get_authorized(context, run_candidate.run_id, for_update=True)
+        record = self._begin(
+            context,
+            f"enrich_run_candidate:{run_candidate_id}",
+            idempotency_key,
+            {"run_candidate_id": str(run_candidate_id)},
+        )
+        if record.response_payload is not None:
+            request = self.session.scalar(
+                select(EnrichmentRequest).where(
+                    EnrichmentRequest.id
+                    == UUID(str(record.response_payload["enrichment_request_id"])),
+                    EnrichmentRequest.tenant_id == context.tenant_id,
+                )
+            )
+            if request is None:
+                raise SourcingError("enrichment_request_not_found")
+            return request, False
+        reservation_key = f"on-demand:{record.id}"
+        self.reserve_usage(
+            context,
+            run.id,
+            provider="apollo",
+            endpoint="people_bulk_match",
+            reservation_key=reservation_key,
+            requested_units={"enrichments": 1, "estimated_credits": 9},
+        )
+        request = EnrichmentRequest(
+            tenant_id=context.tenant_id,
+            run_id=run.id,
+            provider="apollo",
+            candidate_ids=[str(run_candidate.candidate_id)],
+            reservation_key=reservation_key,
+            status="queued",
+        )
+        self.session.add(request)
+        run_candidate.enrichment_status = "pending"
+        self.session.flush()
+        self._audit.record(
+            tenant_id=context.tenant_id,
+            run_id=run.id,
+            actor_user_id=context.user_id,
+            event_key=f"on-demand-enrichment-queued:{record.id}",
+            action="candidate.enrichment_queued",
+            entity_type="enrichment_request",
+            entity_id=request.id,
+            payload={"run_candidate_id": str(run_candidate.id)},
+        )
+        self._complete(record, {"enrichment_request_id": str(request.id)})
+        return request, True
 
     def list_notifications(self, context: RequestContext) -> list[TenantNotification]:
         return list(

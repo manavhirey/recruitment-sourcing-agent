@@ -1,6 +1,7 @@
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import Protocol
 
 
@@ -41,6 +42,17 @@ class ProviderPerson:
     location: str | None
     linkedin_url: str | None
     experiences: tuple[ProviderExperience, ...]
+    contacts: tuple["ProviderContact", ...] = ()
+
+
+@dataclass(frozen=True)
+class ProviderContact:
+    kind: str
+    value: str = field(repr=False)
+    classification: str = "work"
+    verification_state: str = "unverified"
+    confidence: float = 1.0
+    observed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +79,8 @@ class EnrichmentReceipt:
     provider: str
     request_id: str
     submitted_count: int
+    result: "EnrichmentResult | None" = None
+    charged_units: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +88,12 @@ class EnrichmentResult:
     provider: str
     request_id: str
     people: tuple[ProviderPerson, ...]
+    snapshot_payload: dict[str, object] = field(default_factory=dict, repr=False)
+
+
+@dataclass(frozen=True)
+class EnrichmentPending:
+    retry_after_seconds: int
 
 
 class ProviderError(RuntimeError):
@@ -107,9 +127,14 @@ class ProviderGateway(Protocol):
         raise NotImplementedError
 
     def enrich_batch(
-        self, people: tuple[EnrichmentInput, ...], webhook_url: str
+        self,
+        people: tuple[EnrichmentInput, ...],
+        webhook_url: str,
+        *,
+        reveal_personal_emails: bool = False,
+        reveal_phone_number: bool = False,
     ) -> EnrichmentReceipt:
         raise NotImplementedError
 
-    def poll_enrichment(self, request_id: str) -> EnrichmentResult | None:
+    def poll_enrichment(self, request_id: str) -> EnrichmentResult | EnrichmentPending:
         raise NotImplementedError

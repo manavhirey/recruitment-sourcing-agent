@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from app.candidates.models import Candidate
 from app.clients.models import ClientCompany
 from app.core.config import Settings
 from app.core.database import Base, get_db
@@ -16,7 +17,13 @@ from app.identity.models import Membership, Tenant, User
 from app.identity.schemas import IdentityClaims, Role
 from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
 from app.main import create_app
-from app.sourcing.models import SourcingRun, TenantNotification
+from app.sourcing.models import (
+    EnrichmentRequest,
+    RunCandidate,
+    SourcingRun,
+    TenantNotification,
+    UsageLedger,
+)
 
 
 class StaticVerifier:
@@ -33,6 +40,14 @@ class RecordingDispatcher:
 
     def __call__(self, run_id: UUID, tenant_id: UUID, user_id: UUID) -> None:
         self.calls.append((run_id, tenant_id, user_id))
+
+
+class RecordingEnrichmentDispatcher:
+    def __init__(self) -> None:
+        self.calls: list[tuple[UUID, UUID, UUID]] = []
+
+    def __call__(self, request_id: UUID, tenant_id: UUID, user_id: UUID) -> None:
+        self.calls.append((request_id, tenant_id, user_id))
 
 
 @pytest.fixture
@@ -112,7 +127,12 @@ def sourcing_api(
         job_id = job.id
 
     dispatcher = RecordingDispatcher()
-    app = create_app(Settings.for_test(), sourcing_dispatcher=dispatcher)
+    enrichment_dispatcher = RecordingEnrichmentDispatcher()
+    app = create_app(
+        Settings.for_test(),
+        sourcing_dispatcher=dispatcher,
+        enrichment_dispatcher=enrichment_dispatcher,
+    )
     app.state.token_verifier = StaticVerifier(
         IdentityClaims(
             subject="oidc|sourcing-router-owner",
@@ -145,6 +165,7 @@ def sourcing_api(
             "user_id": user_id,
             "job_id": job_id,
             "dispatcher": dispatcher,
+            "enrichment_dispatcher": enrichment_dispatcher,
         }
     engine.dispose()
 
@@ -274,3 +295,54 @@ def test_notifications_are_role_scoped_and_acknowledgement_is_idempotent(
     assert acknowledged.status_code == replay.status_code == 200
     assert acknowledged.json()["acknowledged_at"] is not None
     assert replay.json()["acknowledged_at"] == acknowledged.json()["acknowledged_at"]
+
+
+def test_on_demand_enrichment_is_authorized_budgeted_and_idempotent(
+    sourcing_api: dict[str, Any],
+) -> None:
+    api: TestClient = sourcing_api["api"]
+    headers = _headers(sourcing_api)
+    created = api.post(
+        f"/api/v1/jobs/{sourcing_api['job_id']}/runs",
+        headers={**headers, "Idempotency-Key": "on-demand-run"},
+        json={},
+    )
+    run_id = UUID(created.json()["id"])
+    with Session(sourcing_api["engine"]) as session:
+        run = session.get(SourcingRun, run_id)
+        assert run is not None
+        candidate = Candidate(
+            tenant_id=sourcing_api["tenant_id"],
+            full_name="Priya Sharma",
+            normalized_name="priya sharma",
+        )
+        session.add(candidate)
+        session.flush()
+        run_candidate = RunCandidate(
+            tenant_id=sourcing_api["tenant_id"],
+            run_id=run.id,
+            candidate_id=candidate.id,
+            scorecard_version_id=run.scorecard_version_id,
+            match_score=75,
+            classification="main",
+        )
+        session.add(run_candidate)
+        session.commit()
+        run_candidate_id = run_candidate.id
+
+    url = f"/api/v1/job-candidates/{run_candidate_id}/enrich"
+    first = api.post(
+        url,
+        headers={**headers, "Idempotency-Key": "enrich-priya"},
+    )
+    replay = api.post(
+        url,
+        headers={**headers, "Idempotency-Key": "enrich-priya"},
+    )
+
+    assert first.status_code == replay.status_code == 202
+    assert first.json() == replay.json()
+    assert len(sourcing_api["enrichment_dispatcher"].calls) == 1
+    with Session(sourcing_api["engine"]) as session:
+        assert session.scalar(select(func.count()).select_from(EnrichmentRequest)) == 1
+        assert session.scalar(select(func.count()).select_from(UsageLedger)) == 2
