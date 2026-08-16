@@ -1,6 +1,6 @@
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, Self
 
 import httpx
@@ -50,6 +50,12 @@ class ApolloGateway:
     def close(self) -> None:
         if self._owns_client:
             self._client.close()
+
+    def restore_seen_provider_ids(self, provider_ids: Iterable[str]) -> None:
+        restored = {provider_id for provider_id in provider_ids if provider_id}
+        if len(self._seen_provider_ids | restored) > _MAX_UNIQUE_PEOPLE:
+            raise ValueError("restored provider IDs exceed the run limit")
+        self._seen_provider_ids.update(restored)
 
     def search(self, query: ProviderQuery, page: int) -> SearchPage:
         if page < 1:

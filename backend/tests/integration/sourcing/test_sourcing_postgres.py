@@ -22,6 +22,12 @@ from app.identity import models as identity_models  # noqa: F401
 from app.identity.dependencies import apply_tenant_context
 from app.identity.schemas import RequestContext, Role
 from app.jobs import models as job_models  # noqa: F401
+from app.providers.base import (
+    ProviderPerson,
+    ProviderQuery,
+    ProviderTemporaryError,
+    SearchPage,
+)
 from app.sourcing.models import (  # noqa: F401
     RunCandidate,
     RunCheckpoint,
@@ -32,7 +38,7 @@ from app.sourcing.models import (  # noqa: F401
 )
 from app.sourcing.service import SourcingError, SourcingService
 from app.sourcing.state_machine import RunState
-from app.sourcing.tasks import execute_plan_run
+from app.sourcing.tasks import execute_plan_run, execute_source_run
 
 OWNER_DATABASE_URL = os.getenv("TASK8_OWNER_DATABASE_URL")
 API_DATABASE_URL = os.getenv("TASK8_API_DATABASE_URL")
@@ -740,4 +746,214 @@ def test_cancellation_and_plan_transition_race_finishes_cancelled(
         assert run is not None
         assert run.state is RunState.CANCELLED
         assert run.cancellation_requested is True
+    engine.dispose()
+
+
+def _create_postgres_source_run(
+    scenario: dict[str, object], idempotency_key: str
+) -> tuple[Engine, sessionmaker[Session], UUID]:
+    assert API_DATABASE_URL is not None
+    engine = create_engine(API_DATABASE_URL)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as session:
+        apply_tenant_context(session, scenario["tenant_id"])
+        run = SourcingService(session, b"test-suppression-key").start(
+            scenario["context"],
+            scenario["first_job_id"],
+            idempotency_key=idempotency_key,
+        )
+        run.state = RunState.SOURCING
+        run.current_stage = RunState.SOURCING.value
+        run.planned_queries = [
+            {
+                "titles": ["Product Manager"],
+                "seniorities": [],
+                "person_locations": [],
+                "industry_codes": ["technology.fintech"],
+                "keywords": [],
+            }
+        ]
+        run_id = run.id
+        session.commit()
+    return engine, factory, run_id
+
+
+def _provider_person(provider_id: str, *, shared_url: bool = False) -> ProviderPerson:
+    return ProviderPerson(
+        provider="apollo",
+        provider_person_id=provider_id,
+        full_name="Task 8 Provider Person",
+        current_title="Product Manager",
+        current_company="Example",
+        location="New York, NY",
+        linkedin_url=(
+            "https://linkedin.com/in/task8-retry-shared"
+            if shared_url
+            else f"https://linkedin.com/in/{provider_id}"
+        ),
+        experiences=(),
+    )
+
+
+def test_cross_key_source_runs_share_one_postgres_execution_lock(
+    concurrency_scenario: dict[str, object],
+) -> None:
+    scenario = concurrency_scenario
+    engine, factory, run_id = _create_postgres_source_run(
+        scenario, "start-cross-key-source"
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    factory_calls = 0
+    active_calls = 0
+    maximum_active_calls = 0
+    guard = threading.Lock()
+    outcomes: queue.Queue[object] = queue.Queue()
+
+    class BlockingGateway:
+        def search(self, query: ProviderQuery, page: int) -> SearchPage:
+            nonlocal active_calls, maximum_active_calls
+            with guard:
+                active_calls += 1
+                maximum_active_calls = max(maximum_active_calls, active_calls)
+            entered.set()
+            try:
+                if not release.wait(timeout=5):
+                    raise TimeoutError("cross-key provider was not released")
+                return SearchPage(
+                    people=(_provider_person("cross-key-person"),),
+                    page=page,
+                    next_page=None,
+                    total_available=1,
+                )
+            finally:
+                with guard:
+                    active_calls -= 1
+
+        def close(self) -> None:
+            return None
+
+    def gateway_factory() -> BlockingGateway:
+        nonlocal factory_calls
+        with guard:
+            factory_calls += 1
+        return BlockingGateway()
+
+    def source(key: str) -> None:
+        try:
+            execute_source_run(
+                factory,
+                run_id,
+                scenario["context"],
+                gateway_factory=gateway_factory,
+                idempotency_key=key,
+            )
+        except Exception as error:  # noqa: BLE001 - thread outcome is asserted
+            outcomes.put(error)
+        else:
+            outcomes.put("ok")
+
+    first = threading.Thread(target=source, args=("source:cross-key-one",))
+    second = threading.Thread(target=source, args=("source:cross-key-two",))
+    first.start()
+    assert entered.wait(timeout=5)
+    second.start()
+    second.join(timeout=1)
+    second_returned_while_first_blocked = not second.is_alive()
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive()
+    results = [outcomes.get_nowait(), outcomes.get_nowait()]
+
+    assert second_returned_while_first_blocked
+    assert not any(isinstance(result, Exception) for result in results), results
+    assert factory_calls == 1
+    assert maximum_active_calls == 1
+    engine.dispose()
+
+
+def test_postgres_retry_rehydrates_seen_provider_ids_and_caps_run_at_300(
+    concurrency_scenario: dict[str, object],
+) -> None:
+    scenario = concurrency_scenario
+    engine, factory, run_id = _create_postgres_source_run(
+        scenario, "start-retry-rehydration"
+    )
+
+    class RetryGateway:
+        def __init__(self, *, fail_page_three: bool) -> None:
+            self.fail_page_three = fail_page_three
+            self.seen: set[str] = set()
+            self.restored: set[str] = set()
+            self.search_pages: list[int] = []
+
+        def restore_seen_provider_ids(self, provider_ids: set[str]) -> None:
+            self.restored = set(provider_ids)
+            self.seen.update(provider_ids)
+
+        def search(self, query: ProviderQuery, page: int) -> SearchPage:
+            self.search_pages.append(page)
+            if self.fail_page_three and page == 3:
+                raise ProviderTemporaryError("retry after completed pages")
+            start = (page - 1) * 100
+            available = [f"retry-person-{index}" for index in range(start, start + 100)]
+            remaining = max(0, 300 - len(self.seen))
+            returned_ids = available[:remaining]
+            self.seen.update(returned_ids)
+            return SearchPage(
+                people=tuple(
+                    _provider_person(provider_id, shared_url=True)
+                    for provider_id in returned_ids
+                ),
+                page=page,
+                next_page=(page + 1 if len(self.seen) < 300 else None),
+                total_available=400,
+            )
+
+        def close(self) -> None:
+            return None
+
+    first_gateway = RetryGateway(fail_page_three=True)
+    with pytest.raises(ProviderTemporaryError, match="retry after completed pages"):
+        execute_source_run(
+            factory,
+            run_id,
+            scenario["context"],
+            gateway_factory=lambda: first_gateway,
+            idempotency_key="source:retry-rehydration",
+            propagate_provider_errors=True,
+        )
+    assert first_gateway.search_pages == [1, 2, 3]
+
+    retry_gateway = RetryGateway(fail_page_three=False)
+    execute_source_run(
+        factory,
+        run_id,
+        scenario["context"],
+        gateway_factory=lambda: retry_gateway,
+        idempotency_key="source:retry-rehydration",
+    )
+
+    assert len(retry_gateway.restored) == 200
+    assert retry_gateway.search_pages == [3]
+    assert len(retry_gateway.seen) == 300
+    with factory() as session:
+        apply_tenant_context(session, scenario["tenant_id"])
+        run = session.get(SourcingRun, run_id)
+        assert run is not None
+        assert run.state is RunState.MATCHING
+        persisted_provider_ids = {
+            provider_id
+            for payload in session.scalars(
+                select(RunCheckpoint.payload).where(
+                    RunCheckpoint.run_id == run_id,
+                    RunCheckpoint.stage == "source",
+                    RunCheckpoint.status == "completed",
+                )
+            )
+            if payload is not None
+            for provider_id in payload.get("provider_person_ids", [])
+        }
+        assert len(persisted_provider_ids) == 300
     engine.dispose()

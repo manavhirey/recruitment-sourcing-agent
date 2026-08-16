@@ -3,7 +3,11 @@ from celery import Celery  # type: ignore[import-untyped]
 from app.core.config import get_settings
 
 settings = get_settings()
-celery_app = Celery("recruitment_sourcing", broker=settings.redis_url)
+celery_app = Celery(
+    "recruitment_sourcing",
+    broker=settings.redis_url,
+    include=("app.sourcing.tasks",),
+)
 celery_app.conf.update(
     accept_content=["json"],
     result_serializer="json",
@@ -16,3 +20,4 @@ celery_app.conf.update(
     enable_utc=True,
     worker_prefetch_multiplier=1,
 )
+celery_app.autodiscover_tasks(("app.sourcing",), force=True)

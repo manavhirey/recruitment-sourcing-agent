@@ -1,3 +1,6 @@
+import subprocess
+import sys
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -16,6 +19,29 @@ from app.sourcing.tasks import (
     source_run,
 )
 from app.worker import celery_app
+
+
+def test_clean_worker_process_registers_sourcing_tasks() -> None:
+    backend_root = Path(__file__).resolve().parents[3]
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from app.worker import celery_app; "
+                "required={'sourcing.plan_run','sourcing.source_run',"
+                "'sourcing.match_run'}; "
+                "missing=required-set(celery_app.tasks); "
+                "assert not missing, sorted(missing)"
+            ),
+        ],
+        cwd=backend_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
 
 
 def test_worker_acknowledges_after_commit_and_limits_prefetch() -> None:
@@ -73,9 +99,32 @@ def test_nonretryable_provider_failure_marks_run_failed(
         "_mark_source_retry_exhausted",
         lambda failed_run, context, key: marked.append((failed_run, context, key)),
     )
+    monkeypatch.setattr(tasks, "_run_is_match_eligible", lambda *args: False)
 
     source_run.run(str(run_id), str(tenant_id), str(user_id), "source")
 
     assert [(entry[0], entry[1].tenant_id, entry[2]) for entry in marked] == [
         (run_id, tenant_id, "source")
     ]
+
+
+def test_source_wrapper_dispatches_match_for_eligible_partial_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = uuid4()
+    tenant_id = uuid4()
+    user_id = uuid4()
+    dispatched: list[tuple[str, str, str, str]] = []
+
+    monkeypatch.setattr(tasks, "get_settings", lambda: object())
+    monkeypatch.setattr(tasks, "execute_source_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks, "_run_is_match_eligible", lambda *args: True)
+    monkeypatch.setattr(
+        tasks.match_run,
+        "delay",
+        lambda *args: dispatched.append(args),
+    )
+
+    source_run.run(str(run_id), str(tenant_id), str(user_id), "source")
+
+    assert dispatched == [(str(run_id), str(tenant_id), str(user_id), "match")]

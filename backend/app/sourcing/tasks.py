@@ -139,6 +139,46 @@ def _candidate_count(session: Session, run: SourcingRun) -> int:
     )
 
 
+def _durable_seen_provider_ids(session: Session, run: SourcingRun) -> set[str]:
+    seen: set[str] = set()
+    payloads = session.scalars(
+        select(RunCheckpoint.payload).where(
+            RunCheckpoint.tenant_id == run.tenant_id,
+            RunCheckpoint.run_id == run.id,
+            RunCheckpoint.stage == "source",
+            RunCheckpoint.status == "completed",
+        )
+    )
+    for payload in payloads:
+        if payload is None or "provider_person_ids" not in payload:
+            continue
+        provider_ids = payload["provider_person_ids"]
+        if not isinstance(provider_ids, list) or not all(
+            isinstance(provider_id, str) and provider_id for provider_id in provider_ids
+        ):
+            raise ValueError("stored source provider IDs are invalid")
+        seen.update(provider_ids)
+    if len(seen) > _MAX_RUN_CANDIDATES:
+        raise ValueError("stored source provider IDs exceed the run limit")
+    return seen
+
+
+def _new_run_people(
+    people: tuple[Any, ...], seen_provider_ids: set[str]
+) -> tuple[Any, ...]:
+    selected: list[Any] = []
+    remaining = _MAX_RUN_CANDIDATES - len(seen_provider_ids)
+    for person in people:
+        provider_id = person.provider_person_id
+        if provider_id in seen_provider_ids:
+            continue
+        seen_provider_ids.add(provider_id)
+        selected.append(person)
+        if len(selected) == remaining:
+            break
+    return tuple(selected)
+
+
 def execute_plan_run(
     session_factory: sessionmaker[Session],
     run_id: UUID,
@@ -310,7 +350,10 @@ def _record_source_page(
     run.candidate_count = _candidate_count(session, run)
     checkpoint.status = "completed"
     checkpoint.completed_at = datetime.now(UTC)
-    checkpoint.payload = {"candidate_count": run.candidate_count}
+    checkpoint.payload = {
+        "candidate_count": run.candidate_count,
+        "provider_person_ids": sorted({person.provider_person_id for person in people}),
+    }
 
 
 def _finish_source(
@@ -335,17 +378,7 @@ def _finish_source(
             run.state = transition_run(run.state, RunState.PARTIALLY_READY)
         run.current_stage = RunState.PARTIALLY_READY.value
     elif error:
-        successful_page = session.scalar(
-            select(RunCheckpoint.id)
-            .where(
-                RunCheckpoint.tenant_id == tenant_id,
-                RunCheckpoint.run_id == run_id,
-                RunCheckpoint.stage == "source",
-                RunCheckpoint.status == "completed",
-            )
-            .limit(1)
-        )
-        target = RunState.PARTIALLY_READY if successful_page else RunState.FAILED
+        target = RunState.PARTIALLY_READY if count else RunState.FAILED
         run.state = transition_run(run.state, target)
         run.current_stage = target.value
         run.error_code = "provider_search_failed"
@@ -386,9 +419,8 @@ def _source_execution_lock(
     session_factory: sessionmaker[Session],
     tenant_id: UUID,
     run_id: UUID,
-    idempotency_key: str,
 ) -> Iterator[bool]:
-    lock_key = f"{tenant_id}:{run_id}:{idempotency_key}"
+    lock_key = f"{tenant_id}:{run_id}"
     with session_factory() as lock_session:
         if lock_session.get_bind().dialect.name == "postgresql":
             lock_id = int.from_bytes(
@@ -434,9 +466,7 @@ def execute_source_run(
     idempotency_key: str = "source",
     propagate_provider_errors: bool = False,
 ) -> None:
-    with _source_execution_lock(
-        session_factory, context.tenant_id, run_id, idempotency_key
-    ) as acquired:
+    with _source_execution_lock(session_factory, context.tenant_id, run_id) as acquired:
         if not acquired:
             return
         _execute_source_run(
@@ -477,9 +507,19 @@ def _execute_source_run(
         queries = tuple(_query_from_payload(item) for item in run.planned_queries)
         session.commit()
 
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        run = _load_run(session, run_id, context.tenant_id)
+        restored_provider_ids = _durable_seen_provider_ids(session, run)
+        session.rollback()
+
     gateway = gateway_factory()
+    restore_seen = getattr(gateway, "restore_seen_provider_ids", None)
+    if callable(restore_seen):
+        restore_seen(set(restored_provider_ids))
     provider_error = False
     budget_exhausted = False
+    cancelled = False
     try:
         for query_number, query in enumerate(queries, start=1):
             page_number: int | None = 1
@@ -489,9 +529,14 @@ def _execute_source_run(
                     run = _load_run(session, run_id, context.tenant_id, for_update=True)
                     if run.cancellation_requested or run.state is RunState.CANCELLED:
                         session.rollback()
+                        cancelled = True
                         page_number = None
                         break
-                    if _candidate_count(session, run) >= _MAX_RUN_CANDIDATES:
+                    if (
+                        _candidate_count(session, run) >= _MAX_RUN_CANDIDATES
+                        or len(_durable_seen_provider_ids(session, run))
+                        >= _MAX_RUN_CANDIDATES
+                    ):
                         session.rollback()
                         page_number = None
                         break
@@ -552,11 +597,25 @@ def _execute_source_run(
                 with session_factory() as session:
                     _apply_tenant_context(session, context.tenant_id)
                     run = _load_run(session, run_id, context.tenant_id, for_update=True)
+                    if run.cancellation_requested or run.state is RunState.CANCELLED:
+                        SourcingService(session, b"internal-worker").reconcile_usage(
+                            context,
+                            run_id,
+                            reservation_key=reservation_key,
+                            charged_units=dict(page.charged_units),
+                            provider_request_id=page.provider_request_id,
+                        )
+                        session.commit()
+                        cancelled = True
+                        page_number = None
+                        break
+                    seen_provider_ids = _durable_seen_provider_ids(session, run)
+                    run_people = _new_run_people(page.people, seen_provider_ids)
                     page_key = (
                         f"{idempotency_key}:q{query_number}:p{page.page}:"
                         f"{query.query_hash}"
                     )
-                    _record_source_page(session, run, context, page.people, page_key)
+                    _record_source_page(session, run, context, run_people, page_key)
                     checkpoint = _checkpoint(session, run, page_key, "source")
                     checkpoint.payload = {
                         **(checkpoint.payload or {}),
@@ -571,7 +630,7 @@ def _execute_source_run(
                     )
                     session.commit()
                 page_number = page.next_page
-            if provider_error or budget_exhausted:
+            if provider_error or budget_exhausted or cancelled:
                 break
     finally:
         close = getattr(gateway, "close", None)
@@ -605,6 +664,22 @@ def _mark_source_retry_exhausted(
             error=True,
         )
         session.commit()
+
+
+def _run_is_match_eligible(
+    session_factory: sessionmaker[Session],
+    run_id: UUID,
+    context: RequestContext,
+) -> bool:
+    with session_factory() as session:
+        _apply_tenant_context(session, context.tenant_id)
+        run = _load_run(session, run_id, context.tenant_id)
+        eligible = run.candidate_count > 0 and run.state in (
+            RunState.MATCHING,
+            RunState.PARTIALLY_READY,
+        )
+        session.rollback()
+    return eligible
 
 
 def _context(tenant_id: str, user_id: str) -> RequestContext:
@@ -673,23 +748,17 @@ def source_run(
     except (ProviderRateLimited, ProviderTemporaryError) as error:
         if self.request.retries >= self.max_retries:
             _mark_source_retry_exhausted(UUID(run_id), context, idempotency_key)
-            return
-        raise self.retry(
-            exc=error,
-            countdown=_provider_retry_countdown(
-                error,
-                retries=self.request.retries,
-            ),
-        ) from error
+        else:
+            raise self.retry(
+                exc=error,
+                countdown=_provider_retry_countdown(
+                    error,
+                    retries=self.request.retries,
+                ),
+            ) from error
     except ProviderError:
         _mark_source_retry_exhausted(UUID(run_id), context, idempotency_key)
-        return
-    with database_session_factory() as session:
-        _apply_tenant_context(session, context.tenant_id)
-        run = _load_run(session, UUID(run_id), context.tenant_id)
-        should_match = run.state is RunState.MATCHING
-        session.rollback()
-    if should_match:
+    if _run_is_match_eligible(database_session_factory, UUID(run_id), context):
         match_run.delay(run_id, tenant_id, user_id, "match")
 
 

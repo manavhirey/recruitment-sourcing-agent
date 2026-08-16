@@ -17,6 +17,7 @@ from app.identity.models import Tenant, User
 from app.identity.schemas import RequestContext, Role
 from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
 from app.providers.base import ProviderPerson, ProviderQuery, SearchPage
+from app.sourcing import tasks as sourcing_tasks
 from app.sourcing.models import (
     RunCandidate,
     RunCheckpoint,
@@ -25,6 +26,7 @@ from app.sourcing.models import (
     UsageBudget,
     UsageLedger,
 )
+from app.sourcing.service import SourcingService
 from app.sourcing.state_machine import RunState
 from app.sourcing.tasks import execute_match_run, execute_plan_run, execute_source_run
 
@@ -94,6 +96,36 @@ class FailingGateway:
         from app.providers.base import ProviderTemporaryError
 
         raise ProviderTemporaryError("secret provider detail")
+
+    def close(self) -> None:
+        return None
+
+
+class PaginatedOnePersonGateway:
+    def __init__(self) -> None:
+        self.search_calls = 0
+
+    def search(self, query: ProviderQuery, page: int) -> SearchPage:
+        self.search_calls += 1
+        if page != 1:
+            raise AssertionError("budget must be reserved before page two")
+        return SearchPage(
+            people=(
+                ProviderPerson(
+                    provider="apollo",
+                    provider_person_id="budget-partial-person",
+                    full_name="Budget Partial Person",
+                    current_title="Product Manager",
+                    current_company="Example",
+                    location="New York, NY",
+                    linkedin_url="https://linkedin.com/in/budget-partial-person",
+                    experiences=(),
+                ),
+            ),
+            page=1,
+            next_page=2,
+            total_available=2,
+        )
 
     def close(self) -> None:
         return None
@@ -413,7 +445,7 @@ def test_provider_failure_distinguishes_no_results_from_partial_results(
         )
 
 
-def test_successful_empty_page_then_provider_failure_is_partially_ready(
+def test_successful_empty_page_then_provider_failure_is_failed_without_usable_results(
     sourcing_scenario: dict[str, Any],
 ) -> None:
     scenario = sourcing_scenario
@@ -437,7 +469,7 @@ def test_successful_empty_page_then_provider_failure_is_partially_ready(
     with scenario["factory"]() as session:
         run = session.get(SourcingRun, scenario["run_id"])
         assert run is not None
-        assert run.state is RunState.PARTIALLY_READY
+        assert run.state is RunState.FAILED
         assert run.candidate_count == 0
         assert run.error_code == "provider_search_failed"
         assert "secret" not in run.error_message
@@ -452,6 +484,87 @@ def test_successful_empty_page_then_provider_failure_is_partially_ready(
             )
             == 1
         )
+
+
+def test_provider_failure_with_candidates_is_matched_into_enriching(
+    sourcing_scenario: dict[str, Any],
+) -> None:
+    scenario = sourcing_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    execute_source_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        gateway_factory=lambda: FailingGateway(first_page_succeeds=True),
+        idempotency_key="source:provider-partial-pipeline",
+    )
+
+    assert sourcing_tasks._run_is_match_eligible(
+        scenario["factory"], scenario["run_id"], context
+    )
+    execute_match_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        idempotency_key="match:provider-partial-pipeline",
+    )
+
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        assert run.state is RunState.ENRICHING
+        assert run.matched_count == 1
+
+
+def test_budget_exhaustion_with_candidates_is_matched_into_enriching(
+    sourcing_scenario: dict[str, Any],
+) -> None:
+    scenario = sourcing_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    with scenario["factory"]() as session:
+        session.add(
+            UsageBudget(
+                tenant_id=scenario["tenant_id"],
+                max_search_pages=1,
+                max_estimated_credits=1,
+            )
+        )
+        session.commit()
+
+    gateway = PaginatedOnePersonGateway()
+    execute_source_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        gateway_factory=lambda: gateway,
+        idempotency_key="source:budget-partial-pipeline",
+    )
+
+    assert sourcing_tasks._run_is_match_eligible(
+        scenario["factory"], scenario["run_id"], context
+    )
+    execute_match_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        idempotency_key="match:budget-partial-pipeline",
+    )
+
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        assert run.state is RunState.ENRICHING
+        assert run.matched_count == 1
+        assert run.error_code == "usage_budget_exhausted"
+    assert gateway.search_calls == 1
 
 
 def test_source_reserves_budget_before_the_provider_call(
@@ -564,6 +677,107 @@ def test_concurrent_source_replay_uses_one_run_scoped_gateway(
             )
             == 1
         )
+
+
+def test_inflight_cancellation_prevents_ingestion_and_reconciles_usage(
+    sourcing_scenario: dict[str, Any],
+) -> None:
+    scenario = sourcing_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    outcomes: list[object] = []
+
+    class BlockingGateway:
+        def search(self, query: ProviderQuery, page: int) -> SearchPage:
+            entered.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("cancellation test did not release provider")
+            return SearchPage(
+                people=(
+                    ProviderPerson(
+                        provider="apollo",
+                        provider_person_id="cancelled-inflight-person",
+                        full_name="Cancelled Inflight Person",
+                        current_title="Product Manager",
+                        current_company="Example",
+                        location="New York, NY",
+                        linkedin_url=(
+                            "https://linkedin.com/in/cancelled-inflight-person"
+                        ),
+                        experiences=(),
+                    ),
+                ),
+                page=page,
+                next_page=None,
+                total_available=1,
+                provider_request_id="cancelled-provider-request",
+            )
+
+        def close(self) -> None:
+            return None
+
+    def source() -> None:
+        try:
+            execute_source_run(
+                scenario["factory"],
+                scenario["run_id"],
+                context,
+                gateway_factory=BlockingGateway,
+                idempotency_key="source:inflight-cancel",
+            )
+        except Exception as error:  # noqa: BLE001 - thread outcome is asserted
+            outcomes.append(error)
+        else:
+            outcomes.append("ok")
+
+    thread = threading.Thread(target=source)
+    thread.start()
+    assert entered.wait(timeout=5)
+    with scenario["factory"]() as session:
+        SourcingService(session, b"test-suppression-key").cancel(
+            context,
+            scenario["run_id"],
+            idempotency_key="cancel:inflight-provider",
+        )
+        session.commit()
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert outcomes == ["ok"]
+
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        assert run.state is RunState.CANCELLED
+        assert run.candidate_count == 0
+        assert session.scalar(select(func.count()).select_from(RunCandidate)) == 0
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(RunCheckpoint)
+                .where(RunCheckpoint.run_id == scenario["run_id"])
+            )
+            == 1
+        )
+        usage = list(
+            session.scalars(
+                select(UsageLedger)
+                .where(UsageLedger.run_id == scenario["run_id"])
+                .order_by(UsageLedger.unit_type)
+            )
+        )
+        assert [(row.unit_type, row.charged_units) for row in usage] == [
+            ("estimated_credits", 1),
+            ("search_pages", 1),
+        ]
+        assert {row.provider_request_id for row in usage} == {
+            "cancelled-provider-request"
+        }
 
 
 def test_one_gateway_scope_spans_all_queries_and_stops_at_300_unique_people(

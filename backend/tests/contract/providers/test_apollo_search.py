@@ -304,6 +304,30 @@ def test_apollo_search_scopes_deduplication_to_a_gateway_run(
     assert [person.provider_person_id for person in second.people] == ["p1"]
 
 
+def test_apollo_search_restores_run_seen_ids_after_task_retry(
+    respx_mock: respx.MockRouter,
+    apollo_gateway: ApolloGateway,
+    provider_query: ProviderQuery,
+) -> None:
+    respx_mock.post(APOLLO_PEOPLE_SEARCH_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "people": [
+                    {"id": "p1", "name": "Already Seen"},
+                    {"id": "p2", "name": "New Person"},
+                ],
+                "total_entries": 2,
+            },
+        )
+    )
+    apollo_gateway.restore_seen_provider_ids({"p1"})
+
+    page = apollo_gateway.search(provider_query, page=1)
+
+    assert [person.provider_person_id for person in page.people] == ["p2"]
+
+
 def test_apollo_search_enforces_timeout_for_injected_client(
     respx_mock: respx.MockRouter,
     provider_query: ProviderQuery,
