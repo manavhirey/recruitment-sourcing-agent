@@ -48,6 +48,9 @@ def _allow_enrichment_run(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(tasks, "_enrichment_execution_lock", acquired)
     monkeypatch.setattr(tasks, "_has_active_enrichment_retry", lambda *args: False)
+    monkeypatch.setattr(
+        tasks, "fail_active_enrichment_requests", lambda *args, **kwargs: 0
+    )
 
 
 def test_clean_worker_process_registers_sourcing_tasks() -> None:
@@ -277,6 +280,45 @@ def test_disabled_connector_marks_enrichment_partial_without_provider_call(
     assert observed == ["run_marked"]
 
 
+def test_disabled_connector_sweeps_active_requests_before_retry_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id, tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    claim_token = uuid4()
+    observed: list[str] = []
+    _allow_enrichment_run(monkeypatch)
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: False)
+    monkeypatch.setattr(
+        tasks,
+        "_claim_enrichment_retry_delivery",
+        lambda *args: claim_token,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "fail_active_enrichment_requests",
+        lambda *args, **kwargs: observed.append("requests_swept") or 2,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_mark_enrichment_provider_disabled",
+        lambda *args: observed.append("run_marked"),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_complete_enrichment_retry_delivery",
+        lambda *args: observed.append("retry_completed") or True,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "ApolloGateway",
+        lambda *args: pytest.fail("disabled connector must not reach provider"),
+    )
+
+    enrich_run.run(str(run_id), str(tenant_id), str(user_id), 50, 3)
+
+    assert observed == ["requests_swept", "run_marked", "retry_completed"]
+
+
 def test_disabled_connector_fails_queued_enrichment_without_provider_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -355,6 +397,11 @@ def test_enrichment_authz_failures_disable_platform_before_future_calls(
     observed: list[object] = []
     if task is enrich_run:
         _allow_enrichment_run(monkeypatch)
+        monkeypatch.setattr(
+            tasks,
+            "fail_active_enrichment_requests",
+            lambda *args, **kwargs: observed.append("requests_swept") or 1,
+        )
 
     class Gateway:
         def close(self) -> None:
@@ -384,11 +431,11 @@ def test_enrichment_authz_failures_disable_platform_before_future_calls(
 
     task.run(str(identifier), str(tenant_id), str(user_id))
 
-    assert observed == [
-        ("apollo", reason),
-        "work_marked",
-        "gateway_closed",
-    ]
+    expected: list[object] = [("apollo", reason)]
+    if task is enrich_run:
+        expected.append("requests_swept")
+    expected.extend(("work_marked", "gateway_closed"))
+    assert observed == expected
 
 
 def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(

@@ -1024,6 +1024,42 @@ def _mark_request_failed(
     enrichment.usage_reconciled_at = datetime.now(UTC)
 
 
+def fail_active_enrichment_requests(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    run_id: UUID,
+    *,
+    error_code: str,
+) -> int:
+    with _tenant_session(session_factory, context.tenant_id) as session:
+        active = session.scalars(
+            select(EnrichmentRequest)
+            .where(
+                EnrichmentRequest.tenant_id == context.tenant_id,
+                EnrichmentRequest.run_id == run_id,
+                EnrichmentRequest.status.in_(("queued", "submitting", "pending")),
+            )
+            .order_by(EnrichmentRequest.id)
+            .with_for_update()
+        ).all()
+        for enrichment in active:
+            charge_reserved = (
+                enrichment.provider_request_id is not None
+                or enrichment.status == "pending"
+                or enrichment.usage_reconciled_at is not None
+            )
+            _mark_request_failed(
+                session,
+                enrichment,
+                context,
+                error_code=error_code,
+                charge_reserved=charge_reserved,
+            )
+        session.commit()
+    _finalize_if_terminal(session_factory, context, run_id)
+    return len(active)
+
+
 def _defer_poll_request(
     session_factory: sessionmaker[Session],
     context: RequestContext,

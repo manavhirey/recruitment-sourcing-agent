@@ -42,6 +42,7 @@ from app.sourcing.enrichment import (
     _fail_request,
     enqueue_top_enrichment,
     execute_queued_enrichment_request,
+    fail_active_enrichment_requests,
     poll_enrichment_request,
 )
 from app.sourcing.models import (
@@ -1444,6 +1445,12 @@ def enrich_run(
         try:
             if not is_provider_enabled(database_session_factory, "apollo"):
                 _record_provider_outcome("people_enrichment", "connector_disabled")
+                fail_active_enrichment_requests(
+                    database_session_factory,
+                    context,
+                    parsed_run_id,
+                    error_code="provider_connector_disabled",
+                )
                 _mark_enrichment_provider_disabled(parsed_run_id, context)
                 _complete_enrichment_retry_delivery(
                     database_session_factory,
@@ -1475,6 +1482,12 @@ def enrich_run(
                     database_session_factory, "apollo", "authentication_error"
                 )
                 _record_provider_outcome("people_enrichment", "authentication_error")
+                fail_active_enrichment_requests(
+                    database_session_factory,
+                    context,
+                    parsed_run_id,
+                    error_code="provider_authorization_failed",
+                )
                 _mark_enrichment_provider_disabled(parsed_run_id, context)
                 _complete_enrichment_retry_delivery(
                     database_session_factory,
@@ -1487,6 +1500,12 @@ def enrich_run(
             except ProviderPermissionError:
                 disable_provider(database_session_factory, "apollo", "permission_error")
                 _record_provider_outcome("people_enrichment", "permission_error")
+                fail_active_enrichment_requests(
+                    database_session_factory,
+                    context,
+                    parsed_run_id,
+                    error_code="provider_authorization_failed",
+                )
                 _mark_enrichment_provider_disabled(parsed_run_id, context)
                 _complete_enrichment_retry_delivery(
                     database_session_factory,

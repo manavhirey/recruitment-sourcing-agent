@@ -33,17 +33,21 @@ from app.providers.base import (
     EnrichmentInput,
     EnrichmentReceipt,
     EnrichmentResult,
+    ProviderAuthenticationError,
     ProviderContact,
 )
+from app.providers.health import ProviderConnectorState
 from app.providers.snapshots import SnapshotStore
 from app.sourcing import tasks
 from app.sourcing.enrichment import RegionalContactPolicy
 from app.sourcing.models import (
     EnrichmentRequest,
+    EnrichmentRetryDispatch,
     ProviderSnapshot,
     RunCandidate,
     SourcingRun,
     UsageBudget,
+    UsageLedger,
     WebhookDelivery,
 )
 from app.sourcing.service import SourcingService
@@ -747,6 +751,24 @@ class CeleryEntryGateway:
         return None
 
 
+class AuthenticationFailureGateway(CeleryEntryGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def enrich_batch(
+        self,
+        people: tuple[EnrichmentInput, ...],
+        webhook_url: str,
+        *,
+        reveal_personal_emails: bool = False,
+        reveal_phone_number: bool = False,
+    ) -> EnrichmentReceipt:
+        del people, webhook_url, reveal_personal_emails, reveal_phone_number
+        self.calls += 1
+        raise ProviderAuthenticationError("provider rejected credentials")
+
+
 def _seed_celery_entry_run(
     owner_engine: Engine, *, suffix: str
 ) -> tuple[UUID, UUID, UUID, UUID]:
@@ -992,6 +1014,155 @@ def test_auto_enrichment_celery_entry_binds_tenant_before_forced_rls(
         run = session.get(SourcingRun, run_id)
         assert run is not None and run.state is RunState.READY
     api_engine.dispose()
+
+
+def test_cross_run_auth_circuit_sweeps_disabled_retry_generation(
+    owner_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert API_DATABASE_URL is not None
+    tenant_a, user_a, run_a, run_candidate_a = _seed_celery_entry_run(
+        owner_engine, suffix="circuit-a"
+    )
+    tenant_b, user_b, run_b, _ = _seed_celery_entry_run(
+        owner_engine, suffix="circuit-b"
+    )
+    now = datetime.now(UTC)
+    reservation_states = {
+        "circuit-queued": ("queued", None, None),
+        "circuit-accepted": ("pending", "accepted-request", None),
+        "circuit-ambiguous": ("submitting", None, now),
+    }
+    with Session(owner_engine, expire_on_commit=False) as session:
+        connector = session.get(ProviderConnectorState, "apollo")
+        if connector is not None:
+            session.delete(connector)
+        run = session.get(SourcingRun, run_a)
+        run_candidate = session.get(RunCandidate, run_candidate_a)
+        assert run is not None and run_candidate is not None
+        for reservation_key, (
+            status,
+            provider_request_id,
+            reconciled_at,
+        ) in reservation_states.items():
+            request = EnrichmentRequest(
+                tenant_id=tenant_a,
+                run_id=run_a,
+                provider="apollo",
+                provider_request_id=provider_request_id,
+                candidate_ids=[str(run_candidate.candidate_id)],
+                reservation_key=reservation_key,
+                status=status,
+                usage_reconciled_at=reconciled_at,
+            )
+            session.add(request)
+            for unit_type, requested_units in (
+                ("enrichments", 1),
+                ("estimated_credits", 9),
+            ):
+                session.add(
+                    UsageLedger(
+                        tenant_id=tenant_a,
+                        run_id=run_a,
+                        job_id=run.job_id,
+                        provider="apollo",
+                        endpoint="people_bulk_match",
+                        unit_type=unit_type,
+                        reservation_key=reservation_key,
+                        requested_units=requested_units,
+                        charged_units=(
+                            requested_units if reconciled_at is not None else None
+                        ),
+                        reconciled_at=reconciled_at,
+                    )
+                )
+        session.add(
+            EnrichmentRetryDispatch(
+                tenant_id=tenant_a,
+                run_id=run_a,
+                generation=1,
+                status="published",
+                state_fingerprint="a" * 64,
+                task_id=f"enrich-run-retry:{run_a}:1",
+                requested_by_user_id=user_a,
+                candidate_limit=50,
+                not_before=now - timedelta(seconds=1),
+            )
+        )
+        session.commit()
+
+    gateway = AuthenticationFailureGateway()
+    api_engine = create_engine(API_DATABASE_URL)
+    _patch_celery_entry_dependencies(
+        monkeypatch, api_engine, gateway, reveal_phone=False
+    )
+    try:
+        tasks.enrich_run.run(str(run_b), str(tenant_b), str(user_b), 50)
+        assert gateway.calls == 1
+
+        tasks.enrich_run.run(str(run_a), str(tenant_a), str(user_a), 50, 1)
+        assert gateway.calls == 1
+
+        with Session(owner_engine) as session:
+            requests = list(
+                session.scalars(
+                    select(EnrichmentRequest)
+                    .where(
+                        EnrichmentRequest.tenant_id == tenant_a,
+                        EnrichmentRequest.run_id == run_a,
+                    )
+                    .order_by(EnrichmentRequest.reservation_key)
+                )
+            )
+            assert requests
+            assert all(request.status == "failed" for request in requests)
+            assert all(
+                request.error_code == "provider_connector_disabled"
+                for request in requests
+            )
+            assert all(request.usage_reconciled_at is not None for request in requests)
+            assert not session.scalar(
+                select(func.count())
+                .select_from(EnrichmentRequest)
+                .where(
+                    EnrichmentRequest.tenant_id == tenant_a,
+                    EnrichmentRequest.run_id == run_a,
+                    EnrichmentRequest.status.in_(("queued", "submitting", "pending")),
+                )
+            )
+            run = session.get(SourcingRun, run_a)
+            run_candidate = session.get(RunCandidate, run_candidate_a)
+            retry = session.get(EnrichmentRetryDispatch, (tenant_a, run_a))
+            assert run is not None and run.state is RunState.PARTIALLY_READY
+            assert run.error_code == "provider_connector_disabled"
+            assert run_candidate is not None
+            assert run_candidate.enrichment_status == "failed"
+            assert retry is not None and retry.status == "completed"
+            assert retry.claim_token is None and retry.claimed_at is None
+
+            ledger = list(
+                session.scalars(
+                    select(UsageLedger).where(
+                        UsageLedger.tenant_id == tenant_a,
+                        UsageLedger.run_id == run_a,
+                    )
+                )
+            )
+            charges = {
+                (row.reservation_key, row.unit_type): row.charged_units
+                for row in ledger
+            }
+            assert charges[("circuit-queued", "enrichments")] == 0
+            assert charges[("circuit-queued", "estimated_credits")] == 0
+            for reservation_key in ("circuit-accepted", "circuit-ambiguous"):
+                assert charges[(reservation_key, "enrichments")] == 1
+                assert charges[(reservation_key, "estimated_credits")] == 9
+    finally:
+        api_engine.dispose()
+        with Session(owner_engine) as session:
+            connector = session.get(ProviderConnectorState, "apollo")
+            if connector is not None:
+                session.delete(connector)
+            session.commit()
 
 
 def test_on_demand_and_poll_celery_entries_bind_tenant_before_forced_rls(
