@@ -7,6 +7,7 @@ from app.clients import models as client_models  # noqa: F401
 from app.core.config import get_settings
 from app.core.database import Base
 from app.identity import models  # noqa: F401
+from app.jobs import models as job_models  # noqa: F401
 
 config = context.config
 settings = get_settings()

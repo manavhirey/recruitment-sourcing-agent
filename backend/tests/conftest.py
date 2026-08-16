@@ -13,6 +13,7 @@ os.environ.update(
         "OBJECT_STORE_ENDPOINT": "http://localhost:9000",
         "OIDC_ISSUER": "https://issuer.test/",
         "OIDC_AUDIENCE": "sourcing-api",
+        "OPENAI_API_KEY": "test-openai-key",
         "APOLLO_API_KEY": "test-apollo-key",
         "CONTACT_ENCRYPTION_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "SUPPRESSION_HMAC_KEY": "test-suppression-key",

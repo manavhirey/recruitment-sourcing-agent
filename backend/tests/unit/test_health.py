@@ -49,6 +49,7 @@ REDIS_URL=redis://localhost:6379/0
 OBJECT_STORE_ENDPOINT=http://localhost:9000
 OIDC_ISSUER=https://issuer.example.com/
 OIDC_AUDIENCE=sourcing-api
+OPENAI_API_KEY=development-openai-key
 APOLLO_API_KEY=development-apollo-key
 CONTACT_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 SUPPRESSION_HMAC_KEY=development-suppression-key

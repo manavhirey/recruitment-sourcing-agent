@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     object_store_bucket: str = "provider-snapshots"
     oidc_issuer: str
     oidc_audience: str
+    openai_api_key: SecretStr
+    scorecard_model: str = "gpt-5-mini"
     apollo_api_key: SecretStr
     contact_encryption_key: SecretStr
     suppression_hmac_key: SecretStr
@@ -47,6 +49,7 @@ class Settings(BaseSettings):
             object_store_endpoint="http://localhost:9000",
             oidc_issuer="https://issuer.test/",
             oidc_audience="sourcing-api",
+            openai_api_key="test-openai-key",
             apollo_api_key="test-apollo-key",
             contact_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             suppression_hmac_key="test-suppression-key",
