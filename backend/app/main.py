@@ -17,6 +17,7 @@ from app.candidates.contacts import ContactCipher
 from app.candidates.router import router as candidates_router
 from app.clients.router import router as clients_router
 from app.core.config import Settings, get_settings
+from app.core.database import TransactionBoundaryMiddleware
 from app.core.log_redaction import install_sensitive_data_log_filters
 from app.core.security import TokenVerifier
 from app.core.telemetry import (
@@ -146,6 +147,7 @@ def create_app(
     readiness_checks: Mapping[str, ReadinessCheck] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Recruitment Sourcing API", version="1.0.0")
+    app.add_middleware(TransactionBoundaryMiddleware)
     app.state.settings = settings or get_settings()
     app.state.token_verifier = TokenVerifier(app.state.settings)
     app.state.scorecard_gateway = scorecard_gateway or OpenAIResponsesScorecardGateway(

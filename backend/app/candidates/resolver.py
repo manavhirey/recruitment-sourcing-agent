@@ -25,9 +25,21 @@ class CandidateResolver:
         by_provider = self._by_provider_id(
             context.tenant_id, person.provider, person.provider_person_id
         )
-        if by_provider is not None:
-            return ResolutionDecision.reuse(by_provider, "provider_id")
         normalized_url = normalize_profile_url(person.linkedin_url)
+        if by_provider is not None:
+            by_url = (
+                self._by_profile_url(context.tenant_id, normalized_url)
+                if normalized_url is not None
+                else None
+            )
+            conflicts = (
+                (by_url,) if by_url is not None and by_url != by_provider else ()
+            )
+            return ResolutionDecision.reuse(
+                by_provider,
+                "provider_id",
+                conflict_candidate_ids=conflicts,
+            )
         if normalized_url is not None:
             by_url = self._by_profile_url(context.tenant_id, normalized_url)
             if by_url is not None:

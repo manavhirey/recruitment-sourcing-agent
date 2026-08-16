@@ -42,9 +42,144 @@ def test_test_settings_supply_all_required_secrets() -> None:
     assert hasattr(worker, "apollo_api_key")
     assert not hasattr(worker, "oidc_issuer")
     assert not hasattr(worker, "openai_api_key")
-    assert SchedulerSettings(_env_file=None, redis_url="redis://broker/0").model_dump() == {
-        "redis_url": "redis://broker/0"
-    }
+    assert (
+        settings.identity_hmac_key.get_secret_value()
+        != settings.suppression_hmac_key.get_secret_value()
+    )
+    assert settings.identity_hmac_key_version == "v1"
+    assert SchedulerSettings(
+        _env_file=None, redis_url="redis://broker/0"
+    ).model_dump() == {"redis_url": "redis://broker/0"}
+
+
+def _production_runtime_payload() -> dict[str, object]:
+    payload = Settings.for_test().model_dump()
+    payload.update(
+        environment="production",
+        database_url=(
+            "postgresql+psycopg://sourcing_api:"
+            "api-password-with-32-random-characters@db.internal:5432/sourcing"
+        ),
+        redis_url=(
+            "rediss://:redis-password-with-32-random-characters@redis.internal:6379/0"
+        ),
+        object_store_endpoint="https://objects.internal",
+        object_store_writer_access_key_id="writer-access-identity-2026",
+        object_store_writer_secret_access_key="writer-secret-with-32-random-characters",
+        oidc_issuer="https://identity.company.com/",
+        openai_api_key="sk-live-with-32-random-characters-2026",
+        contact_encryption_key="QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=",
+        suppression_hmac_key="suppression-with-32-random-characters",
+        identity_hmac_key="identity-with-32-random-characters-2026",
+        telemetry_hmac_key="telemetry-with-32-random-characters-2026",
+        webhook_hmac_key="webhook-with-32-random-characters-2026",
+        webhook_base_url="https://api.company.com",
+    )
+    return payload
+
+
+def _production_worker_payload() -> dict[str, object]:
+    payload = WorkerSettings.for_test().model_dump()
+    payload.update(_production_runtime_payload())
+    payload.pop("oidc_issuer", None)
+    payload.pop("oidc_audience", None)
+    payload.pop("openai_api_key", None)
+    payload.pop("scorecard_model", None)
+    payload["apollo_api_key"] = "apollo-with-32-random-characters-2026"
+    return payload
+
+
+def _production_maintenance_payload() -> dict[str, object]:
+    payload = MaintenanceSettings.for_test().model_dump()
+    payload.update(
+        environment="production",
+        maintenance_database_url=(
+            "postgresql+psycopg://sourcing_maintenance:"
+            "maintenance-password-with-32-random@db.internal:5432/sourcing"
+        ),
+        redis_url=(
+            "rediss://:maintenance-redis-password-32-random@redis.internal:6379/0"
+        ),
+        object_store_endpoint="https://objects.internal",
+        object_store_delete_access_key_id="delete-access-identity-2026",
+        object_store_delete_secret_access_key="delete-secret-with-32-random-characters",
+        telemetry_hmac_key="maintenance-telemetry-32-random-characters",
+    )
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (Settings, _production_runtime_payload()),
+        (WorkerSettings, _production_worker_payload()),
+        (MaintenanceSettings, _production_maintenance_payload()),
+    ],
+)
+def test_production_settings_accept_strong_distinct_secure_configuration(
+    model: type[Settings] | type[WorkerSettings] | type[MaintenanceSettings],
+    payload: dict[str, object],
+) -> None:
+    model(_env_file=None, **payload)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload", "field", "unsafe_value"),
+    [
+        (Settings, _production_runtime_payload(), "suppression_hmac_key", "short"),
+        (
+            Settings,
+            _production_runtime_payload(),
+            "identity_hmac_key",
+            "suppression-with-32-random-characters",
+        ),
+        (
+            Settings,
+            _production_runtime_payload(),
+            "object_store_endpoint",
+            "http://objects.internal",
+        ),
+        (
+            Settings,
+            _production_runtime_payload(),
+            "database_url",
+            (
+                "postgresql+psycopg://sourcing_api:"
+                "api-password-with-32-random-characters@localhost:5432/sourcing"
+            ),
+        ),
+        (
+            WorkerSettings,
+            _production_worker_payload(),
+            "apollo_api_key",
+            "replace-with-production-key",
+        ),
+        (
+            WorkerSettings,
+            _production_worker_payload(),
+            "contact_encryption_key",
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+        ),
+        (
+            MaintenanceSettings,
+            _production_maintenance_payload(),
+            "redis_url",
+            "redis://redis.internal:6379/0",
+        ),
+    ],
+)
+def test_production_settings_reject_weak_reused_placeholder_or_insecure_values(
+    model: type[Settings] | type[WorkerSettings] | type[MaintenanceSettings],
+    payload: dict[str, object],
+    field: str,
+    unsafe_value: str,
+) -> None:
+    payload[field] = unsafe_value
+
+    with pytest.raises(ValidationError) as caught:
+        model(_env_file=None, **payload)
+
+    assert unsafe_value not in str(caught.value)
 
 
 def test_object_store_capability_settings_expose_only_their_own_credentials() -> None:
@@ -444,13 +579,15 @@ def test_compose_processes_receive_only_their_required_capabilities() -> None:
 
     assert "DATABASE_URL" in services["api"]["environment"]
     assert "DATABASE_URL" in services["worker"]["environment"]
-    assert "MAINTENANCE_DATABASE_URL" in services["maintenance-worker"][
-        "environment"
-    ]
+    assert "MAINTENANCE_DATABASE_URL" in services["maintenance-worker"]["environment"]
     assert "AUTH_SECRET" in services["web"]["environment"]
     for data_service in ("postgres", "redis", "minio", "prometheus"):
         assert "ports" not in services[data_service]
-    assert services["scheduler"]["environment"] == {"REDIS_URL": "${REDIS_URL}"}
+    assert services["scheduler"]["environment"] == {"REDIS_URL": "${COMPOSE_REDIS_URL}"}
+    assert services["api"]["environment"]["DATABASE_URL"] == ("${COMPOSE_DATABASE_URL}")
+    assert services["api"]["environment"]["OBJECT_STORE_ENDPOINT"] == (
+        "${COMPOSE_OBJECT_STORE_ENDPOINT}"
+    )
     assert "--no-access-log" in services["api"]["command"]
 
 
@@ -487,9 +624,10 @@ def test_rendered_compose_preserves_capability_and_port_isolation() -> None:
         "OIDC_AUDIENCE",
         "OPENAI_API_KEY",
     }.isdisjoint(services["worker"]["environment"])
-    assert "OBJECT_STORE_WRITER_SECRET_ACCESS_KEY" not in services[
-        "maintenance-worker"
-    ]["environment"]
+    assert (
+        "OBJECT_STORE_WRITER_SECRET_ACCESS_KEY"
+        not in services["maintenance-worker"]["environment"]
+    )
     assert set(services["scheduler"]["environment"]) == {"REDIS_URL"}
     for service_name in ("postgres", "redis", "minio", "prometheus"):
         assert "ports" not in services[service_name]

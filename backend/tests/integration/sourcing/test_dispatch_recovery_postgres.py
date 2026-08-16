@@ -45,9 +45,12 @@ def _config() -> Config:
 def _cleanup(engine: Engine) -> None:
     with engine.begin() as connection:
         connection.execute(
+            text("ALTER TABLE audit_events DISABLE TRIGGER audit_events_append_only")
+        )
+        connection.execute(
             text(
-                "ALTER TABLE audit_events DISABLE TRIGGER "
-                "audit_events_append_only"
+                "ALTER TABLE crm_acceptance_cohorts "
+                "DISABLE TRIGGER crm_acceptance_cohorts_append_only"
             )
         )
         connection.execute(
@@ -63,9 +66,12 @@ def _cleanup(engine: Engine) -> None:
             text("DELETE FROM users WHERE oidc_subject LIKE 'task12-dispatch|%'")
         )
         connection.execute(
+            text("ALTER TABLE audit_events ENABLE TRIGGER audit_events_append_only")
+        )
+        connection.execute(
             text(
-                "ALTER TABLE audit_events ENABLE TRIGGER "
-                "audit_events_append_only"
+                "ALTER TABLE crm_acceptance_cohorts "
+                "ENABLE TRIGGER crm_acceptance_cohorts_append_only"
             )
         )
 
@@ -258,9 +264,12 @@ def test_0012_upgrade_downgrade_upgrade_and_model_parity(
 
     with owner_engine.begin() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0013_provider_connector_state"
+            "0014_final_review_contracts"
         )
-        assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
+        assert (
+            compare_metadata(MigrationContext.configure(connection), Base.metadata)
+            == []
+        )
 
 
 def test_dispatch_functions_cross_forced_rls_without_table_grants(

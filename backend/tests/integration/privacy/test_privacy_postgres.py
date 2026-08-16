@@ -99,12 +99,29 @@ def test_0010_upgrade_downgrade_upgrade_and_model_parity(
     with owner_engine.begin() as connection:
         _grant_test_privileges(connection)
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0013_provider_connector_state"
+            "0014_final_review_contracts"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
             == []
         )
+
+
+def test_0014_one_step_downgrade_restores_user_attributed_finalizer(
+    owner_engine: Engine,
+) -> None:
+    command.downgrade(_config(), "0013_provider_connector_state")
+    with owner_engine.connect() as connection:
+        definition = connection.scalar(
+            text(
+                "SELECT pg_get_functiondef("
+                "'privacy_finalize_deletion(uuid,uuid)'::regprocedure)"
+            )
+        )
+    assert definition is not None
+    assert "request_row.approved_by_user_id" in definition
+    assert '"executor":"system"' not in definition
+    command.upgrade(_config(), "head")
 
 
 def test_privacy_tables_force_rls_with_check_and_suppression_is_append_only(
@@ -360,6 +377,76 @@ def test_deletion_barrier_wins_concurrent_reimport(owner_engine: Engine) -> None
         assert session.scalar(select(func.count()).select_from(Candidate)) == 1
         erased = session.get(Candidate, candidate.candidate_id)
         assert erased is not None and erased.full_name == "[deleted]"
+    api_engine.dispose()
+
+
+def test_concurrent_different_keys_replay_one_active_privacy_request(
+    owner_engine: Engine,
+) -> None:
+    assert API_DATABASE_URL is not None
+    seeded = _seed_candidate(owner_engine, "active-request-race")
+    api_engine = create_engine(API_DATABASE_URL)
+    context = RequestContext(
+        tenant_id=seeded["tenant_id"],
+        user_id=seeded["user_id"],
+        role=Role.OWNER,
+    )
+    start_insert = threading.Barrier(2)
+    outcomes: queue.Queue[tuple[str, object]] = queue.Queue()
+    key = b"privacy-active-request-race"
+
+    class SynchronizedPrivacyService(PrivacyService):
+        synchronized = False
+
+        def _active_request(self, *args: object, **kwargs: object) -> object:
+            active = super()._active_request(*args, **kwargs)  # type: ignore[arg-type]
+            if active is None and not self.synchronized:
+                self.synchronized = True
+                start_insert.wait(timeout=10)
+            return active
+
+    def submit(idempotency_key: str) -> None:
+        try:
+            with Session(api_engine, expire_on_commit=False) as session:
+                apply_tenant_context(session, context.tenant_id)
+                request = SynchronizedPrivacyService(
+                    session,
+                    key,
+                    ContactCipher(base64.b64encode(b"r" * 32).decode(), key),
+                ).submit(
+                    context,
+                    candidate_id=seeded["candidate_id"],
+                    request_type=PrivacyRequestType.ACCESS,
+                    idempotency_key=idempotency_key,
+                )
+                session.commit()
+                outcomes.put(("ok", request.id))
+        except (PrivacyError, SQLAlchemyError, threading.BrokenBarrierError) as error:
+            outcomes.put(("error", error))
+
+    threads = [
+        threading.Thread(target=submit, args=(f"race-{index}",), daemon=True)
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+
+    results = [outcomes.get_nowait() for _ in threads]
+    assert [status for status, _ in results] == ["ok", "ok"], results
+    assert len({value for _, value in results}) == 1
+    with Session(api_engine) as session:
+        apply_tenant_context(session, context.tenant_id)
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(PrivacyRequest)
+                .where(PrivacyRequest.tenant_id == context.tenant_id)
+            )
+            == 1
+        )
     api_engine.dispose()
 
 
@@ -643,17 +730,15 @@ def test_privacy_deletion_purges_every_object_version_without_duplicate_audit(
             )
             == 0
         )
-        assert (
-            session.scalar(
-                select(func.count())
-                .select_from(AuditEvent)
-                .where(
-                    AuditEvent.tenant_id == tenant_id,
-                    AuditEvent.action == "privacy.deletion_completed",
-                )
+        audit = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.tenant_id == tenant_id,
+                AuditEvent.action == "privacy.deletion_completed",
             )
-            == 1
         )
+        assert audit is not None
+        assert audit.actor_user_id is None
+        assert audit.payload == {"executor": "system"}
 
 
 def _seed_privacy_snapshot_deletion(
@@ -1004,6 +1089,7 @@ def _cleanup(connection: Connection) -> None:
     for table in (
         "audit_events",
         "crm_activity_events",
+        "crm_acceptance_cohorts",
         "crm_acceptance_snapshots",
         "suppression_identifiers",
     ):
@@ -1012,6 +1098,7 @@ def _cleanup(connection: Connection) -> None:
     connection.execute(text("DELETE FROM users WHERE oidc_subject LIKE 'task11|%'"))
     for table in (
         "suppression_identifiers",
+        "crm_acceptance_cohorts",
         "crm_acceptance_snapshots",
         "crm_activity_events",
         "audit_events",

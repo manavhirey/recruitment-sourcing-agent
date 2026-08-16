@@ -811,6 +811,11 @@ export interface components {
         readonly AcceptanceResponse: {
             /** Accepted */
             readonly accepted: number;
+            /**
+             * Client Id
+             * Format: uuid
+             */
+            readonly client_id: string;
             /** Denominator */
             readonly denominator: number;
             /** Final */
@@ -820,6 +825,13 @@ export interface components {
              * Format: date-time
              */
             readonly final_at: string;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            readonly job_id: string;
+            /** Market */
+            readonly market: string;
             /** New */
             readonly new: number;
             /** Rate */
@@ -833,6 +845,18 @@ export interface components {
             readonly rejected: number;
             /** Reviewed */
             readonly reviewed: number;
+            /**
+             * Run Id
+             * Format: uuid
+             */
+            readonly run_id: string;
+            /**
+             * Scorecard Version Id
+             * Format: uuid
+             */
+            readonly scorecard_version_id: string;
+            /** Scoring Version */
+            readonly scoring_version: string;
             /** Shortlisted */
             readonly shortlisted: number;
         };
@@ -1547,7 +1571,7 @@ export interface components {
          * PrivacyRequestState
          * @enum {string}
          */
-        readonly PrivacyRequestState: "Received" | "Identity Verification Required" | "Approved" | "Executing" | "Completed" | "Rejected";
+        readonly PrivacyRequestState: "Received" | "Identity Verification Required" | "Approved" | "Executing" | "Manual Fulfillment Required" | "Completed" | "Rejected";
         /**
          * PrivacyRequestType
          * @enum {string}

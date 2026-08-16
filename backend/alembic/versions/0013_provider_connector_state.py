@@ -21,9 +21,7 @@ def upgrade() -> None:
     op.create_table(
         "provider_connector_states",
         sa.Column("provider", sa.String(length=64), primary_key=True),
-        sa.Column(
-            "enabled", sa.Boolean(), nullable=False, server_default=sa.true()
-        ),
+        sa.Column("enabled", sa.Boolean(), nullable=False, server_default=sa.true()),
         sa.Column("disabled_reason", sa.String(length=64)),
         sa.Column(
             "updated_at",

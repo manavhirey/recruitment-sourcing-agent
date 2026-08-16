@@ -203,9 +203,7 @@ def test_draft_update_cannot_launder_server_owned_inference_provenance(
 
     assert normalized.draft.criteria[1].inferred is True
     with pytest.raises(JobError, match="scorecard_inferences_unresolved"):
-        job_service.confirm_scorecard(
-            owner_context, draft_job.id, expected_revision=2
-        )
+        job_service.confirm_scorecard(owner_context, draft_job.id, expected_revision=2)
 
 
 def test_draft_update_cannot_invent_extraction_source_to_bypass_lawful_review(
@@ -499,9 +497,7 @@ def test_direct_api_cannot_clear_server_owned_inference_before_confirmation(
     assert saved.status_code == 200
     assert saved.json()["draft"]["criteria"][0]["inferred"] is True
     assert bypass.status_code == 409
-    assert bypass.json() == {
-        "detail": {"code": "scorecard_inferences_unresolved"}
-    }
+    assert bypass.json() == {"detail": {"code": "scorecard_inferences_unresolved"}}
 
 
 def test_job_list_is_bounded_deterministic_and_paginated(job_api) -> None:

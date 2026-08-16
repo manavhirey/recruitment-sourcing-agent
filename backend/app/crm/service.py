@@ -21,6 +21,7 @@ from app.candidates.models import (
 )
 from app.core.errors import AppError
 from app.crm.models import (
+    AcceptanceCohort,
     AcceptanceSnapshot,
     ActivityEvent,
     CandidateNote,
@@ -88,6 +89,12 @@ class CrmError(AppError):
 
 @dataclass(frozen=True)
 class AcceptanceReport:
+    job_id: UUID
+    client_id: UUID
+    run_id: UUID
+    scorecard_version_id: UUID
+    market: str
+    scoring_version: str
     denominator: int
     accepted: int
     reviewed: int
@@ -418,12 +425,16 @@ class CrmService:
         evidence = row.score_json if isinstance(row.score_json, dict) else {}
         failed_values = evidence.get("failed_must_haves")
         unknown_values = evidence.get("unknown_keys")
-        failed = {
-            value for value in failed_values if isinstance(value, str)
-        } if isinstance(failed_values, list) else set()
-        unknown = {
-            value for value in unknown_values if isinstance(value, str)
-        } if isinstance(unknown_values, list) else set()
+        failed = (
+            {value for value in failed_values if isinstance(value, str)}
+            if isinstance(failed_values, list)
+            else set()
+        )
+        unknown = (
+            {value for value in unknown_values if isinstance(value, str)}
+            if isinstance(unknown_values, list)
+            else set()
+        )
         criteria = self.session.scalars(
             select(ScorecardCriterionRecord)
             .where(
@@ -770,19 +781,25 @@ class CrmService:
             raise CrmError("acceptance_not_ready")
         ready_time = _utc(ready_run.completed_at)
         final_at = ready_time + timedelta(days=7)
+        cohort_record = capture_acceptance_cohort(self.session, ready_run)
         existing_snapshot = self._acceptance_snapshot(context, job_id, ready_run.id)
         if existing_snapshot is not None:
             return self._snapshot_report(existing_snapshot, final_at)
-        cohort = list(
-            self.session.scalars(
-                select(JobCandidate)
-                .where(
-                    JobCandidate.tenant_id == context.tenant_id,
-                    JobCandidate.job_id == job_id,
+        cohort_ids = [UUID(value) for value in cohort_record.candidate_ids]
+        cohort = (
+            list(
+                self.session.scalars(
+                    select(JobCandidate)
+                    .where(
+                        JobCandidate.tenant_id == context.tenant_id,
+                        JobCandidate.job_id == job_id,
+                        JobCandidate.candidate_id.in_(cohort_ids),
+                    )
+                    .order_by(JobCandidate.id)
                 )
-                .order_by(JobCandidate.score.desc(), JobCandidate.id)
-                .limit(20)
             )
+            if cohort_ids
+            else []
         )
         reviewed = sum(row.stage is CandidateStage.REVIEWED for row in cohort)
         shortlisted = sum(row.stage is CandidateStage.SHORTLISTED for row in cohort)
@@ -790,7 +807,8 @@ class CrmService:
         rejected = sum(row.stage is CandidateStage.REJECTED for row in cohort)
         accepted = reviewed + shortlisted
         effective_time = _utc(as_of or datetime.now(UTC))
-        final = effective_time >= final_at or (len(cohort) == 20 and new == 0)
+        decided = reviewed + shortlisted + rejected
+        final = effective_time >= final_at or (len(cohort_ids) == 20 and decided == 20)
         if final:
             self._jobs.get_authorized(context, job_id, for_update=True)
             existing_snapshot = self._acceptance_snapshot(context, job_id, ready_run.id)
@@ -800,6 +818,10 @@ class CrmService:
                 tenant_id=context.tenant_id,
                 job_id=job_id,
                 run_id=ready_run.id,
+                client_id=cohort_record.client_id,
+                scorecard_version_id=cohort_record.scorecard_version_id,
+                market=cohort_record.market,
+                scoring_version=cohort_record.scoring_version,
                 finalized_by_user_id=context.user_id,
                 ready_at=ready_time,
                 finalized_at=effective_time,
@@ -809,7 +831,7 @@ class CrmService:
                 shortlisted_count=shortlisted,
                 new_count=new,
                 rejected_count=rejected,
-                cohort_candidate_ids=[str(row.candidate_id) for row in cohort],
+                cohort_candidate_ids=list(cohort_record.candidate_ids),
             )
             self.session.add(snapshot)
             self.session.flush()
@@ -837,9 +859,18 @@ class CrmService:
                     "shortlisted": shortlisted,
                     "new": new,
                     "rejected": rejected,
+                    "client_id": str(cohort_record.client_id),
+                    "market": cohort_record.market,
+                    "scoring_version": cohort_record.scoring_version,
                 },
             )
         return AcceptanceReport(
+            job_id=job_id,
+            client_id=cohort_record.client_id,
+            run_id=ready_run.id,
+            scorecard_version_id=cohort_record.scorecard_version_id,
+            market=cohort_record.market,
+            scoring_version=cohort_record.scoring_version,
             denominator=20,
             accepted=accepted,
             reviewed=reviewed,
@@ -872,6 +903,12 @@ class CrmService:
         final_at: datetime,
     ) -> AcceptanceReport:
         return AcceptanceReport(
+            job_id=snapshot.job_id,
+            client_id=snapshot.client_id,
+            run_id=snapshot.run_id,
+            scorecard_version_id=snapshot.scorecard_version_id,
+            market=snapshot.market,
+            scoring_version=snapshot.scoring_version,
             denominator=snapshot.denominator,
             accepted=snapshot.accepted_count,
             reviewed=snapshot.reviewed_count,
@@ -1154,8 +1191,7 @@ class CrmService:
         contact_point_id: UUID,
     ) -> str:
         return (
-            f"shortlist-contact-exported:{export_record.id}:"
-            f"{row.id}:{contact_point_id}"
+            f"shortlist-contact-exported:{export_record.id}:{row.id}:{contact_point_id}"
         )
 
     def record_export_outcome(
@@ -1600,6 +1636,122 @@ def materialize_run_matches(
     context: RequestContext,
 ) -> list[JobCandidate]:
     return CrmService(session, b"internal-worker").materialize_run_matches(run, context)
+
+
+def capture_acceptance_cohort(
+    session: Session,
+    run: SourcingRun,
+) -> AcceptanceCohort:
+    existing = session.scalar(
+        select(AcceptanceCohort).where(
+            AcceptanceCohort.tenant_id == run.tenant_id,
+            AcceptanceCohort.run_id == run.id,
+        )
+    )
+    if existing is not None:
+        return existing
+    if run.state is not RunState.READY or run.completed_at is None:
+        raise ValueError("acceptance cohort requires a completed Ready run")
+    job = session.scalar(
+        select(Job).where(Job.tenant_id == run.tenant_id, Job.id == run.job_id)
+    )
+    scorecard = session.scalar(
+        select(ScorecardVersion).where(
+            ScorecardVersion.tenant_id == run.tenant_id,
+            ScorecardVersion.id == run.scorecard_version_id,
+        )
+    )
+    if job is None or scorecard is None:
+        raise ValueError("acceptance cohort dimensions are unavailable")
+    run_rows = list(
+        session.execute(
+            select(
+                RunCandidate.candidate_id,
+                RunCandidate.scoring_version,
+            )
+            .where(
+                RunCandidate.tenant_id == run.tenant_id,
+                RunCandidate.run_id == run.id,
+                RunCandidate.match_score.is_not(None),
+                RunCandidate.classification == "main",
+                RunCandidate.scoring_version.is_not(None),
+            )
+            .order_by(RunCandidate.match_score.desc(), RunCandidate.id)
+            .limit(20)
+        )
+    )
+    if run_rows:
+        candidate_ids = [str(row.candidate_id) for row in run_rows]
+        scoring_versions = {str(row.scoring_version) for row in run_rows}
+    else:
+        legacy_rows = list(
+            session.scalars(
+                select(JobCandidate)
+                .where(
+                    JobCandidate.tenant_id == run.tenant_id,
+                    JobCandidate.job_id == run.job_id,
+                    JobCandidate.latest_run_id == run.id,
+                    JobCandidate.classification == "main",
+                )
+                .order_by(JobCandidate.score.desc(), JobCandidate.id)
+                .limit(20)
+            )
+        )
+        candidate_ids = [str(row.candidate_id) for row in legacy_rows]
+        scoring_versions = {row.scoring_version for row in legacy_rows}
+    scoring_version = (
+        next(iter(scoring_versions))
+        if len(scoring_versions) == 1
+        else "mixed"
+        if scoring_versions
+        else "matching-v1"
+    )
+    cohort = AcceptanceCohort(
+        tenant_id=run.tenant_id,
+        job_id=run.job_id,
+        run_id=run.id,
+        client_id=job.client_id,
+        scorecard_version_id=run.scorecard_version_id,
+        market=_acceptance_market(job, scorecard),
+        scoring_version=scoring_version,
+        candidate_ids=candidate_ids,
+        ready_at=_utc(run.completed_at),
+    )
+    session.add(cohort)
+    session.flush()
+    return cohort
+
+
+def _acceptance_market(job: Job, scorecard: ScorecardVersion) -> str:
+    location = " ".join((job.location or "", *scorecard.locations)).casefold()
+    if any(
+        marker in location
+        for marker in (
+            "india",
+            "bengaluru",
+            "bangalore",
+            "mumbai",
+            "delhi",
+            "hyderabad",
+            "pune",
+            "chennai",
+        )
+    ):
+        return "IN"
+    if any(
+        marker in location
+        for marker in (
+            "united states",
+            " usa",
+            " us",
+            "new york",
+            "san francisco",
+            "california",
+            "texas",
+        )
+    ):
+        return "US"
+    return "unknown"
 
 
 def _normalize_query(value: str) -> str:

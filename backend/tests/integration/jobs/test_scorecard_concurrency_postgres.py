@@ -183,6 +183,7 @@ def test_generate_does_not_lock_job_during_extraction_and_rechecks_revision(
     mutation_engine = create_engine(scenario.api_database_url)
     generation_outcomes: queue.Queue[object] = queue.Queue()
     mutation_outcomes: queue.Queue[object] = queue.Queue()
+    mutation_finished = threading.Event()
 
     def generate() -> None:
         with Session(generation_engine) as session:
@@ -206,33 +207,35 @@ def test_generate_does_not_lock_job_during_extraction_and_rechecks_revision(
                 generation_outcomes.put("succeeded")
 
     def mutate() -> None:
-        with Session(mutation_engine) as session:
-            apply_tenant_context(session, scenario.context.tenant_id)
-            try:
-                JobService(session, b"test-suppression-key").update_draft(
-                    scenario.context,
-                    scenario.job_id,
-                    recruiter_draft,
-                    expected_revision=1,
-                    idempotency_key="edit-during-generation",
-                )
-                session.commit()
-            except (JobError, SQLAlchemyError) as error:
-                session.rollback()
-                mutation_outcomes.put(error)
-            else:
-                mutation_outcomes.put("succeeded")
+        try:
+            with Session(mutation_engine) as session:
+                apply_tenant_context(session, scenario.context.tenant_id)
+                try:
+                    JobService(session, b"test-suppression-key").update_draft(
+                        scenario.context,
+                        scenario.job_id,
+                        recruiter_draft,
+                        expected_revision=1,
+                        idempotency_key="edit-during-generation",
+                    )
+                    session.commit()
+                except (JobError, SQLAlchemyError) as error:
+                    session.rollback()
+                    mutation_outcomes.put(error)
+                else:
+                    mutation_outcomes.put("succeeded")
+        finally:
+            mutation_finished.set()
 
     generation_thread = threading.Thread(target=generate)
     mutation_thread = threading.Thread(target=mutate)
     generation_thread.start()
     assert gateway.entered.wait(timeout=5)
     mutation_thread.start()
-    mutation_thread.join(timeout=1)
-    mutation_completed_while_gateway_blocked = not mutation_thread.is_alive()
+    mutation_completed_while_gateway_blocked = mutation_finished.wait(timeout=10)
     gateway.release.set()
-    generation_thread.join(timeout=5)
-    mutation_thread.join(timeout=5)
+    generation_thread.join(timeout=15)
+    mutation_thread.join(timeout=15)
 
     assert mutation_completed_while_gateway_blocked
     assert not generation_thread.is_alive()

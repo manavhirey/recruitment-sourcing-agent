@@ -11,12 +11,18 @@ from sqlalchemy.pool import StaticPool
 
 from app.audit.models import AuditEvent
 from app.candidates.models import Candidate
+from app.candidates.service import CandidateService
 from app.clients.models import ClientCompany
 from app.core.database import Base
 from app.identity.models import Tenant, User
 from app.identity.schemas import RequestContext, Role
 from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
-from app.providers.base import ProviderPerson, ProviderQuery, SearchPage
+from app.providers.base import (
+    ProviderPerson,
+    ProviderQuery,
+    ProviderTemporaryError,
+    SearchPage,
+)
 from app.sourcing import tasks as sourcing_tasks
 from app.sourcing.models import (
     RunCandidate,
@@ -281,6 +287,111 @@ def test_replayed_source_task_does_not_duplicate_candidates(
     assert gateway.search_calls == 1
 
 
+def test_identity_conflict_does_not_abort_the_source_page(
+    sourcing_scenario: dict[str, Any],
+) -> None:
+    scenario = sourcing_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    with scenario["factory"]() as session:
+        service = CandidateService(session)
+        provider_match = service.ingest(
+            context,
+            ProviderPerson(
+                provider="apollo",
+                provider_person_id="provider-match",
+                full_name="Provider Match",
+                current_title="Product Manager",
+                current_company="Example",
+                location="New York, NY",
+                linkedin_url="https://linkedin.com/in/provider-match",
+                experiences=(),
+            ),
+        )
+        url_match = service.ingest(
+            context,
+            ProviderPerson(
+                provider="apollo",
+                provider_person_id="url-match",
+                full_name="URL Match",
+                current_title="Product Manager",
+                current_company="Example",
+                location="New York, NY",
+                linkedin_url="https://linkedin.com/in/url-match",
+                experiences=(),
+            ),
+        )
+        session.commit()
+
+    class ConflictPageGateway:
+        def search(self, query: ProviderQuery, page: int) -> SearchPage:
+            del query
+            return SearchPage(
+                people=(
+                    ProviderPerson(
+                        provider="apollo",
+                        provider_person_id="provider-match",
+                        full_name="Provider Match Updated",
+                        current_title="Product Manager",
+                        current_company="Example",
+                        location="New York, NY",
+                        linkedin_url="https://linkedin.com/in/url-match",
+                        experiences=(),
+                    ),
+                    ProviderPerson(
+                        provider="apollo",
+                        provider_person_id="following",
+                        full_name="Following Candidate",
+                        current_title="Product Manager",
+                        current_company="Example",
+                        location="New York, NY",
+                        linkedin_url="https://linkedin.com/in/following",
+                        experiences=(),
+                    ),
+                ),
+                page=page,
+                next_page=None,
+                total_available=2,
+            )
+
+        def close(self) -> None:
+            return None
+
+    execute_source_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        gateway_factory=ConflictPageGateway,
+        idempotency_key="source:identity-conflict",
+    )
+
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        assert run.state is RunState.MATCHING
+        assert run.candidate_count == 2
+        run_candidate_ids = set(
+            session.scalars(
+                select(RunCandidate.candidate_id).where(
+                    RunCandidate.run_id == scenario["run_id"]
+                )
+            )
+        )
+        assert provider_match.candidate_id in run_candidate_ids
+        assert url_match.candidate_id not in run_candidate_ids
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(AuditEvent.action == "candidate.identity_conflict")
+            )
+            == 1
+        )
+
+
 def test_source_reconciles_returned_provider_usage_receipt(
     sourcing_scenario: dict[str, Any],
 ) -> None:
@@ -324,6 +435,79 @@ def test_source_reconciles_returned_provider_usage_receipt(
             ("search_pages", 1),
         ]
         assert {row.provider_request_id for row in usage} == {"apollo-request-123"}
+
+
+def test_search_retry_reserves_and_charges_each_provider_attempt(
+    sourcing_scenario: dict[str, Any],
+) -> None:
+    scenario = sourcing_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+
+    class RetryOnceGateway(HundredPersonGateway):
+        def search(self, query: ProviderQuery, page: int) -> SearchPage:
+            self.search_calls += 1
+            if self.search_calls == 1:
+                raise ProviderTemporaryError("ambiguous search attempt")
+            return SearchPage(
+                people=(
+                    ProviderPerson(
+                        provider="apollo",
+                        provider_person_id="retry-success",
+                        full_name="Retry Success",
+                        current_title="Product Manager",
+                        current_company="Example",
+                        location="New York, NY",
+                        linkedin_url="https://linkedin.com/in/retry-success",
+                        experiences=(),
+                    ),
+                ),
+                page=page,
+                next_page=None,
+                total_available=1,
+                provider_request_id="search-receipt-2",
+            )
+
+    gateway = RetryOnceGateway()
+    with pytest.raises(ProviderTemporaryError):
+        execute_source_run(
+            scenario["factory"],
+            scenario["run_id"],
+            context,
+            gateway_factory=lambda: gateway,
+            idempotency_key="source:attempt-budget",
+            propagate_provider_errors=True,
+        )
+    execute_source_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        gateway_factory=lambda: gateway,
+        idempotency_key="source:attempt-budget",
+    )
+
+    with scenario["factory"]() as session:
+        rows = list(
+            session.scalars(
+                select(UsageLedger)
+                .where(UsageLedger.run_id == scenario["run_id"])
+                .order_by(UsageLedger.reservation_key, UsageLedger.unit_type)
+            )
+        )
+        assert len(rows) == 4
+        assert {row.reservation_key.rsplit(":", 1)[-1] for row in rows} == {
+            "attempt-1",
+            "attempt-2",
+        }
+        assert all(row.charged_units == 1 for row in rows)
+        assert {
+            row.provider_request_id
+            for row in rows
+            if row.reservation_key.endswith("attempt-2")
+        } == {"search-receipt-2"}
 
 
 def test_plan_and_match_tasks_replay_through_production_checkpoints(

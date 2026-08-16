@@ -105,9 +105,7 @@ class Telemetry:
                 safe_fields[field.removesuffix("_id") + "_hash"] = identifier_digest(
                     str(identifier), self._hmac_key
                 )
-        safe_event: dict[str, object] = sanitize_event(
-            {"event": event, **safe_fields}
-        )
+        safe_event: dict[str, object] = sanitize_event({"event": event, **safe_fields})
         if self._sink is not None:
             self._sink(safe_event)
             return
@@ -210,7 +208,9 @@ def install_api_telemetry(
     app.state.telemetry = event_sink
 
     @app.middleware("http")
-    async def observe_request(request: Request, call_next: Callable[..., Any]) -> Response:
+    async def observe_request(
+        request: Request, call_next: Callable[..., Any]
+    ) -> Response:
         started = time.perf_counter()
         status_code = 500
         try:
@@ -333,9 +333,7 @@ def install_task_telemetry(
                 and time.perf_counter() - began >= stuck_after_seconds
             )
 
-        platform_metrics.stuck_runs.labels(task_name).set_function(
-            stuck_count
-        )
+        platform_metrics.stuck_runs.labels(task_name).set_function(stuck_count)
         request = getattr(sender, "request", None)
         event_sink.emit(
             "worker_task_started",

@@ -831,3 +831,7 @@ def _finalize_run(session: Session, enrichment: EnrichmentRequest) -> None:
         run.state = transition_run(run.state, target)
     run.current_stage = run.state.value
     run.completed_at = datetime.now(UTC)
+    if run.state is RunState.READY:
+        from app.crm.service import capture_acceptance_cohort
+
+        capture_acceptance_cohort(session, run)

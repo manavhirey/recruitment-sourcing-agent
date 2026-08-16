@@ -39,10 +39,21 @@ class ResolutionDecision:
     candidate_id: UUID | None
     matched_by: str | None
     fuzzy_candidate_ids: tuple[UUID, ...] = ()
+    conflict_candidate_ids: tuple[UUID, ...] = ()
 
     @classmethod
-    def reuse(cls, candidate_id: UUID, matched_by: str) -> "ResolutionDecision":
-        return cls(candidate_id=candidate_id, matched_by=matched_by)
+    def reuse(
+        cls,
+        candidate_id: UUID,
+        matched_by: str,
+        *,
+        conflict_candidate_ids: tuple[UUID, ...] = (),
+    ) -> "ResolutionDecision":
+        return cls(
+            candidate_id=candidate_id,
+            matched_by=matched_by,
+            conflict_candidate_ids=conflict_candidate_ids,
+        )
 
     @classmethod
     def create_with_suggestions(

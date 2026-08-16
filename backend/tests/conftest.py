@@ -27,6 +27,8 @@ os.environ.update(
         "APOLLO_API_KEY": "test-apollo-key",
         "CONTACT_ENCRYPTION_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "SUPPRESSION_HMAC_KEY": "test-suppression-key",
+        "IDENTITY_HMAC_KEY": "test-identity-key",
+        "IDENTITY_HMAC_KEY_VERSION": "v1",
         "TELEMETRY_HMAC_KEY": "test-telemetry-key",
         "WEBHOOK_HMAC_KEY": "test-webhook-key",
     }

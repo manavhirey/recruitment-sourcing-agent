@@ -75,9 +75,7 @@ def upgrade() -> None:
         sa.Column("expired_at", sa.DateTime(timezone=True)),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.CheckConstraint(
-            "kind IN ('email', 'phone')", name="ck_contact_points_kind"
-        ),
+        sa.CheckConstraint("kind IN ('email', 'phone')", name="ck_contact_points_kind"),
         sa.CheckConstraint(
             "classification IN ('work', 'personal')",
             name="ck_contact_points_classification",

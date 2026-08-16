@@ -114,9 +114,7 @@ def test_periodic_task_uses_only_maintenance_database_capability(
         maintenance_database_url="postgresql://maintenance-capability",
         redis_url="redis://broker",
     )
-    monkeypatch.setattr(
-        dispatch_recovery, "get_maintenance_settings", lambda: settings
-    )
+    monkeypatch.setattr(dispatch_recovery, "get_maintenance_settings", lambda: settings)
     monkeypatch.setattr(
         dispatch_recovery,
         "recover_pending_dispatches",

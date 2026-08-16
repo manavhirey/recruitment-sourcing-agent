@@ -251,10 +251,12 @@ class MembershipService:
             user.display_name = claims.name
 
         membership = self._session.scalar(
-            select(Membership).where(
+            select(Membership)
+            .where(
                 Membership.tenant_id == invitation.tenant_id,
                 Membership.user_id == user.id,
-            ).with_for_update()
+            )
+            .with_for_update()
         )
         if membership is None:
             membership = Membership(

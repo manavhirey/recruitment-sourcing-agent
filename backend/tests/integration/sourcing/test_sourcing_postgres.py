@@ -99,7 +99,21 @@ def _purge_task8_tenants(engine: Engine) -> None:
                     "(SELECT id FROM tenants WHERE slug LIKE 'task8-%')"
                 )
             )
+        if "crm_acceptance_cohorts" in tables:
+            connection.execute(
+                text(
+                    "ALTER TABLE crm_acceptance_cohorts "
+                    "DISABLE TRIGGER crm_acceptance_cohorts_append_only"
+                )
+            )
         connection.execute(text("DELETE FROM tenants WHERE slug LIKE 'task8-%'"))
+        if "crm_acceptance_cohorts" in tables:
+            connection.execute(
+                text(
+                    "ALTER TABLE crm_acceptance_cohorts "
+                    "ENABLE TRIGGER crm_acceptance_cohorts_append_only"
+                )
+            )
         if "audit_events" in tables:
             connection.execute(
                 text("ALTER TABLE audit_events ENABLE TRIGGER audit_events_append_only")
@@ -126,7 +140,7 @@ def test_0005_migration_upgrade_downgrade_and_model_parity(
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0013_provider_connector_state"
+            "0014_final_review_contracts"
         )
         assert set(_TENANT_TABLES).issubset(inspect(connection).get_table_names())
         differences = compare_metadata(

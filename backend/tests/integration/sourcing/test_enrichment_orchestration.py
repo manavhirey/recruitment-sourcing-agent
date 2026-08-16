@@ -20,10 +20,14 @@ from app.providers.base import (
     EnrichmentInput,
     EnrichmentReceipt,
     EnrichmentResult,
+    ProviderAuthenticationError,
+    ProviderRateLimited,
     ProviderTemporaryError,
 )
 from app.providers.snapshots import SnapshotStore
 from app.sourcing.enrichment import (
+    DeferredEnrichment,
+    FailedEnrichment,
     RegionalContactPolicy,
     enqueue_top_enrichment,
     execute_queued_enrichment_request,
@@ -141,6 +145,32 @@ class FailingGateway(RecordingGateway):
     def poll_enrichment(self, request_id: str) -> EnrichmentResult:
         del request_id
         raise ProviderTemporaryError("sensitive provider failure")
+
+
+class AuthenticationFailingGateway(RecordingGateway):
+    def enrich_batch(
+        self,
+        people: tuple[EnrichmentInput, ...],
+        webhook_url: str,
+        *,
+        reveal_personal_emails: bool = False,
+        reveal_phone_number: bool = False,
+    ) -> EnrichmentReceipt:
+        del people, webhook_url, reveal_personal_emails, reveal_phone_number
+        raise ProviderAuthenticationError("provider authentication failed")
+
+
+class RateLimitedGateway(RecordingGateway):
+    def enrich_batch(
+        self,
+        people: tuple[EnrichmentInput, ...],
+        webhook_url: str,
+        *,
+        reveal_personal_emails: bool = False,
+        reveal_phone_number: bool = False,
+    ) -> EnrichmentReceipt:
+        del people, webhook_url, reveal_personal_emails, reveal_phone_number
+        raise ProviderRateLimited(17)
 
 
 class CancellingGateway(RecordingGateway):
@@ -465,7 +495,7 @@ def test_cancellation_race_after_provider_call_is_fenced_before_payload_write(
     assert objects.objects == {}
 
 
-def test_provider_enrichment_failure_preserves_candidates_and_marks_partial(
+def test_ambiguous_enrichment_failure_preserves_candidates_until_lease_expires(
     enrichment_scenario: dict[str, Any],
 ) -> None:
     scenario = enrichment_scenario
@@ -499,12 +529,350 @@ def test_provider_enrichment_failure_preserves_candidates_and_marks_partial(
             session.scalar(
                 select(func.count())
                 .select_from(RunCandidate)
+                .where(RunCandidate.enrichment_status == "pending")
+            )
+            == 50
+        )
+        requests = list(session.scalars(select(EnrichmentRequest)))
+        assert requests
+        request_ids = {request.id for request in requests}
+        for request in requests:
+            request.stage_deadline = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+
+    replay_gateway = RecordingGateway(scenario["factory"], scenario["run_id"])
+    replay = enqueue_top_enrichment(
+        scenario["run_id"],
+        session_factory=scenario["factory"],
+        context=RequestContext(
+            tenant_id=scenario["tenant_id"],
+            user_id=scenario["user_id"],
+            role=Role.OWNER,
+        ),
+        gateway=replay_gateway,
+        callback_base_url="https://api.example.test",
+        contact_cipher=ContactCipher(
+            base64.b64encode(b"c" * 32).decode(), b"contact-lookup"
+        ),
+        snapshot_store=SnapshotStore(
+            MemoryObjectStore(),
+            "snapshots",
+            base64.b64encode(b"s" * 32).decode(),
+        ),
+        policy=RegionalContactPolicy(False, False),
+        token_codec=CapabilityTokenCodec(b"webhook-key"),
+    )
+
+    failed = [item for item in replay if isinstance(item, FailedEnrichment)]
+    assert len(failed) == len(replay)
+    assert {item.request_id for item in failed} == request_ids
+    assert replay_gateway.calls == []
+    with scenario["factory"]() as session:
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(RunCandidate)
                 .where(RunCandidate.enrichment_status == "failed")
             )
             == 50
         )
         run = session.get(SourcingRun, scenario["run_id"])
         assert run is not None and run.state is RunState.PARTIALLY_READY
+
+
+def test_enrichment_authentication_failure_reaches_circuit_breaker_wrapper(
+    enrichment_scenario: dict[str, Any],
+) -> None:
+    scenario = enrichment_scenario
+    with pytest.raises(ProviderAuthenticationError):
+        enqueue_top_enrichment(
+            scenario["run_id"],
+            1,
+            session_factory=scenario["factory"],
+            context=RequestContext(
+                tenant_id=scenario["tenant_id"],
+                user_id=scenario["user_id"],
+                role=Role.OWNER,
+            ),
+            gateway=AuthenticationFailingGateway(
+                scenario["factory"], scenario["run_id"]
+            ),
+            callback_base_url="https://api.example.test",
+            contact_cipher=ContactCipher(
+                base64.b64encode(b"c" * 32).decode(), b"contact-lookup"
+            ),
+            snapshot_store=SnapshotStore(
+                MemoryObjectStore(),
+                "snapshots",
+                base64.b64encode(b"s" * 32).decode(),
+            ),
+            policy=RegionalContactPolicy(False, False),
+            token_codec=CapabilityTokenCodec(b"webhook-key"),
+        )
+
+
+def test_rate_limited_enrichment_is_durably_retryable_without_zero_charge(
+    enrichment_scenario: dict[str, Any],
+) -> None:
+    scenario = enrichment_scenario
+    results = enqueue_top_enrichment(
+        scenario["run_id"],
+        1,
+        session_factory=scenario["factory"],
+        context=RequestContext(
+            tenant_id=scenario["tenant_id"],
+            user_id=scenario["user_id"],
+            role=Role.OWNER,
+        ),
+        gateway=RateLimitedGateway(scenario["factory"], scenario["run_id"]),
+        callback_base_url="https://api.example.test",
+        contact_cipher=ContactCipher(
+            base64.b64encode(b"c" * 32).decode(), b"contact-lookup"
+        ),
+        snapshot_store=SnapshotStore(
+            MemoryObjectStore(),
+            "snapshots",
+            base64.b64encode(b"s" * 32).decode(),
+        ),
+        policy=RegionalContactPolicy(False, False),
+        token_codec=CapabilityTokenCodec(b"webhook-key"),
+    )
+
+    assert results == [DeferredEnrichment(retry_after_seconds=17)]
+    with scenario["factory"]() as session:
+        request = session.scalar(select(EnrichmentRequest))
+        assert request is not None
+        assert request.status == "queued"
+        assert request.retry_count == 1
+        assert all(
+            charge is None
+            for charge in session.scalars(select(UsageLedger.charged_units))
+        )
+
+    retry_gateway = RecordingGateway(scenario["factory"], scenario["run_id"])
+    retried = enqueue_top_enrichment(
+        scenario["run_id"],
+        1,
+        session_factory=scenario["factory"],
+        context=RequestContext(
+            tenant_id=scenario["tenant_id"],
+            user_id=scenario["user_id"],
+            role=Role.OWNER,
+        ),
+        gateway=retry_gateway,
+        callback_base_url="https://api.example.test",
+        contact_cipher=ContactCipher(
+            base64.b64encode(b"c" * 32).decode(), b"contact-lookup"
+        ),
+        snapshot_store=SnapshotStore(
+            MemoryObjectStore(),
+            "snapshots",
+            base64.b64encode(b"s" * 32).decode(),
+        ),
+        policy=RegionalContactPolicy(False, False),
+        token_codec=CapabilityTokenCodec(b"webhook-key"),
+    )
+
+    assert len(retried) == 1
+    assert retry_gateway.calls
+    with scenario["factory"]() as session:
+        request = session.scalar(select(EnrichmentRequest))
+        assert request is not None and request.status == "completed"
+
+
+def test_rate_limited_enrichment_exhaustion_becomes_terminal_without_charge(
+    enrichment_scenario: dict[str, Any],
+) -> None:
+    scenario = enrichment_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    common = {
+        "session_factory": scenario["factory"],
+        "context": context,
+        "callback_base_url": "https://api.example.test",
+        "contact_cipher": ContactCipher(
+            base64.b64encode(b"c" * 32).decode(), b"contact-lookup"
+        ),
+        "snapshot_store": SnapshotStore(
+            MemoryObjectStore(),
+            "snapshots",
+            base64.b64encode(b"s" * 32).decode(),
+        ),
+        "policy": RegionalContactPolicy(False, False),
+        "token_codec": CapabilityTokenCodec(b"webhook-key"),
+    }
+    enqueue_top_enrichment(
+        scenario["run_id"],
+        1,
+        gateway=RateLimitedGateway(scenario["factory"], scenario["run_id"]),
+        **common,
+    )
+    with scenario["factory"]() as session:
+        request = session.scalar(select(EnrichmentRequest))
+        assert request is not None
+        request.retry_count = 5
+        session.commit()
+        request_id = request.id
+
+    exhausted = enqueue_top_enrichment(
+        scenario["run_id"],
+        1,
+        gateway=RateLimitedGateway(scenario["factory"], scenario["run_id"]),
+        **common,
+    )
+
+    assert exhausted == [FailedEnrichment(request_id=request_id)]
+    with scenario["factory"]() as session:
+        request = session.get(EnrichmentRequest, request_id)
+        assert request is not None and request.status == "failed"
+        assert request.error_code == "provider_rate_limit_exhausted"
+        assert all(
+            charged == 0
+            for charged in session.scalars(select(UsageLedger.charged_units))
+        )
+
+
+def test_ambiguous_enrichment_failure_consumes_reservation_and_defers_replay(
+    enrichment_scenario: dict[str, Any],
+) -> None:
+    scenario = enrichment_scenario
+    results = enqueue_top_enrichment(
+        scenario["run_id"],
+        1,
+        session_factory=scenario["factory"],
+        context=RequestContext(
+            tenant_id=scenario["tenant_id"],
+            user_id=scenario["user_id"],
+            role=Role.OWNER,
+        ),
+        gateway=FailingGateway(scenario["factory"], scenario["run_id"]),
+        callback_base_url="https://api.example.test",
+        contact_cipher=ContactCipher(
+            base64.b64encode(b"c" * 32).decode(), b"contact-lookup"
+        ),
+        snapshot_store=SnapshotStore(
+            MemoryObjectStore(),
+            "snapshots",
+            base64.b64encode(b"s" * 32).decode(),
+        ),
+        policy=RegionalContactPolicy(False, False),
+        token_codec=CapabilityTokenCodec(b"webhook-key"),
+    )
+
+    assert len(results) == 1
+    assert isinstance(results[0], DeferredEnrichment)
+    with scenario["factory"]() as session:
+        request = session.scalar(select(EnrichmentRequest))
+        assert request is not None
+        assert request.status == "submitting"
+        assert request.error_code is None
+        assert all(
+            charge == requested
+            for charge, requested in session.execute(
+                select(UsageLedger.charged_units, UsageLedger.requested_units)
+            )
+        )
+
+    replay_gateway = RecordingGateway(scenario["factory"], scenario["run_id"])
+    replay = enqueue_top_enrichment(
+        scenario["run_id"],
+        1,
+        session_factory=scenario["factory"],
+        context=RequestContext(
+            tenant_id=scenario["tenant_id"],
+            user_id=scenario["user_id"],
+            role=Role.OWNER,
+        ),
+        gateway=replay_gateway,
+        callback_base_url="https://api.example.test",
+        contact_cipher=ContactCipher(
+            base64.b64encode(b"c" * 32).decode(), b"contact-lookup"
+        ),
+        snapshot_store=SnapshotStore(
+            MemoryObjectStore(),
+            "snapshots",
+            base64.b64encode(b"s" * 32).decode(),
+        ),
+        policy=RegionalContactPolicy(False, False),
+        token_codec=CapabilityTokenCodec(b"webhook-key"),
+    )
+
+    assert len(replay) == 1
+    assert isinstance(replay[0], DeferredEnrichment)
+    assert replay_gateway.calls == []
+
+
+def test_expired_ambiguous_queued_request_reports_failure_and_stays_charged(
+    enrichment_scenario: dict[str, Any],
+) -> None:
+    scenario = enrichment_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    cipher = ContactCipher(base64.b64encode(b"c" * 32).decode(), b"contact-lookup")
+    snapshots = SnapshotStore(
+        MemoryObjectStore(),
+        "snapshots",
+        base64.b64encode(b"s" * 32).decode(),
+    )
+    codec = CapabilityTokenCodec(b"webhook-key")
+    enqueue_top_enrichment(
+        scenario["run_id"],
+        1,
+        session_factory=scenario["factory"],
+        context=context,
+        gateway=FailingGateway(scenario["factory"], scenario["run_id"]),
+        callback_base_url="https://api.example.test",
+        contact_cipher=cipher,
+        snapshot_store=snapshots,
+        policy=RegionalContactPolicy(False, False),
+        token_codec=codec,
+    )
+    with scenario["factory"]() as session:
+        request = session.scalar(select(EnrichmentRequest))
+        assert request is not None
+        request.stage_deadline = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+        request_id = request.id
+
+    gateway = RecordingGateway(scenario["factory"], scenario["run_id"])
+    result = execute_queued_enrichment_request(
+        scenario["factory"],
+        request_id,
+        context,
+        gateway=gateway,
+        callback_base_url="https://api.example.test",
+        contact_cipher=cipher,
+        snapshot_store=snapshots,
+        policy=RegionalContactPolicy(False, False),
+        token_codec=codec,
+    )
+
+    assert result == FailedEnrichment(request_id=request_id)
+    assert gateway.calls == []
+    with scenario["factory"]() as session:
+        request = session.get(EnrichmentRequest, request_id)
+        assert request is not None and request.status == "failed"
+        assert request.error_code == "ambiguous_provider_submission"
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(RunCandidate)
+                .where(RunCandidate.enrichment_status == "failed")
+            )
+            == 1
+        )
+        assert all(
+            charged == requested
+            for charged, requested in session.execute(
+                select(UsageLedger.charged_units, UsageLedger.requested_units)
+            )
+        )
 
 
 def test_budget_exhaustion_happens_before_provider_call(

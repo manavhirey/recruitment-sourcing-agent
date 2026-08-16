@@ -133,6 +133,12 @@ class ActivityPage(BaseModel):
 
 
 class AcceptanceResponse(BaseModel):
+    job_id: UUID
+    client_id: UUID
+    run_id: UUID
+    scorecard_version_id: UUID
+    market: str
+    scoring_version: str
     denominator: int
     accepted: int
     reviewed: int

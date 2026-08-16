@@ -1,9 +1,107 @@
+import base64
+import binascii
+import hashlib
+import hmac
+import re
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
+
+_PLACEHOLDER_MARKERS = (
+    "change-me",
+    "changeme",
+    "development",
+    "example",
+    "placeholder",
+    "replace",
+    "sample",
+    "test-",
+)
+
+
+def _secret_value(value: SecretStr) -> str:
+    return value.get_secret_value()
+
+
+def _require_production_secrets(
+    environment: str,
+    secrets: dict[str, tuple[SecretStr, int]],
+) -> None:
+    if environment.casefold() != "production":
+        return
+    supplied: dict[str, str] = {}
+    for name, (secret, minimum_length) in secrets.items():
+        value = _secret_value(secret)
+        normalized = value.casefold()
+        if len(value) < minimum_length or any(
+            marker in normalized for marker in _PLACEHOLDER_MARKERS
+        ):
+            raise ValueError(f"{name} is not production-safe")
+        supplied[name] = value
+    if len(set(supplied.values())) != len(supplied):
+        raise ValueError("production secret capabilities must be distinct")
+
+
+def _require_secure_url(name: str, value: str, *, schemes: set[str]) -> None:
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme.casefold() not in schemes or not host:
+        raise ValueError(f"{name} must use a secure URL")
+    if host in {"localhost", "127.0.0.1", "::1"} or any(
+        marker in host for marker in ("example", "placeholder", ".invalid")
+    ):
+        raise ValueError(f"{name} must not use a placeholder host")
+
+
+def _require_production_database_url(name: str, value: str) -> None:
+    parsed = make_url(value)
+    host = (parsed.host or "").casefold()
+    if parsed.get_backend_name() != "postgresql" or not host:
+        raise ValueError(f"{name} must use PostgreSQL")
+    if host in {"localhost", "127.0.0.1", "::1"} or any(
+        marker in host for marker in ("example", "placeholder", ".invalid")
+    ):
+        raise ValueError(f"{name} must not use a placeholder host")
+    password = parsed.password or ""
+    if len(password) < 24 or any(
+        marker in password.casefold() for marker in _PLACEHOLDER_MARKERS
+    ):
+        raise ValueError(f"{name} credentials are not production-safe")
+
+
+def _require_contact_encryption_key(value: SecretStr) -> None:
+    try:
+        decoded_key = base64.b64decode(value.get_secret_value(), validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("contact_encryption_key is invalid") from error
+    if len(decoded_key) != 32:
+        raise ValueError("contact_encryption_key is invalid")
+
+
+def _require_production_redis_url(value: str) -> None:
+    _require_secure_url("redis_url", value, schemes={"rediss"})
+    password = urlsplit(value).password or ""
+    if len(password) < 24 or any(
+        marker in password.casefold() for marker in _PLACEHOLDER_MARKERS
+    ):
+        raise ValueError("redis_url credentials are not production-safe")
+
+
+def _require_key_version(name: str, value: str) -> None:
+    if not re.fullmatch(r"v[1-9][0-9]{0,5}", value):
+        raise ValueError(f"{name} is invalid")
+
+
+def derive_identity_hmac_key(settings: "Settings | WorkerSettings") -> bytes:
+    return hmac.digest(
+        settings.identity_hmac_key.get_secret_value().encode(),
+        b"invitation-idempotency\0" + settings.identity_hmac_key_version.encode(),
+        hashlib.sha256,
+    )
 
 
 class _ObjectStoreAccessKeyIdentities(BaseSettings):
@@ -52,8 +150,10 @@ class Settings(BaseSettings):
     scorecard_model: str = "gpt-5-mini"
     contact_encryption_key: SecretStr
     suppression_hmac_key: SecretStr
+    identity_hmac_key: SecretStr = SecretStr("development-identity-key")
     telemetry_hmac_key: SecretStr
     suppression_hmac_key_version: str = "v1"
+    identity_hmac_key_version: str = "v1"
     webhook_hmac_key: SecretStr
     webhook_base_url: str = "https://localhost"
     webhook_max_body_bytes: int = 262_144
@@ -68,6 +168,41 @@ class Settings(BaseSettings):
                 "object_store_lifecycle_admin_access_key_id",
             ),
         )
+        _require_key_version(
+            "identity_hmac_key_version", self.identity_hmac_key_version
+        )
+        if self.environment.casefold() == "production":
+            _require_production_database_url("database_url", self.database_url)
+            _require_production_redis_url(self.redis_url)
+            _require_secure_url(
+                "object_store_endpoint",
+                self.object_store_endpoint,
+                schemes={"https"},
+            )
+            _require_secure_url("oidc_issuer", self.oidc_issuer, schemes={"https"})
+            _require_secure_url(
+                "webhook_base_url", self.webhook_base_url, schemes={"https"}
+            )
+            _require_production_secrets(
+                self.environment,
+                {
+                    "object_store_writer_access_key_id": (
+                        self.object_store_writer_access_key_id,
+                        16,
+                    ),
+                    "object_store_writer_secret_access_key": (
+                        self.object_store_writer_secret_access_key,
+                        32,
+                    ),
+                    "openai_api_key": (self.openai_api_key, 24),
+                    "contact_encryption_key": (self.contact_encryption_key, 43),
+                    "suppression_hmac_key": (self.suppression_hmac_key, 32),
+                    "identity_hmac_key": (self.identity_hmac_key, 32),
+                    "telemetry_hmac_key": (self.telemetry_hmac_key, 32),
+                    "webhook_hmac_key": (self.webhook_hmac_key, 32),
+                },
+            )
+            _require_contact_encryption_key(self.contact_encryption_key)
         return self
 
     @classmethod
@@ -87,6 +222,7 @@ class Settings(BaseSettings):
             openai_api_key="test-openai-key",
             contact_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             suppression_hmac_key="test-suppression-key",
+            identity_hmac_key="test-identity-key",
             telemetry_hmac_key="test-telemetry-key",
             webhook_hmac_key="test-webhook-key",
         )
@@ -107,8 +243,10 @@ class WorkerSettings(BaseSettings):
     apollo_api_key: SecretStr
     contact_encryption_key: SecretStr
     suppression_hmac_key: SecretStr
+    identity_hmac_key: SecretStr = SecretStr("development-identity-key")
     telemetry_hmac_key: SecretStr
     suppression_hmac_key_version: str = "v1"
+    identity_hmac_key_version: str = "v1"
     webhook_hmac_key: SecretStr
     webhook_base_url: str = "https://localhost"
     apollo_reveal_personal_emails: bool = False
@@ -124,6 +262,40 @@ class WorkerSettings(BaseSettings):
                 "object_store_lifecycle_admin_access_key_id",
             ),
         )
+        _require_key_version(
+            "identity_hmac_key_version", self.identity_hmac_key_version
+        )
+        if self.environment.casefold() == "production":
+            _require_production_database_url("database_url", self.database_url)
+            _require_production_redis_url(self.redis_url)
+            _require_secure_url(
+                "object_store_endpoint",
+                self.object_store_endpoint,
+                schemes={"https"},
+            )
+            _require_secure_url(
+                "webhook_base_url", self.webhook_base_url, schemes={"https"}
+            )
+            _require_production_secrets(
+                self.environment,
+                {
+                    "object_store_writer_access_key_id": (
+                        self.object_store_writer_access_key_id,
+                        16,
+                    ),
+                    "object_store_writer_secret_access_key": (
+                        self.object_store_writer_secret_access_key,
+                        32,
+                    ),
+                    "apollo_api_key": (self.apollo_api_key, 24),
+                    "contact_encryption_key": (self.contact_encryption_key, 43),
+                    "suppression_hmac_key": (self.suppression_hmac_key, 32),
+                    "identity_hmac_key": (self.identity_hmac_key, 32),
+                    "telemetry_hmac_key": (self.telemetry_hmac_key, 32),
+                    "webhook_hmac_key": (self.webhook_hmac_key, 32),
+                },
+            )
+            _require_contact_encryption_key(self.contact_encryption_key)
         return self
 
     @classmethod
@@ -155,6 +327,7 @@ class MaintenanceSettings(BaseSettings):
         env_file=Path(__file__).resolve().parents[3] / ".env", extra="ignore"
     )
 
+    environment: str = "development"
     maintenance_database_url: str
     redis_url: str
     object_store_endpoint: str
@@ -177,11 +350,36 @@ class MaintenanceSettings(BaseSettings):
                 "object_store_lifecycle_admin_access_key_id",
             ),
         )
+        if self.environment.casefold() == "production":
+            _require_production_database_url(
+                "maintenance_database_url", self.maintenance_database_url
+            )
+            _require_production_redis_url(self.redis_url)
+            _require_secure_url(
+                "object_store_endpoint",
+                self.object_store_endpoint,
+                schemes={"https"},
+            )
+            _require_production_secrets(
+                self.environment,
+                {
+                    "object_store_delete_access_key_id": (
+                        self.object_store_delete_access_key_id,
+                        16,
+                    ),
+                    "object_store_delete_secret_access_key": (
+                        self.object_store_delete_secret_access_key,
+                        32,
+                    ),
+                    "telemetry_hmac_key": (self.telemetry_hmac_key, 32),
+                },
+            )
         return self
 
     @classmethod
     def for_test(cls) -> "MaintenanceSettings":
         return cls(
+            environment="test",
             maintenance_database_url=(
                 "postgresql+psycopg://sourcing_maintenance:sourcing-maintenance-test"
                 "@localhost:5432/sourcing_test"

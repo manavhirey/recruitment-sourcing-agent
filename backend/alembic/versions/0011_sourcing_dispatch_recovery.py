@@ -187,9 +187,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("DROP FUNCTION IF EXISTS maintenance_release_sourcing_dispatch(uuid, uuid)")
-    op.execute("DROP FUNCTION IF EXISTS maintenance_complete_sourcing_dispatch(uuid, uuid)")
-    op.execute("DROP FUNCTION IF EXISTS maintenance_claim_pending_sourcing_dispatches(integer)")
+    op.execute(
+        "DROP FUNCTION IF EXISTS maintenance_release_sourcing_dispatch(uuid, uuid)"
+    )
+    op.execute(
+        "DROP FUNCTION IF EXISTS maintenance_complete_sourcing_dispatch(uuid, uuid)"
+    )
+    op.execute(
+        "DROP FUNCTION IF EXISTS maintenance_claim_pending_sourcing_dispatches(integer)"
+    )
     op.drop_index("ix_sourcing_runs_pending_dispatch", table_name="sourcing_runs")
     op.drop_column("sourcing_runs", "dispatch_claim_token")
     op.drop_column("sourcing_runs", "dispatch_claimed_at")

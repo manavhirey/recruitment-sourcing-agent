@@ -16,7 +16,11 @@ from app.providers.base import (
     EnrichmentPending,
     EnrichmentReceipt,
     EnrichmentResult,
+    ProviderAuthenticationError,
     ProviderError,
+    ProviderPermissionError,
+    ProviderRateLimited,
+    ProviderTemporaryError,
 )
 from app.providers.snapshots import SnapshotStore
 from app.sourcing.models import (
@@ -35,6 +39,7 @@ from app.sourcing.webhooks import (
 
 _MAX_ENRICHMENT_LIMIT = 50
 _MAX_BATCH_SIZE = 10
+_MAX_PROVIDER_RATE_LIMIT_ATTEMPTS = 6
 _STAGE_DEADLINE = timedelta(minutes=5)
 
 
@@ -104,6 +109,11 @@ class DeferredEnrichment:
     retry_after_seconds: int
 
 
+@dataclass(frozen=True)
+class FailedEnrichment:
+    request_id: UUID
+
+
 def stable_top_candidate_ids(
     candidates: Iterable[tuple[UUID, int | None, str | None]], *, limit: int = 50
 ) -> list[UUID]:
@@ -142,7 +152,7 @@ def enqueue_top_enrichment(
     policy: RegionalContactPolicy,
     token_codec: CapabilityTokenCodec,
     on_budget_exhausted: Callable[[], None] | None = None,
-) -> list[SubmittedEnrichment]:
+) -> list[SubmittedEnrichment | DeferredEnrichment | FailedEnrichment]:
     if not callback_base_url.startswith("https://"):
         raise ValueError("callback base URL must use HTTPS")
     codec = token_codec
@@ -182,6 +192,7 @@ def enqueue_top_enrichment(
             str,
         ]
     ] = []
+    submissions: list[SubmittedEnrichment | DeferredEnrichment | FailedEnrichment] = []
     for index, (records, reveal_personal, reveal_phone) in enumerate(batches):
         candidate_ids = tuple(record[0] for record in records)
         reservation_key = _reservation_key(index, candidate_ids)
@@ -196,6 +207,9 @@ def enqueue_top_enrichment(
             codec,
             on_budget_exhausted,
         )
+        if isinstance(prepared, (DeferredEnrichment, FailedEnrichment)):
+            submissions.append(prepared)
+            continue
         if prepared is None:
             continue
         enrichment_id, capability_token = prepared
@@ -209,7 +223,6 @@ def enqueue_top_enrichment(
             )
         )
 
-    submissions: list[SubmittedEnrichment] = []
     for (
         records,
         reveal_personal,
@@ -231,13 +244,42 @@ def enqueue_top_enrichment(
                 reveal_personal_emails=reveal_personal,
                 reveal_phone_number=reveal_phone,
             )
-        except ProviderError:
+        except (ProviderAuthenticationError, ProviderPermissionError):
             _fail_request(
                 session_factory,
                 context,
                 enrichment_id,
                 error_code="provider_enrichment_failed",
             )
+            raise
+        except ProviderRateLimited as error:
+            submissions.append(
+                _defer_rate_limited_request(
+                    session_factory,
+                    context,
+                    enrichment_id,
+                    retry_after=error.retry_after,
+                )
+            )
+            continue
+        except ProviderTemporaryError:
+            submissions.append(
+                _defer_ambiguous_request(
+                    session_factory,
+                    context,
+                    enrichment_id,
+                )
+            )
+            continue
+        except ProviderError:
+            _fail_request(
+                session_factory,
+                context,
+                enrichment_id,
+                error_code="provider_enrichment_failed",
+                charge_reserved=True,
+            )
+            submissions.append(FailedEnrichment(request_id=enrichment_id))
             continue
         _record_receipt(
             session_factory,
@@ -348,7 +390,7 @@ def execute_queued_enrichment_request(
     snapshot_store: SnapshotStore,
     policy: RegionalContactPolicy,
     token_codec: CapabilityTokenCodec,
-) -> SubmittedEnrichment | DeferredEnrichment | None:
+) -> SubmittedEnrichment | DeferredEnrichment | FailedEnrichment | None:
     if not callback_base_url.startswith("https://"):
         raise ValueError("callback base URL must use HTTPS")
     with _tenant_session(session_factory, context.tenant_id) as session:
@@ -377,12 +419,17 @@ def execute_queued_enrichment_request(
                 return DeferredEnrichment(
                     retry_after_seconds=max(1, int(remaining) + 1)
                 )
-            enrichment.status = "failed"
-            enrichment.error_code = "ambiguous_provider_submission"
-            enrichment.completed_at = datetime.now(UTC)
-            session.commit()
-            _finalize_if_terminal(session_factory, context, enrichment.run_id)
-            return None
+            run_id = enrichment.run_id
+            session.rollback()
+            _fail_request(
+                session_factory,
+                context,
+                request_id,
+                error_code="ambiguous_provider_submission",
+                charge_reserved=True,
+            )
+            _finalize_if_terminal(session_factory, context, run_id)
+            return FailedEnrichment(request_id=request_id)
         run = _load_run(session, context, enrichment.run_id, for_update=True)
         if run.cancellation_requested or run.state is RunState.CANCELLED:
             enrichment.status = "cancelled"
@@ -418,7 +465,7 @@ def execute_queued_enrichment_request(
             reveal_personal_emails=reveal_personal,
             reveal_phone_number=reveal_phone,
         )
-    except ProviderError:
+    except (ProviderAuthenticationError, ProviderPermissionError):
         _fail_request(
             session_factory,
             context,
@@ -426,7 +473,30 @@ def execute_queued_enrichment_request(
             error_code="provider_enrichment_failed",
         )
         _finalize_if_terminal(session_factory, context, run_id)
-        return None
+        raise
+    except ProviderRateLimited as error:
+        return _defer_rate_limited_request(
+            session_factory,
+            context,
+            request_id,
+            retry_after=error.retry_after,
+        )
+    except ProviderTemporaryError:
+        return _defer_ambiguous_request(
+            session_factory,
+            context,
+            request_id,
+        )
+    except ProviderError:
+        _fail_request(
+            session_factory,
+            context,
+            request_id,
+            error_code="provider_enrichment_failed",
+            charge_reserved=True,
+        )
+        _finalize_if_terminal(session_factory, context, run_id)
+        return FailedEnrichment(request_id=request_id)
     _record_receipt(
         session_factory,
         context,
@@ -552,17 +622,56 @@ def _prepare_request(
     reveal_phone: bool,
     codec: CapabilityTokenCodec,
     on_budget_exhausted: Callable[[], None] | None,
-) -> tuple[UUID, str] | None:
+) -> tuple[UUID, str] | DeferredEnrichment | FailedEnrichment | None:
     with _tenant_session(session_factory, context.tenant_id) as session:
         existing = session.scalar(
-            select(EnrichmentRequest).where(
+            select(EnrichmentRequest)
+            .where(
                 EnrichmentRequest.tenant_id == context.tenant_id,
                 EnrichmentRequest.run_id == run_id,
                 EnrichmentRequest.reservation_key == reservation_key,
             )
+            .with_for_update()
         )
         if existing is not None:
-            return None
+            if existing.status == "submitting":
+                deadline = existing.stage_deadline
+                if deadline is not None and deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=UTC)
+                remaining = (
+                    (deadline - datetime.now(UTC)).total_seconds()
+                    if deadline is not None
+                    else 0
+                )
+                if remaining > 0:
+                    session.rollback()
+                    return DeferredEnrichment(
+                        retry_after_seconds=max(1, int(remaining) + 1)
+                    )
+                request_id = existing.id
+                session.rollback()
+                _fail_request(
+                    session_factory,
+                    context,
+                    request_id,
+                    error_code="ambiguous_provider_submission",
+                    charge_reserved=True,
+                )
+                _finalize_if_terminal(session_factory, context, run_id)
+                return FailedEnrichment(request_id=request_id)
+            if existing.status != "queued":
+                session.rollback()
+                return None
+            run = _load_run(session, context, run_id, for_update=True)
+            if run.cancellation_requested or run.state is RunState.CANCELLED:
+                session.rollback()
+                return None
+            token = codec.issue(existing.id, context.tenant_id)
+            existing.capability_token_hmac = codec.digest(token, context.tenant_id)
+            existing.status = "submitting"
+            existing.stage_deadline = datetime.now(UTC) + _STAGE_DEADLINE
+            session.commit()
+            return existing.id, token
         run = _load_run(session, context, run_id, for_update=True)
         if run.cancellation_requested or run.state is RunState.CANCELLED:
             session.rollback()
@@ -771,44 +880,137 @@ def _fail_request(
         )
         if enrichment is None or enrichment.status in ("completed", "cancelled"):
             return
-        enrichment.status = "failed"
-        enrichment.error_code = error_code
-        enrichment.completed_at = datetime.now(UTC)
-        session.execute(
-            update(RunCandidate)
-            .where(
-                RunCandidate.tenant_id == context.tenant_id,
-                RunCandidate.run_id == enrichment.run_id,
-                RunCandidate.candidate_id.in_(
-                    [UUID(value) for value in enrichment.candidate_ids]
-                ),
-            )
-            .values(enrichment_status="failed", enriched_at=datetime.now(UTC))
+        _mark_request_failed(
+            session,
+            enrichment,
+            context,
+            error_code=error_code,
+            charge_reserved=charge_reserved,
         )
+        session.commit()
+
+
+def _mark_request_failed(
+    session: Session,
+    enrichment: EnrichmentRequest,
+    context: RequestContext,
+    *,
+    error_code: str,
+    charge_reserved: bool,
+) -> None:
+    enrichment.status = "failed"
+    enrichment.error_code = error_code
+    enrichment.completed_at = datetime.now(UTC)
+    session.execute(
+        update(RunCandidate)
+        .where(
+            RunCandidate.tenant_id == context.tenant_id,
+            RunCandidate.run_id == enrichment.run_id,
+            RunCandidate.candidate_id.in_(
+                [UUID(value) for value in enrichment.candidate_ids]
+            ),
+        )
+        .values(enrichment_status="failed", enriched_at=datetime.now(UTC))
+    )
+    if enrichment.usage_reconciled_at is not None:
+        return
+    charged_units = {"enrichments": 0, "estimated_credits": 0}
+    provider_request_id = None
+    if charge_reserved:
+        ledger = list(
+            session.scalars(
+                select(UsageLedger).where(
+                    UsageLedger.tenant_id == context.tenant_id,
+                    UsageLedger.run_id == enrichment.run_id,
+                    UsageLedger.reservation_key == enrichment.reservation_key,
+                )
+            )
+        )
+        charged_units = {row.unit_type: row.requested_units for row in ledger}
+        provider_request_id = enrichment.provider_request_id
+    SourcingService(session, b"internal-enrichment").reconcile_usage(
+        context,
+        enrichment.run_id,
+        reservation_key=enrichment.reservation_key,
+        charged_units=charged_units,
+        provider_request_id=provider_request_id,
+    )
+    enrichment.usage_reconciled_at = datetime.now(UTC)
+
+
+def _defer_rate_limited_request(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    request_id: UUID,
+    *,
+    retry_after: int | None,
+) -> DeferredEnrichment | FailedEnrichment:
+    delay = max(1, retry_after or 1)
+    terminal_run_id: UUID | None = None
+    with _tenant_session(session_factory, context.tenant_id) as session:
+        enrichment = session.scalar(
+            select(EnrichmentRequest)
+            .where(
+                EnrichmentRequest.id == request_id,
+                EnrichmentRequest.tenant_id == context.tenant_id,
+            )
+            .with_for_update()
+        )
+        if enrichment is None:
+            raise LookupError("enrichment request not found")
+        enrichment.status = "queued"
+        enrichment.stage_deadline = None
+        enrichment.retry_count += 1
+        if enrichment.retry_count >= _MAX_PROVIDER_RATE_LIMIT_ATTEMPTS:
+            _mark_request_failed(
+                session,
+                enrichment,
+                context,
+                error_code="provider_rate_limit_exhausted",
+                charge_reserved=False,
+            )
+            terminal_run_id = enrichment.run_id
+        session.commit()
+    if terminal_run_id is not None:
+        _finalize_if_terminal(session_factory, context, terminal_run_id)
+        return FailedEnrichment(request_id=request_id)
+    return DeferredEnrichment(retry_after_seconds=delay)
+
+
+def _defer_ambiguous_request(
+    session_factory: sessionmaker[Session],
+    context: RequestContext,
+    request_id: UUID,
+) -> DeferredEnrichment:
+    with _tenant_session(session_factory, context.tenant_id) as session:
+        enrichment = session.scalar(
+            select(EnrichmentRequest)
+            .where(
+                EnrichmentRequest.id == request_id,
+                EnrichmentRequest.tenant_id == context.tenant_id,
+            )
+            .with_for_update()
+        )
+        if enrichment is None:
+            raise LookupError("enrichment request not found")
         if enrichment.usage_reconciled_at is None:
-            charged_units = {"enrichments": 0, "estimated_credits": 0}
-            provider_request_id = None
-            if charge_reserved:
-                ledger = list(
-                    session.scalars(
-                        select(UsageLedger).where(
-                            UsageLedger.tenant_id == context.tenant_id,
-                            UsageLedger.run_id == enrichment.run_id,
-                            UsageLedger.reservation_key == enrichment.reservation_key,
-                        )
+            reserved = {
+                row.unit_type: row.requested_units
+                for row in session.scalars(
+                    select(UsageLedger).where(
+                        UsageLedger.tenant_id == context.tenant_id,
+                        UsageLedger.run_id == enrichment.run_id,
+                        UsageLedger.reservation_key == enrichment.reservation_key,
                     )
                 )
-                charged_units = {row.unit_type: row.requested_units for row in ledger}
-                provider_request_id = enrichment.provider_request_id
-            SourcingService(session, b"internal-enrichment").reconcile_usage(
-                context,
-                enrichment.run_id,
-                reservation_key=enrichment.reservation_key,
-                charged_units=charged_units,
-                provider_request_id=provider_request_id,
-            )
-            enrichment.usage_reconciled_at = datetime.now(UTC)
+            }
+            _reconcile_receipt_usage(session, enrichment, context, reserved)
+        deadline = enrichment.stage_deadline or datetime.now(UTC) + _STAGE_DEADLINE
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        remaining = max(1, int((deadline - datetime.now(UTC)).total_seconds()) + 1)
         session.commit()
+    return DeferredEnrichment(retry_after_seconds=remaining)
 
 
 def _load_run(
@@ -838,6 +1040,9 @@ def _finish_empty_enrichment(
             run.state = transition_run(run.state, RunState.READY)
             run.current_stage = RunState.READY.value
             run.completed_at = datetime.now(UTC)
+            from app.crm.service import capture_acceptance_cohort
+
+            capture_acceptance_cohort(session, run)
         session.commit()
 
 
@@ -883,4 +1088,8 @@ def _finalize_if_terminal(
             run.state = transition_run(run.state, target)
         run.current_stage = run.state.value
         run.completed_at = datetime.now(UTC)
+        if run.state is RunState.READY:
+            from app.crm.service import capture_acceptance_cohort
+
+            capture_acceptance_cohort(session, run)
         session.commit()

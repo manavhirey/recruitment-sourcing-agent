@@ -131,9 +131,7 @@ def configure_snapshot_lifecycle(client: ObjectStoreClient, bucket: str) -> None
                     "Status": "Enabled",
                     "Filter": {"Prefix": ""},
                     "Expiration": {"Days": _RETENTION_DAYS},
-                    "NoncurrentVersionExpiration": {
-                        "NoncurrentDays": _RETENTION_DAYS
-                    },
+                    "NoncurrentVersionExpiration": {"NoncurrentDays": _RETENTION_DAYS},
                 }
             ]
         },

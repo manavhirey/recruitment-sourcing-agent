@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import AuditService
@@ -285,10 +286,11 @@ class PrivacyService:
         contact_cipher: ContactCipher,
         *,
         key_version: str = _DEFAULT_KEY_VERSION,
+        idempotency_hmac_key: bytes | None = None,
     ) -> None:
         self.session = session
         self._hmac_key = bytes(hmac_key)
-        self._idempotency = MembershipService(session, hmac_key)
+        self._idempotency = MembershipService(session, idempotency_hmac_key or hmac_key)
         self._audit = AuditService(session)
         self._suppression = SuppressionService(
             session, hmac_key, key_version=key_version
@@ -313,6 +315,10 @@ class PrivacyService:
         replay = self._request_from_record(context, record)
         if replay is not None:
             return replay
+        active = self._active_request(context, candidate_id, request_type)
+        if active is not None:
+            self._complete(record, active)
+            return active
         request = PrivacyRequest(
             tenant_id=context.tenant_id,
             candidate_id=candidate_id,
@@ -320,8 +326,16 @@ class PrivacyService:
             state=PrivacyRequestState.IDENTITY_VERIFICATION_REQUIRED,
             submitted_by_user_id=context.user_id,
         )
-        self.session.add(request)
-        self.session.flush()
+        try:
+            with self.session.begin_nested():
+                self.session.add(request)
+                self.session.flush()
+        except IntegrityError:
+            active = self._active_request(context, candidate_id, request_type)
+            if active is None:
+                raise
+            self._complete(record, active)
+            return active
         self._audit.record(
             tenant_id=context.tenant_id,
             actor_user_id=context.user_id,
@@ -333,6 +347,29 @@ class PrivacyService:
         )
         self._complete(record, request)
         return request
+
+    def _active_request(
+        self,
+        context: RequestContext,
+        candidate_id: UUID,
+        request_type: PrivacyRequestType,
+    ) -> PrivacyRequest | None:
+        return self.session.scalar(
+            select(PrivacyRequest)
+            .where(
+                PrivacyRequest.tenant_id == context.tenant_id,
+                PrivacyRequest.candidate_id == candidate_id,
+                PrivacyRequest.request_type == request_type,
+                PrivacyRequest.state.not_in(
+                    (
+                        PrivacyRequestState.COMPLETED,
+                        PrivacyRequestState.REJECTED,
+                    )
+                ),
+            )
+            .order_by(PrivacyRequest.created_at, PrivacyRequest.id)
+            .limit(1)
+        )
 
     def list(self, context: RequestContext) -> list[PrivacyRequest]:
         statement = select(PrivacyRequest).where(
@@ -492,12 +529,9 @@ class PrivacyService:
             return request
         if request.state is not PrivacyRequestState.APPROVED:
             raise PrivacyError("privacy_request_state_invalid")
-        request.state = PrivacyRequestState.EXECUTING
-        self._checkpoint(request, "execution_started")
-        request.state = PrivacyRequestState.COMPLETED
-        request.completed_at = datetime.now(UTC)
-        self._checkpoint(request, "completed")
-        self._record_action(context, request, "completed")
+        request.state = PrivacyRequestState.MANUAL_FULFILLMENT_REQUIRED
+        self._checkpoint(request, "manual_fulfillment_required")
+        self._record_action(context, request, "manual_fulfillment_required")
         self._complete(record, request)
         return request
 

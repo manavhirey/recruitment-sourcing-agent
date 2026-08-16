@@ -53,9 +53,7 @@ def test_concurrent_first_disable_is_an_atomic_upsert(tmp_path) -> None:
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(
             pool.map(
-                lambda _: disable_provider(
-                    sessions, "apollo", "authentication_error"
-                ),
+                lambda _: disable_provider(sessions, "apollo", "authentication_error"),
                 range(16),
             )
         )

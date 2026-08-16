@@ -244,9 +244,7 @@ class SourcingService:
             raise SourcingError("run_not_found")
         return run
 
-    def result_counts(
-        self, context: RequestContext, run_id: UUID
-    ) -> tuple[int, int]:
+    def result_counts(self, context: RequestContext, run_id: UUID) -> tuple[int, int]:
         run = self.get_authorized(context, run_id)
         enriched, failed = self.session.execute(
             select(
@@ -369,9 +367,7 @@ class SourcingService:
             .with_for_update()
         )
         if active_request is not None:
-            self._complete(
-                record, {"enrichment_request_id": str(active_request.id)}
-            )
+            self._complete(record, {"enrichment_request_id": str(active_request.id)})
             return EnrichmentDispatchOutcome(
                 active_request,
                 self._claim_enrichment_dispatch(active_request),

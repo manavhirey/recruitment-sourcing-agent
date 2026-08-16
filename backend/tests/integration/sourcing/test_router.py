@@ -458,9 +458,7 @@ def test_latest_job_run_collapses_missing_job_and_missing_run(
     )
 
     assert no_run.status_code == missing.status_code == 404
-    assert no_run.json() == missing.json() == {
-        "detail": {"code": "run_not_found"}
-    }
+    assert no_run.json() == missing.json() == {"detail": {"code": "run_not_found"}}
 
 
 def test_notifications_are_role_scoped_and_acknowledgement_is_idempotent(
@@ -688,9 +686,7 @@ def test_on_demand_enrichment_retries_pending_dispatch_with_the_same_key(
         session.commit()
         run_candidate_id = row.id
 
-    dispatcher: RecordingEnrichmentDispatcher = sourcing_api[
-        "enrichment_dispatcher"
-    ]
+    dispatcher: RecordingEnrichmentDispatcher = sourcing_api["enrichment_dispatcher"]
     dispatcher.failures_remaining = 1
     url = f"/api/v1/job-candidates/{run_candidate_id}/enrich"
     with pytest.raises(ConnectionError, match="broker unavailable"):
@@ -749,9 +745,7 @@ def test_on_demand_enrichment_new_key_binds_the_pending_request(
         session.commit()
         run_candidate_id = row.id
 
-    dispatcher: RecordingEnrichmentDispatcher = sourcing_api[
-        "enrichment_dispatcher"
-    ]
+    dispatcher: RecordingEnrichmentDispatcher = sourcing_api["enrichment_dispatcher"]
     dispatcher.failures_remaining = 1
     url = f"/api/v1/job-candidates/{run_candidate_id}/enrich"
     with pytest.raises(ConnectionError):

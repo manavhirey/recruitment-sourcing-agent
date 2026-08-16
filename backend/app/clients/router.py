@@ -14,7 +14,7 @@ from app.clients.schemas import (
     ClientResponse,
 )
 from app.clients.service import ClientError, ClientService
-from app.core.config import Settings
+from app.core.config import Settings, derive_identity_hmac_key
 from app.core.database import get_db
 from app.identity.dependencies import (
     get_app_settings,
@@ -29,9 +29,7 @@ manager_context = require_role(Role.OWNER, Role.ADMIN)
 
 
 def _service(session: Session, settings: Settings) -> ClientService:
-    return ClientService(
-        session, settings.suppression_hmac_key.get_secret_value().encode()
-    )
+    return ClientService(session, derive_identity_hmac_key(settings))
 
 
 def _client_response(service: ClientService, client: ClientCompany) -> ClientResponse:

@@ -8,7 +8,7 @@ from app.core.log_redaction import SensitiveDataLogFilter
 @pytest.mark.parametrize(
     "message",
     [
-        'POST /api/v1/membership-invitations/%s/claim HTTP/1.1',
+        "POST /api/v1/membership-invitations/%s/claim HTTP/1.1",
         'HTTP Request: POST https://api.example.test/api/v1/membership-invitations/%s/claim "HTTP/1.1 200 OK"',
     ],
 )

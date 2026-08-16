@@ -168,9 +168,7 @@ def test_aborted_stream_keeps_previously_emitted_plaintext_audited(crm_api) -> N
             == 1
         )
         payloads = session.scalars(
-            select(AuditEvent.payload).where(
-                AuditEvent.action.in_(actions)
-            )
+            select(AuditEvent.payload).where(AuditEvent.action.in_(actions))
         ).all()
         assert "+12125550112" not in str(payloads)
 

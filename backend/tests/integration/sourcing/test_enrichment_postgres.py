@@ -99,6 +99,12 @@ def owner_engine() -> Generator[Engine, None, None]:
         )
         connection.execute(
             text(
+                "ALTER TABLE crm_acceptance_cohorts "
+                "DISABLE TRIGGER crm_acceptance_cohorts_append_only"
+            )
+        )
+        connection.execute(
+            text(
                 "DELETE FROM audit_events WHERE tenant_id IN "
                 "(SELECT id FROM tenants WHERE slug LIKE 'task9-%')"
             )
@@ -107,6 +113,12 @@ def owner_engine() -> Generator[Engine, None, None]:
         connection.execute(text("DELETE FROM users WHERE oidc_subject LIKE 'task9|%'"))
         connection.execute(
             text("ALTER TABLE audit_events ENABLE TRIGGER audit_events_append_only")
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE crm_acceptance_cohorts "
+                "ENABLE TRIGGER crm_acceptance_cohorts_append_only"
+            )
         )
     engine.dispose()
 
@@ -126,7 +138,7 @@ def test_0007_to_head_upgrade_downgrade_and_model_parity(owner_engine: Engine) -
 
     with owner_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0013_provider_connector_state"
+            "0014_final_review_contracts"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -1073,7 +1085,9 @@ def test_on_demand_lock_order_avoids_run_candidate_deadlock_and_replays(
     def on_demand_worker() -> None:
         try:
             assert run_locked.wait(timeout=5)
-            with SignallingSession(bind=owner_engine, expire_on_commit=False) as session:
+            with SignallingSession(
+                bind=owner_engine, expire_on_commit=False
+            ) as session:
                 outcome = SourcingService(
                     session, b"test-key"
                 ).queue_on_demand_enrichment(
@@ -1097,9 +1111,7 @@ def test_on_demand_lock_order_avoids_run_candidate_deadlock_and_replays(
     assert all(not thread.is_alive() for thread in threads)
     observed = [outcomes.get_nowait(), outcomes.get_nowait()]
     assert not [item for item in observed if isinstance(item, BaseException)]
-    request_id, claim_token = next(
-        item for item in observed if isinstance(item, tuple)
-    )
+    request_id, claim_token = next(item for item in observed if isinstance(item, tuple))
     assert claim_token is not None
 
     with Session(owner_engine, expire_on_commit=False) as session:

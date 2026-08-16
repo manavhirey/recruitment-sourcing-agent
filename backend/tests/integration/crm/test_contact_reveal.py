@@ -2,17 +2,80 @@ import json
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.audit.models import AuditEvent
 from app.candidates.contacts import ContactService
 from app.candidates.models import ContactPoint
+from app.core import database
+from app.core.database import get_db
 from app.core.telemetry import Telemetry, identifier_digest
-from app.crm.models import ActivityEvent
+from app.crm.models import ActivityEvent, CandidateStage, JobCandidate
 from app.identity.models import IdentityIdempotencyKey
 from app.identity.schemas import RequestContext, Role
 from app.providers.base import ProviderContact
+
+
+class _CommitFailureSession(Session):
+    def commit(self) -> None:
+        self.rollback()
+        raise RuntimeError("forced commit failure")
+
+
+def _client_with_commit_failure(
+    crm_api: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> TestClient:
+    engine = crm_api["engine"]
+
+    def failing_session_factory() -> _CommitFailureSession:
+        return _CommitFailureSession(bind=engine, expire_on_commit=False)
+
+    app = crm_api["api"].app  # type: ignore[union-attr]
+    app.dependency_overrides.pop(get_db)
+    monkeypatch.setattr(database, "session_factory", failing_session_factory)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_commit_failure_emits_no_success_for_ordinary_mutation(
+    crm_api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    headers = {
+        **crm_api["headers"],
+        "Idempotency-Key": "commit-failure-stage-change",
+    }
+    with _client_with_commit_failure(crm_api, monkeypatch) as api:
+        response = api.patch(
+            f"/api/v1/job-candidates/{crm_api['priya_row_id']}/stage",
+            headers=headers,
+            json={"stage": CandidateStage.SHORTLISTED.value},
+        )
+
+    assert response.status_code == 500
+    assert '"stage":"Shortlisted"' not in response.text
+    with Session(crm_api["engine"]) as session:
+        row = session.get(JobCandidate, crm_api["priya_row_id"])
+        assert row is not None
+        assert row.stage is CandidateStage.NEW
+
+
+def test_commit_failure_emits_no_revealed_plaintext(
+    crm_api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    headers = {
+        **crm_api["headers"],
+        "Idempotency-Key": "commit-failure-contact-reveal",
+    }
+    with _client_with_commit_failure(crm_api, monkeypatch) as api:
+        response = api.post(
+            f"/api/v1/contact-points/{crm_api['work_email_id']}/reveal",
+            headers=headers,
+        )
+
+    assert response.status_code == 500
+    assert "priya@example.test" not in response.text
 
 
 def test_reveal_updates_legitimate_use_audits_once_and_never_caches_plaintext(
@@ -71,7 +134,9 @@ def test_reveal_updates_legitimate_use_audits_once_and_never_caches_plaintext(
         )
         assert ledger is not None
         assert "priya@example.test" not in str(ledger.response_payload)
-    reveal_events = [event for event in captured if event["event"] == "contact_revealed"]
+    reveal_events = [
+        event for event in captured if event["event"] == "contact_revealed"
+    ]
     assert reveal_events
     assert reveal_events[0]["user_hash"] == identifier_digest(
         crm_api["recruiter_id"], b"telemetry-test-key"

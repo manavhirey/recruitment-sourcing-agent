@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
-from app.core.config import Settings
+from app.core.config import Settings, derive_identity_hmac_key
 from app.core.database import get_db
 from app.identity.dependencies import (
     get_app_settings,
@@ -41,7 +41,7 @@ def _service(
 ) -> JobService:
     return JobService(
         session,
-        settings.suppression_hmac_key.get_secret_value().encode(),
+        derive_identity_hmac_key(settings),
         gateway,
     )
 
@@ -98,12 +98,8 @@ def list_jobs(
     offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
 ) -> JobPage:
     service = _service(session, settings, gateway)
-    jobs, next_offset = service.list_authorized(
-        context, limit=limit, offset=offset
-    )
-    return JobPage(
-        items=[_job_summary(job) for job in jobs], next_offset=next_offset
-    )
+    jobs, next_offset = service.list_authorized(context, limit=limit, offset=offset)
+    return JobPage(items=[_job_summary(job) for job in jobs], next_offset=next_offset)
 
 
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)

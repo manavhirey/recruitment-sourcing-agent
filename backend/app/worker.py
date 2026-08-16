@@ -35,8 +35,6 @@ metrics_redis = Redis.from_url(settings.redis_url, socket_timeout=2)
 worker_metrics = install_task_telemetry(
     celery_app,
     hmac_key=settings.telemetry_hmac_key.get_secret_value().encode(),
-    queue_depth_probes={
-        "sourcing": lambda: cast(int, metrics_redis.llen("sourcing"))
-    },
+    queue_depth_probes={"sourcing": lambda: cast(int, metrics_redis.llen("sourcing"))},
 )
 start_metrics_server_from_env(worker_metrics)

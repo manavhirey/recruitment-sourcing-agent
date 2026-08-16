@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.candidates.models import Candidate, ContactPoint
-from app.core.config import Settings
+from app.core.config import Settings, derive_identity_hmac_key
 from app.core.database import get_db
 from app.crm.exports import export_shortlist_csv
 from app.crm.models import CandidateStage, JobCandidate
@@ -48,7 +48,7 @@ def _service(
 ) -> CrmService:
     return CrmService(
         session,
-        settings.suppression_hmac_key.get_secret_value().encode(),
+        derive_identity_hmac_key(settings),
         request.app.state.contact_cipher,
     )
 
@@ -137,9 +137,7 @@ def _view(
                     provider=experience.provider,
                     source_timestamp=_utc(experience.source_timestamp),
                 )
-                for experience in service.candidate_experiences(
-                    context, candidate.id
-                )
+                for experience in service.candidate_experiences(context, candidate.id)
             ]
             if detail
             else None
@@ -480,9 +478,7 @@ def export_shortlist(
             request.app.state.contact_cipher,
             context,
             job_id,
-            authorization_hmac_key=(
-                settings.suppression_hmac_key.get_secret_value().encode()
-            ),
+            authorization_hmac_key=(derive_identity_hmac_key(settings)),
             idempotency_key=idempotency_key,
         )
     except CrmError as error:

@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.core.config import Settings
+from app.core.config import Settings, derive_identity_hmac_key
 from app.core.database import get_db
 from app.identity.dependencies import (
     get_app_settings,
@@ -64,39 +64,73 @@ def _run_activity_summary(event: object) -> str | None:
 
     def count(name: str) -> int | None:
         value = payload.get(name)
-        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+        return (
+            value
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            else None
+        )
 
     state_value = payload.get("state")
-    state = state_value.replace("_", " ") if isinstance(state_value, str) and state_value in {item.value for item in RunState} else None
+    state = (
+        state_value.replace("_", " ")
+        if isinstance(state_value, str)
+        and state_value in {item.value for item in RunState}
+        else None
+    )
     if action == "sourcing_run.planned":
         query_count = count("query_count")
-        return f"{query_count} provider queries planned" if query_count is not None else None
+        return (
+            f"{query_count} provider queries planned"
+            if query_count is not None
+            else None
+        )
     if action == "sourcing_run.source_completed":
         candidate_count = count("candidate_count")
-        return " · ".join(
-            value for value in (
-                f"{candidate_count} candidates sourced" if candidate_count is not None else None,
-                state,
-            ) if value
-        ) or None
+        return (
+            " · ".join(
+                value
+                for value in (
+                    f"{candidate_count} candidates sourced"
+                    if candidate_count is not None
+                    else None,
+                    state,
+                )
+                if value
+            )
+            or None
+        )
     if action == "sourcing_run.matched":
         matched_count = count("matched_count")
-        return " · ".join(
-            value for value in (
-                f"{matched_count} candidates matched" if matched_count is not None else None,
-                state,
-            ) if value
-        ) or None
+        return (
+            " · ".join(
+                value
+                for value in (
+                    f"{matched_count} candidates matched"
+                    if matched_count is not None
+                    else None,
+                    state,
+                )
+                if value
+            )
+            or None
+        )
     if action == "sourcing_run.enrichment_applied":
         candidate_count = count("candidate_count")
         source = payload.get("source")
         delivery = source if source in {"webhook", "poll"} else None
-        return " · ".join(
-            value for value in (
-                f"{candidate_count} candidates enriched" if candidate_count is not None else None,
-                f"{delivery} delivery" if delivery else None,
-            ) if value
-        ) or None
+        return (
+            " · ".join(
+                value
+                for value in (
+                    f"{candidate_count} candidates enriched"
+                    if candidate_count is not None
+                    else None,
+                    f"{delivery} delivery" if delivery else None,
+                )
+                if value
+            )
+            or None
+        )
     return None
 
 
@@ -109,9 +143,7 @@ def get_enrichment_dispatcher(request: Request) -> EnrichmentDispatcher:
 
 
 def _service(session: Session, settings: Settings) -> SourcingService:
-    return SourcingService(
-        session, settings.suppression_hmac_key.get_secret_value().encode()
-    )
+    return SourcingService(session, derive_identity_hmac_key(settings))
 
 
 def _raise_sourcing_error(error: SourcingError) -> NoReturn:

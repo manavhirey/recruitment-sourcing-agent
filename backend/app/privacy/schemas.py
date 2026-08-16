@@ -17,6 +17,7 @@ class PrivacyRequestState(StrEnum):
     IDENTITY_VERIFICATION_REQUIRED = "Identity Verification Required"
     APPROVED = "Approved"
     EXECUTING = "Executing"
+    MANUAL_FULFILLMENT_REQUIRED = "Manual Fulfillment Required"
     COMPLETED = "Completed"
     REJECTED = "Rejected"
 

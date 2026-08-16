@@ -39,6 +39,7 @@ pytestmark = pytest.mark.skipif(
 
 _CRM_TABLES = (
     "job_candidates",
+    "crm_acceptance_cohorts",
     "crm_acceptance_snapshots",
     "candidate_notes",
     "crm_tags",
@@ -80,7 +81,7 @@ def test_0009_upgrade_downgrade_and_model_parity(owner_engine: Engine) -> None:
     with owner_engine.begin() as connection:
         _grant_api(connection)
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0013_provider_connector_state"
+            "0014_final_review_contracts"
         )
         assert (
             compare_metadata(MigrationContext.configure(connection), Base.metadata)
@@ -182,10 +183,12 @@ def test_crm_tables_force_rls_with_using_and_check_and_activity_is_append_only(
         connection.execute(
             text(
                 "INSERT INTO crm_acceptance_snapshots "
-                "(id, tenant_id, job_id, run_id, finalized_by_user_id, ready_at, "
+                "(id, tenant_id, job_id, run_id, client_id, scorecard_version_id, "
+                "market, scoring_version, finalized_by_user_id, ready_at, "
                 "finalized_at, denominator, accepted_count, reviewed_count, "
                 "shortlisted_count, new_count, rejected_count, cohort_candidate_ids, "
-                "created_at) VALUES (:id, :tenant, :job, :run, :user, now(), now(), "
+                "created_at) VALUES (:id, :tenant, :job, :run, :client, :scorecard, "
+                "'US', 'matching-v1', :user, now(), now(), "
                 "20, 0, 0, 0, 0, 0, CAST(:cohort AS json), now())"
             ),
             {
@@ -193,6 +196,8 @@ def test_crm_tables_force_rls_with_using_and_check_and_activity_is_append_only(
                 "tenant": seeded["tenant_id"],
                 "job": seeded["job_id"],
                 "run": ready_run_id,
+                "client": seeded["client_id"],
+                "scorecard": seeded["scorecard_id"],
                 "user": seeded["user_id"],
                 "cohort": "[]",
             },
@@ -801,6 +806,12 @@ def _cleanup(connection) -> None:
     )
     connection.execute(
         text(
+            "ALTER TABLE crm_acceptance_cohorts "
+            "DISABLE TRIGGER crm_acceptance_cohorts_append_only"
+        )
+    )
+    connection.execute(
+        text(
             "ALTER TABLE crm_activity_events "
             "DISABLE TRIGGER crm_activity_events_append_only"
         )
@@ -817,6 +828,12 @@ def _cleanup(connection) -> None:
         text(
             "ALTER TABLE crm_acceptance_snapshots "
             "ENABLE TRIGGER crm_acceptance_snapshots_append_only"
+        )
+    )
+    connection.execute(
+        text(
+            "ALTER TABLE crm_acceptance_cohorts "
+            "ENABLE TRIGGER crm_acceptance_cohorts_append_only"
         )
     )
     connection.execute(

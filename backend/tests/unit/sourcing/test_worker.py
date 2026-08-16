@@ -22,7 +22,7 @@ from app.providers.base import (
     ProviderTemporaryError,
 )
 from app.sourcing import maintenance_tasks, tasks
-from app.sourcing.enrichment import DeferredEnrichment
+from app.sourcing.enrichment import DeferredEnrichment, FailedEnrichment
 from app.sourcing.maintenance_tasks import (
     expire_contact_points,
     reconcile_expired_snapshots,
@@ -402,6 +402,11 @@ def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(
         "execute_queued_enrichment_request",
         lambda *args, **kwargs: DeferredEnrichment(retry_after_seconds=37),
     )
+    monkeypatch.setattr(
+        tasks,
+        "_record_provider_outcome",
+        lambda endpoint, outcome: observed.update(outcome=(endpoint, outcome)),
+    )
 
     def retry(**kwargs: object) -> None:
         observed.update(kwargs)
@@ -412,7 +417,100 @@ def test_duplicate_enrichment_delivery_retries_after_the_submission_lease(
     with pytest.raises(RetryRequested):
         enrich_request.run(str(uuid4()), str(uuid4()), str(uuid4()))
 
-    assert observed == {"closed": True, "countdown": 37}
+    assert observed == {
+        "closed": True,
+        "countdown": 37,
+        "outcome": ("people_enrichment", "retry_scheduled"),
+    }
+
+
+def test_enrichment_batch_deferral_retries_and_reports_retry_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class RetryRequested(RuntimeError):
+        pass
+
+    class Gateway:
+        def close(self) -> None:
+            observed["closed"] = True
+
+    monkeypatch.setattr(tasks, "get_worker_settings", WorkerSettings.for_test)
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: True)
+    monkeypatch.setattr(tasks, "ApolloGateway", lambda settings: Gateway())
+    monkeypatch.setattr(
+        tasks,
+        "_enrichment_dependencies",
+        lambda settings: (None, None, None, None),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "enqueue_top_enrichment",
+        lambda *args, **kwargs: [DeferredEnrichment(retry_after_seconds=23)],
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_record_provider_outcome",
+        lambda endpoint, outcome: observed.update(outcome=(endpoint, outcome)),
+    )
+
+    def retry(**kwargs: object) -> None:
+        observed.update(kwargs)
+        raise RetryRequested
+
+    monkeypatch.setattr(enrich_run, "retry", retry)
+
+    with pytest.raises(RetryRequested):
+        enrich_run.run(str(uuid4()), str(uuid4()), str(uuid4()))
+
+    assert observed == {
+        "closed": True,
+        "countdown": 23,
+        "outcome": ("people_enrichment", "retry_scheduled"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("task", "operation"),
+    [
+        (enrich_run, "enqueue_top_enrichment"),
+        (enrich_request, "execute_queued_enrichment_request"),
+    ],
+)
+def test_terminal_enrichment_failure_is_not_reported_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+    task: object,
+    operation: str,
+) -> None:
+    observed: list[tuple[str, str]] = []
+    request_id = uuid4()
+
+    class Gateway:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(tasks, "get_worker_settings", WorkerSettings.for_test)
+    monkeypatch.setattr(tasks, "is_provider_enabled", lambda *args: True)
+    monkeypatch.setattr(tasks, "ApolloGateway", lambda settings: Gateway())
+    monkeypatch.setattr(
+        tasks,
+        "_enrichment_dependencies",
+        lambda settings: (None, None, None, None),
+    )
+    result: object = FailedEnrichment(request_id=request_id)
+    if task is enrich_run:
+        result = [result]
+    monkeypatch.setattr(tasks, operation, lambda *args, **kwargs: result)
+    monkeypatch.setattr(
+        tasks,
+        "_record_provider_outcome",
+        lambda endpoint, outcome: observed.append((endpoint, outcome)),
+    )
+
+    task.run(str(request_id), str(uuid4()), str(uuid4()))
+
+    assert observed == [("people_enrichment", "provider_error")]
 
 
 def test_maintenance_tasks_are_isolated_on_a_dedicated_worker_and_queue() -> None:

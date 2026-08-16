@@ -59,7 +59,7 @@ class PrivacyRequest(Base):
         ),
         CheckConstraint(
             "state IN ('Received', 'Identity Verification Required', 'Approved', "
-            "'Executing', 'Completed', 'Rejected')",
+            "'Executing', 'Manual Fulfillment Required', 'Completed', 'Rejected')",
             name="ck_privacy_requests_state",
         ),
         Index(

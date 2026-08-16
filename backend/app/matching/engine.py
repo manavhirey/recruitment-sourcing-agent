@@ -183,6 +183,11 @@ class MatchingEngine:
 
         recency_atoms = self._recency_and_trajectory(candidate, scorecard.confirmed_at)
         recency_score = _allocate_supported_points(recency_atoms, 10)
+        exclusion_atoms = [
+            criterion_by_key[criterion.key]
+            for criterion in scorecard_criteria
+            if criterion.kind is CriterionKind.EXCLUSION
+        ]
 
         all_atoms = [
             *role_atoms,
@@ -190,6 +195,7 @@ class MatchingEngine:
             industry_atom,
             *location_atoms,
             *recency_atoms,
+            *exclusion_atoms,
         ]
         unique_atoms = _deduplicate_atoms(all_atoms)
         evaluations = tuple(
@@ -217,6 +223,14 @@ class MatchingEngine:
                 and criterion_by_key[criterion.key].state is EvidenceState.UNKNOWN
             )
         )
+        triggered_exclusions = tuple(
+            sorted(
+                criterion.key
+                for criterion in scorecard_criteria
+                if criterion.kind is CriterionKind.EXCLUSION
+                and criterion_by_key[criterion.key].state is EvidenceState.FAILED
+            )
+        )
         breakdown = ScoreBreakdown(
             role_and_skills=role_score,
             scope_seniority_years=scope_score,
@@ -226,7 +240,9 @@ class MatchingEngine:
         )
         return MatchResult(
             classification=(
-                "near_match" if failed_must_haves or mandatory_unknowns else "main"
+                "near_match"
+                if failed_must_haves or mandatory_unknowns or triggered_exclusions
+                else "main"
             ),
             total=sum(breakdown.model_dump().values()),
             breakdown=breakdown,

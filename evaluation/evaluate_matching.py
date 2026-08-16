@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import math
+import os
 import re
 import sys
 from collections import defaultdict
@@ -121,6 +123,15 @@ class EvaluationBaseline(BaseModel):
     classifications: dict[str, Classification]
 
 
+class RecruiterPanelApproval(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["recruiter-panel-approval-v1"]
+    dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    approved_at: datetime
+    approval_reference: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{7,127}$")
+
+
 def _load_jsonl(path: Path) -> list[dict[str, object]]:
     if not path.exists():
         raise EvaluationGateError(f"dataset_file_missing:{path}")
@@ -171,7 +182,12 @@ def _contains_personal_data(value: object, *, key: str = "") -> bool:
     return False
 
 
-def require_recruiter_panel(dataset: EvaluationDataset) -> None:
+def require_recruiter_panel(
+    dataset: EvaluationDataset,
+    *,
+    approval_manifest: Path | None = None,
+    trusted_manifest_sha256: str | None = None,
+) -> None:
     counts: dict[str, int] = defaultdict(int)
     for judgment in dataset.judgments:
         counts[judgment.job_key] += 1
@@ -194,10 +210,40 @@ def require_recruiter_panel(dataset: EvaluationDataset) -> None:
         )
     ):
         failures.append("personal_data_detected")
+    if not _has_trusted_panel_approval(
+        dataset,
+        approval_manifest=approval_manifest,
+        trusted_manifest_sha256=trusted_manifest_sha256,
+    ):
+        failures.append("approval_trust_signal")
     if failures:
         raise EvaluationGateError(
             "recruiter_panel_required:" + ",".join(sorted(set(failures)))
         )
+
+
+def _has_trusted_panel_approval(
+    dataset: EvaluationDataset,
+    *,
+    approval_manifest: Path | None,
+    trusted_manifest_sha256: str | None,
+) -> bool:
+    if approval_manifest is None or trusted_manifest_sha256 is None:
+        return False
+    expected = trusted_manifest_sha256.removeprefix("sha256:")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return False
+    try:
+        resolved = approval_manifest.resolve(strict=True)
+        if resolved.is_relative_to(_REPOSITORY_ROOT.resolve()):
+            return False
+        content = resolved.read_bytes()
+        if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), expected):
+            return False
+        approval = RecruiterPanelApproval.model_validate_json(content)
+    except (OSError, ValueError):
+        return False
+    return hmac.compare_digest(approval.dataset_sha256, _dataset_digest(dataset))
 
 
 def _dataset_digest(dataset: EvaluationDataset) -> str:
@@ -321,6 +367,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--report", type=Path)
     parser.add_argument("--fail-on-regression", action="store_true")
     parser.add_argument("--require-recruiter-panel", action="store_true")
+    parser.add_argument("--approval-manifest", type=Path)
     return parser.parse_args(argv)
 
 
@@ -329,7 +376,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         dataset = load_dataset(args.jobs, args.judgments)
         if args.require_recruiter_panel:
-            require_recruiter_panel(dataset)
+            require_recruiter_panel(
+                dataset,
+                approval_manifest=args.approval_manifest,
+                trusted_manifest_sha256=os.getenv(
+                    "RECRUITER_PANEL_APPROVAL_MANIFEST_SHA256"
+                ),
+            )
         report = evaluate_dataset(dataset)
         failures: list[str] = []
         if args.fail_on_regression:

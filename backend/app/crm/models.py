@@ -154,6 +154,18 @@ class AcceptanceSnapshot(Base):
     )
     job_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
     run_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    client_id: Mapped[UUID] = mapped_column(
+        ForeignKey("client_companies.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    scorecard_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("scorecard_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    market: Mapped[str] = mapped_column(String(16), nullable=False)
+    scoring_version: Mapped[str] = mapped_column(String(64), nullable=False)
     finalized_by_user_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
@@ -168,6 +180,48 @@ class AcceptanceSnapshot(Base):
     new_count: Mapped[int] = mapped_column(Integer, nullable=False)
     rejected_count: Mapped[int] = mapped_column(Integer, nullable=False)
     cohort_candidate_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class AcceptanceCohort(Base):
+    __tablename__ = "crm_acceptance_cohorts"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "run_id"),
+        ForeignKeyConstraint(
+            ("tenant_id", "job_id"),
+            ("jobs.tenant_id", "jobs.id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "run_id"),
+            ("sourcing_runs.tenant_id", "sourcing_runs.id"),
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    job_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    run_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    client_id: Mapped[UUID] = mapped_column(
+        ForeignKey("client_companies.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    scorecard_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("scorecard_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    market: Mapped[str] = mapped_column(String(16), nullable=False)
+    scoring_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    ready_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

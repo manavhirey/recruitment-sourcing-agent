@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
+import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -11,10 +13,10 @@ from app.candidates.models import (
     SourceIdentity,
 )
 from app.crm.models import ActivityEvent, CandidateNote, CandidateStage, JobCandidate
-from app.crm.service import CrmService
+from app.crm.service import CrmError, CrmService, capture_acceptance_cohort
 from app.identity.schemas import RequestContext, Role
 from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
-from app.sourcing.models import SourcingRun
+from app.sourcing.models import RunCandidate, SourcingRun
 from app.sourcing.state_machine import RunState
 
 
@@ -77,6 +79,48 @@ def test_ranked_review_routes_apply_all_filters_and_stable_score_cursor(
         assert [item["candidate_id"] for item in response.json()["items"]] == [
             str(expected_candidate_id)
         ]
+
+
+def test_rank_cursor_is_bound_to_tenant_actor_role_and_client_grants(crm_api) -> None:
+    original = RequestContext(
+        tenant_id=crm_api["tenant_id"],
+        user_id=crm_api["recruiter_id"],
+        role=Role.RECRUITER,
+        allowed_client_ids=frozenset((crm_api["granted_client_id"],)),
+    )
+    with Session(crm_api["engine"]) as session:
+        service = CrmService(session, b"cursor-scope-test")
+        _rows, cursor = service.list_job_candidates(
+            original, crm_api["job_id"], limit=1
+        )
+        assert cursor is not None
+        contexts = (
+            original.model_copy(update={"tenant_id": uuid4()}),
+            original.model_copy(update={"user_id": crm_api["assignee_id"]}),
+            original.model_copy(update={"role": Role.OWNER}),
+            original.model_copy(
+                update={
+                    "allowed_client_ids": frozenset(
+                        (
+                            crm_api["granted_client_id"],
+                            crm_api["hidden_client_id"],
+                        )
+                    )
+                }
+            ),
+        )
+        for changed_context in contexts:
+            with pytest.raises(CrmError) as caught:
+                service.list_job_candidates(
+                    changed_context,
+                    crm_api["job_id"],
+                    cursor=cursor,
+                    limit=1,
+                )
+            assert caught.value.code in {
+                "cursor_invalid",
+                "job_candidate_not_found",
+            }
 
 
 def test_near_match_list_exposes_only_safe_mandatory_gap_summaries(crm_api) -> None:
@@ -320,7 +364,9 @@ def test_detail_returns_normalized_experience_provenance_notes_and_run_candidate
     assert "observed_value_hash" not in response.text
 
 
-def test_activity_response_allowlists_actions_and_omits_stored_payloads(crm_api) -> None:
+def test_activity_response_allowlists_actions_and_omits_stored_payloads(
+    crm_api,
+) -> None:
     with Session(crm_api["engine"]) as session:
         session.add_all(
             (
@@ -443,6 +489,7 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
             owner_user_id=crm_api["recruiter_id"],
             title="Acceptance Cohort",
             job_description="Measure review acceptance.",
+            location="New York, United States",
         )
         session.add(job)
         session.flush()
@@ -454,7 +501,7 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
             seniority=[],
             minimum_years=None,
             maximum_years=None,
-            locations=[],
+            locations=["New York, United States"],
             industry_code="technology.fintech",
             suggested_adjacent_industries=[],
             uncertainties=[],
@@ -534,6 +581,10 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
     assert before.accepted == before.reviewed + before.shortlisted
     assert before.rate == 0.4
     assert before.final is False
+    assert before.job_id == job_id
+    assert before.client_id == crm_api["granted_client_id"]
+    assert before.market == "US"
+    assert before.scoring_version == "matching-v1"
     assert boundary.final is True
 
     with Session(crm_api["engine"]) as session:
@@ -547,6 +598,8 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
             completed_at=ready_at + timedelta(days=8),
         )
         session.add(second_run)
+        session.flush()
+        second_run_id = second_run.id
         for row in session.scalars(
             select(JobCandidate).where(
                 JobCandidate.job_id == job_id,
@@ -563,10 +616,11 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
             as_of=ready_at + timedelta(days=9),
         )
         session.commit()
-    assert early.final is True
-    assert early.accepted == 8
+    assert early.run_id == second_run_id
+    assert early.final is False
+    assert early.accepted == 0
     assert early.new == 0
-    assert early.rejected == 12
+    assert early.rejected == 0
 
     http_report = crm_api["api"].get(
         f"/api/v1/jobs/{job_id}/acceptance",
@@ -594,7 +648,10 @@ def test_acceptance_uses_fixed_top_twenty_and_exact_finalization_boundaries(
             job_id,
             as_of=ready_at + timedelta(days=10),
         )
-    assert immutable == early
+    assert immutable.final is True
+    assert immutable.run_id == early.run_id
+    assert immutable.accepted == early.accepted
+    assert immutable.rejected == early.rejected
 
 
 def test_acceptance_route_uses_server_time_not_caller_supplied_as_of(crm_api) -> None:
@@ -623,3 +680,109 @@ def test_acceptance_route_uses_server_time_not_caller_supplied_as_of(crm_api) ->
 
     assert response.status_code == 200
     assert response.json()["final"] is False
+
+
+def test_acceptance_dimensions_remain_bound_to_ready_run_version_and_market(
+    crm_api,
+) -> None:
+    ready_at = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    with Session(crm_api["engine"], expire_on_commit=False) as session:
+        job = Job(
+            tenant_id=crm_api["tenant_id"],
+            client_id=crm_api["granted_client_id"],
+            owner_user_id=crm_api["recruiter_id"],
+            title="India Product Lead",
+            job_description="Find an India product lead.",
+        )
+        candidate = Candidate(
+            tenant_id=crm_api["tenant_id"],
+            full_name="Versioned Candidate",
+            normalized_name="versioned candidate",
+        )
+        session.add_all((job, candidate))
+        session.flush()
+        scorecard = ScorecardVersion(
+            tenant_id=crm_api["tenant_id"],
+            job_id=job.id,
+            version=2,
+            target_titles=["Product Lead"],
+            seniority=[],
+            minimum_years=None,
+            maximum_years=None,
+            locations=["Bengaluru, India"],
+            industry_code="technology.fintech",
+            suggested_adjacent_industries=[],
+            uncertainties=[],
+            extraction_status="ready",
+            confirmed_by_user_id=crm_api["recruiter_id"],
+        )
+        session.add(scorecard)
+        session.flush()
+        job.current_scorecard_id = scorecard.id
+        run = SourcingRun(
+            tenant_id=crm_api["tenant_id"],
+            job_id=job.id,
+            scorecard_version_id=scorecard.id,
+            started_by_user_id=crm_api["recruiter_id"],
+            state=RunState.READY,
+            current_stage=RunState.READY.value,
+            completed_at=ready_at,
+        )
+        session.add(run)
+        session.flush()
+        run_candidate = RunCandidate(
+            tenant_id=crm_api["tenant_id"],
+            run_id=run.id,
+            candidate_id=candidate.id,
+            scorecard_version_id=scorecard.id,
+            match_score=95,
+            classification="main",
+            scoring_version="matching-v2",
+        )
+        session.add_all(
+            (
+                run_candidate,
+                JobCandidate(
+                    tenant_id=crm_api["tenant_id"],
+                    job_id=job.id,
+                    candidate_id=candidate.id,
+                    latest_run_id=run.id,
+                    scorecard_version_id=scorecard.id,
+                    classification="main",
+                    score=95,
+                    score_json={"total": 95},
+                    scoring_version="matching-v2",
+                    stage=CandidateStage.REVIEWED,
+                ),
+            )
+        )
+        session.flush()
+        cohort = capture_acceptance_cohort(session, run)
+        assert cohort.market == "IN"
+        assert cohort.scoring_version == "matching-v2"
+        scorecard.locations = ["New York, United States"]
+        run_candidate.scoring_version = "matching-v3"
+        session.commit()
+        job_id = job.id
+        run_id = run.id
+        scorecard_id = scorecard.id
+
+    context = RequestContext(
+        tenant_id=crm_api["tenant_id"],
+        user_id=crm_api["recruiter_id"],
+        role=Role.RECRUITER,
+        allowed_client_ids=frozenset((crm_api["granted_client_id"],)),
+    )
+    with Session(crm_api["engine"]) as session:
+        report = CrmService(session, b"acceptance-dimensions").acceptance_report(
+            context,
+            job_id,
+            as_of=ready_at + timedelta(days=1),
+        )
+
+    assert report.run_id == run_id
+    assert report.scorecard_version_id == scorecard_id
+    assert report.client_id == crm_api["granted_client_id"]
+    assert report.market == "IN"
+    assert report.scoring_version == "matching-v2"
+    assert report.accepted == 1

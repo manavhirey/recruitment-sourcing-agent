@@ -29,6 +29,34 @@ def test_explicitly_failed_must_have_becomes_near_match(
     assert evaluation.evidence == ("retail merchandising",)
 
 
+def test_supported_exclusion_fact_is_visible_and_forces_near_match(
+    engine: MatchingEngine,
+    scorecard_factory: Callable[..., ConfirmedScorecard],
+    candidate_factory: Callable[..., CandidateProfile],
+) -> None:
+    scorecard = scorecard_factory(
+        criteria=[
+            ScorecardCriterion(
+                key="legacy_java",
+                label="Legacy Java experience",
+                kind=CriterionKind.EXCLUSION,
+                source_text="Exclude candidates with legacy Java experience",
+            )
+        ]
+    )
+
+    result = engine.evaluate(
+        scorecard, candidate_factory(skills=("Legacy Java experience",))
+    )
+
+    assert result.classification == "near_match"
+    assert result.failed_must_haves == ()
+    evaluation = _criterion("legacy_java", result)
+    assert evaluation.state is EvidenceState.FAILED
+    assert evaluation.evidence == ("Legacy Java experience",)
+    assert evaluation.source_refs == ("candidate.skills",)
+
+
 def test_unknown_optional_must_have_stays_main_with_visible_uncertainty(
     engine: MatchingEngine,
     scorecard_factory: Callable[..., ConfirmedScorecard],

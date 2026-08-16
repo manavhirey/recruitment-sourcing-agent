@@ -437,17 +437,12 @@ class JobService:
                     ),
                     None,
                 )
-            old = (
-                previous_criteria[match_index]
-                if match_index is not None
-                else None
-            )
+            old = previous_criteria[match_index] if match_index is not None else None
             if match_index is not None:
                 used.add(match_index)
-            unchanged_extraction = (
-                old is not None
-                and semantic_content(old) == semantic_content(criterion)
-            )
+            unchanged_extraction = old is not None and semantic_content(
+                old
+            ) == semantic_content(criterion)
             if old is not None and (old.inferred or unchanged_extraction):
                 provenance = {
                     "source_text": old.source_text,
@@ -474,8 +469,7 @@ class JobService:
         payload["confirmed_inferred_items"] = []
         normalized_draft = ScorecardDraft.model_validate(payload)
         valid_confirmations = sorted(
-            set(draft.confirmed_inferred_items)
-            & normalized_draft.inferred_item_ids()
+            set(draft.confirmed_inferred_items) & normalized_draft.inferred_item_ids()
         )
         return normalized_draft.model_copy(
             update={"confirmed_inferred_items": valid_confirmations}

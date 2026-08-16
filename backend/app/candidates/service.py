@@ -91,6 +91,7 @@ class CandidateService:
             normalized_url,
         )
         decision = self.resolver.resolve(context, provider_person)
+        accepted_url = None if decision.conflict_candidate_ids else normalized_url
         created = decision.candidate_id is None
         if created:
             full_name = _display_value(provider_person.full_name) or "Unknown Candidate"
@@ -117,12 +118,12 @@ class CandidateService:
             context.tenant_id,
             candidate.id,
             provider_person,
-            normalized_url,
+            accepted_url,
             timestamp,
             confidence,
         )
         self._observe_fields(
-            candidate, identity, provider_person, timestamp, confidence, normalized_url
+            candidate, identity, provider_person, timestamp, confidence, accepted_url
         )
         self._observe_fact_lists(
             candidate,
@@ -138,12 +139,33 @@ class CandidateService:
             timestamp,
             confidence,
         )
+        suggestion_candidate_ids = tuple(
+            dict.fromkeys(
+                (*decision.conflict_candidate_ids, *decision.fuzzy_candidate_ids)
+            )
+        )
         duplicate_suggestion_id = self._suggest_duplicates(
             context.tenant_id,
             candidate.id,
             provider_person,
-            decision.fuzzy_candidate_ids,
+            suggestion_candidate_ids,
         )
+        if decision.conflict_candidate_ids and duplicate_suggestion_id is not None:
+            AuditService(self.session).record(
+                tenant_id=context.tenant_id,
+                actor_user_id=context.user_id,
+                event_key=(
+                    f"candidate-identity-conflict:{identity.id}:"
+                    f"{duplicate_suggestion_id}"
+                ),
+                action="candidate.identity_conflict",
+                entity_type="candidate_duplicate_suggestion",
+                entity_id=duplicate_suggestion_id,
+                payload={
+                    "conflict_type": "provider_id_profile_url",
+                    "resolution": "provider_id_precedence",
+                },
+            )
         self.session.flush()
         return ResolutionResult(
             candidate_id=candidate.id,

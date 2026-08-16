@@ -36,6 +36,7 @@ from app.providers.query_planner import QueryPlanner
 from app.providers.snapshots import SnapshotStore
 from app.sourcing.enrichment import (
     DeferredEnrichment,
+    FailedEnrichment,
     RegionalContactPolicy,
     _fail_request,
     enqueue_top_enrichment,
@@ -47,6 +48,7 @@ from app.sourcing.models import (
     RunCandidate,
     RunCheckpoint,
     SourcingRun,
+    UsageLedger,
 )
 from app.sourcing.service import SourcingError, SourcingService
 from app.sourcing.state_machine import RunState, transition_run
@@ -609,9 +611,24 @@ def _execute_source_run(
                         continue
                     session.rollback()
 
-                reservation_key = f"source:{query.query_hash}:page:{page_number}"
                 with session_factory() as session:
                     _apply_tenant_context(session, context.tenant_id)
+                    reservation_base = f"source:{query.query_hash}:page:{page_number}"
+                    prior_attempts = int(
+                        session.scalar(
+                            select(
+                                func.count(func.distinct(UsageLedger.reservation_key))
+                            ).where(
+                                UsageLedger.tenant_id == context.tenant_id,
+                                UsageLedger.run_id == run_id,
+                                UsageLedger.reservation_key.like(
+                                    f"{reservation_base}:attempt-%"
+                                ),
+                            )
+                        )
+                        or 0
+                    )
+                    reservation_key = f"{reservation_base}:attempt-{prior_attempts + 1}"
                     try:
                         SourcingService(session, b"internal-worker").reserve_usage(
                             context,
@@ -637,6 +654,19 @@ def _execute_source_run(
                 try:
                     page = gateway.search(query, page_number)
                 except ProviderError:
+                    with session_factory() as session:
+                        _apply_tenant_context(session, context.tenant_id)
+                        SourcingService(session, b"internal-worker").reconcile_usage(
+                            context,
+                            run_id,
+                            reservation_key=reservation_key,
+                            charged_units={
+                                "search_pages": 1,
+                                "estimated_credits": 1,
+                            },
+                            provider_request_id=None,
+                        )
+                        session.commit()
                     if propagate_provider_errors:
                         raise
                     provider_error = True
@@ -871,9 +901,7 @@ def source_run(
         )
         _record_provider_outcome("people_search_run", "success")
     except ProviderAuthenticationError:
-        disable_provider(
-            database_session_factory, "apollo", "authentication_error"
-        )
+        disable_provider(database_session_factory, "apollo", "authentication_error")
         _record_provider_outcome("people_search_run", "authentication_error")
         _mark_source_retry_exhausted(UUID(run_id), context, idempotency_key)
     except ProviderPermissionError:
@@ -973,11 +1001,8 @@ def enrich_run(
             token_codec=codec,
             on_budget_exhausted=_record_budget_exhaustion,
         )
-        _record_provider_outcome("people_enrichment", "success")
     except ProviderAuthenticationError:
-        disable_provider(
-            database_session_factory, "apollo", "authentication_error"
-        )
+        disable_provider(database_session_factory, "apollo", "authentication_error")
         _record_provider_outcome("people_enrichment", "authentication_error")
         _mark_enrichment_provider_disabled(UUID(run_id), context)
         return
@@ -988,7 +1013,15 @@ def enrich_run(
         return
     finally:
         gateway.close()
+    retry_delays: list[int] = []
+    provider_failed = False
     for submission in submissions:
+        if isinstance(submission, DeferredEnrichment):
+            retry_delays.append(submission.retry_after_seconds)
+            continue
+        if isinstance(submission, FailedEnrichment):
+            provider_failed = True
+            continue
         with database_session_factory() as session:
             _apply_tenant_context(session, context.tenant_id)
             request = session.get(EnrichmentRequest, submission.request_id)
@@ -1002,6 +1035,12 @@ def enrich_run(
                 ),
                 countdown=300,
             )
+    if retry_delays:
+        _record_provider_outcome("people_enrichment", "retry_scheduled")
+        raise self.retry(countdown=min(retry_delays))
+    _record_provider_outcome(
+        "people_enrichment", "provider_error" if provider_failed else "success"
+    )
 
 
 @celery_app.task(
@@ -1041,11 +1080,8 @@ def enrich_request(
             policy=policy,
             token_codec=codec,
         )
-        _record_provider_outcome("people_enrichment", "success")
     except ProviderAuthenticationError:
-        disable_provider(
-            database_session_factory, "apollo", "authentication_error"
-        )
+        disable_provider(database_session_factory, "apollo", "authentication_error")
         _record_provider_outcome("people_enrichment", "authentication_error")
         _mark_enrichment_request_provider_disabled(UUID(request_id), context)
         return
@@ -1057,7 +1093,12 @@ def enrich_request(
     finally:
         gateway.close()
     if isinstance(submission, DeferredEnrichment):
+        _record_provider_outcome("people_enrichment", "retry_scheduled")
         raise self.retry(countdown=submission.retry_after_seconds)
+    _record_provider_outcome(
+        "people_enrichment",
+        "provider_error" if isinstance(submission, FailedEnrichment) else "success",
+    )
     if submission is not None:
         poll_enrichment_result.apply_async(
             args=(request_id, tenant_id, user_id), countdown=300
@@ -1101,9 +1142,7 @@ def poll_enrichment_result(
         )
         _record_provider_outcome("enrichment_poll", "success")
     except ProviderAuthenticationError:
-        disable_provider(
-            database_session_factory, "apollo", "authentication_error"
-        )
+        disable_provider(database_session_factory, "apollo", "authentication_error")
         _record_provider_outcome("enrichment_poll", "authentication_error")
         _mark_enrichment_request_provider_disabled(UUID(request_id), context)
         return

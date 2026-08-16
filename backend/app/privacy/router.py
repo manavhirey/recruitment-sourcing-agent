@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.core.config import Settings
+from app.core.config import Settings, derive_identity_hmac_key
 from app.core.database import get_db
 from app.identity.dependencies import (
     get_app_settings,
@@ -34,6 +34,7 @@ def _service(
         settings.suppression_hmac_key.get_secret_value().encode(),
         request.app.state.contact_cipher,
         key_version=settings.suppression_hmac_key_version,
+        idempotency_hmac_key=derive_identity_hmac_key(settings),
     )
 
 

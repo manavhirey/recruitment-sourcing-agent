@@ -115,9 +115,7 @@ def test_telemetry_hashes_user_and_candidate_identifiers_before_logging() -> Non
         {
             "event": "contact_revealed",
             "user_hash": identifier_digest(user_id, b"telemetry-test-key"),
-            "candidate_hash": identifier_digest(
-                candidate_id, b"telemetry-test-key"
-            ),
+            "candidate_hash": identifier_digest(candidate_id, b"telemetry-test-key"),
             "outcome": "success",
         }
     ]
@@ -206,6 +204,7 @@ def test_task_signals_emit_only_safe_fields_for_the_owning_worker() -> None:
         queue_depth_probes={"sourcing": lambda: 7},
         stuck_after_seconds=0,
     )
+
     class Sender:
         def __init__(self, owner: Celery, retries: int) -> None:
             self.app = owner

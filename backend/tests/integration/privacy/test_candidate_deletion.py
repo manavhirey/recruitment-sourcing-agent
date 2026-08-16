@@ -378,6 +378,44 @@ def test_privacy_routes_allow_recruiter_submission_but_manager_only_operation(
     assert len(api.get("/api/v1/privacy-requests").json()) == 1
 
 
+@pytest.mark.parametrize("request_type", ["Access", "Correction"])
+def test_unimplemented_privacy_fulfillment_stays_explicitly_manual_required(
+    privacy_api: dict[str, Any], request_type: str
+) -> None:
+    privacy_api["current"]["context"] = RequestContext(
+        tenant_id=privacy_api["tenant_id"],
+        user_id=privacy_api["owner_id"],
+        role=Role.OWNER,
+    )
+    api = privacy_api["api"]
+    created = api.post(
+        "/api/v1/privacy-requests",
+        headers={"Idempotency-Key": f"privacy-{request_type}-submit"},
+        json={
+            "candidate_id": str(privacy_api["visible_candidate_id"]),
+            "request_type": request_type,
+        },
+    )
+    request_id = created.json()["id"]
+    api.post(
+        f"/api/v1/privacy-requests/{request_id}/verify",
+        headers={"Idempotency-Key": f"privacy-{request_type}-verify"},
+    )
+    api.post(
+        f"/api/v1/privacy-requests/{request_id}/approve",
+        headers={"Idempotency-Key": f"privacy-{request_type}-approve"},
+    )
+
+    executed = api.post(
+        f"/api/v1/privacy-requests/{request_id}/execute",
+        headers={"Idempotency-Key": f"privacy-{request_type}-execute"},
+    )
+
+    assert executed.status_code == 200
+    assert executed.json()["state"] == "Manual Fulfillment Required"
+    assert executed.json()["completed_at"] is None
+
+
 def test_privacy_request_status_is_not_disclosed_cross_tenant(
     privacy_api: dict[str, Any],
 ) -> None:
@@ -405,6 +443,34 @@ def test_privacy_request_status_is_not_disclosed_cross_tenant(
 
     assert response.status_code == 404
     assert response.json() == {"detail": {"code": "privacy_request_not_found"}}
+
+
+def test_different_idempotency_key_replays_the_active_privacy_request(
+    privacy_api: dict[str, Any],
+) -> None:
+    privacy_api["current"]["context"] = RequestContext(
+        tenant_id=privacy_api["tenant_id"],
+        user_id=privacy_api["owner_id"],
+        role=Role.OWNER,
+    )
+    payload = {
+        "candidate_id": str(privacy_api["visible_candidate_id"]),
+        "request_type": "Access",
+    }
+
+    first = privacy_api["api"].post(
+        "/api/v1/privacy-requests",
+        headers={"Idempotency-Key": "privacy-active-first"},
+        json=payload,
+    )
+    second = privacy_api["api"].post(
+        "/api/v1/privacy-requests",
+        headers={"Idempotency-Key": "privacy-active-second"},
+        json=payload,
+    )
+
+    assert first.status_code == second.status_code == 201
+    assert second.json()["id"] == first.json()["id"]
 
 
 def test_recruiter_request_is_not_disclosed_after_client_grant_is_revoked(

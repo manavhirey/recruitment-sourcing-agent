@@ -29,8 +29,8 @@ def _run(command: tuple[str, ...], environment: dict[str, str]) -> None:
 
 
 def _database_url(base_url: str, database: str) -> str:
-    return make_url(base_url).set(database=database).render_as_string(
-        hide_password=False
+    return (
+        make_url(base_url).set(database=database).render_as_string(hide_password=False)
     )
 
 

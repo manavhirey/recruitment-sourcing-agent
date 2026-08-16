@@ -49,7 +49,7 @@ def test_launch_gate_rejects_synthetic_or_incomplete_panel_data() -> None:
         require_recruiter_panel(dataset)
 
 
-def test_launch_gate_requires_thirty_jobs_both_markets_and_twenty_judgments() -> None:
+def test_shape_complete_self_attestation_cannot_satisfy_launch_gate() -> None:
     dataset = EvaluationDataset.model_validate(
         {
             "jobs": [
@@ -79,7 +79,8 @@ def test_launch_gate_requires_thirty_jobs_both_markets_and_twenty_judgments() ->
         }
     )
 
-    require_recruiter_panel(dataset)
+    with pytest.raises(EvaluationGateError, match="approval_trust_signal"):
+        require_recruiter_panel(dataset)
 
 
 @pytest.mark.parametrize(
