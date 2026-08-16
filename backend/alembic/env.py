@@ -3,12 +3,14 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 
 from alembic import context
+from app.audit import models as audit_models  # noqa: F401
 from app.candidates import models as candidate_models  # noqa: F401
 from app.clients import models as client_models  # noqa: F401
 from app.core.config import get_settings
 from app.core.database import Base
 from app.identity import models  # noqa: F401
 from app.jobs import models as job_models  # noqa: F401
+from app.sourcing import models as sourcing_models  # noqa: F401
 
 config = context.config
 settings = get_settings()

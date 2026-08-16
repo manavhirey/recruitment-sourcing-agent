@@ -43,6 +43,7 @@ def test_apollo_search_normalizes_people(
     route = respx_mock.post(APOLLO_PEOPLE_SEARCH_URL).mock(
         return_value=httpx.Response(
             200,
+            headers={"X-Request-ID": "apollo-request-123"},
             json={
                 "people": [
                     {
@@ -82,6 +83,11 @@ def test_apollo_search_normalizes_people(
     assert page.people[0].location == "New York, New York, United States"
     assert page.people[0].experiences[0].company_name == "BankCo"
     assert page.next_page is None
+    assert page.provider_request_id == "apollo-request-123"
+    assert dict(page.charged_units) == {
+        "estimated_credits": 1,
+        "search_pages": 1,
+    }
     request = route.calls[0].request
     assert request.headers["x-api-key"] == "test-apollo-key"
     assert request.url.path == "/api/v1/mixed_people/api_search"

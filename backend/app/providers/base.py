@@ -49,6 +49,11 @@ class SearchPage:
     page: int
     next_page: int | None
     total_available: int | None
+    provider_request_id: str | None = None
+    charged_units: tuple[tuple[str, int], ...] = (
+        ("estimated_credits", 1),
+        ("search_pages", 1),
+    )
 
 
 @dataclass(frozen=True)

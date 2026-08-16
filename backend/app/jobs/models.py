@@ -25,6 +25,7 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint("draft_revision >= 0", name="ck_jobs_draft_revision"),
+        UniqueConstraint("tenant_id", "id"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -74,6 +75,8 @@ class ScorecardVersion(Base):
     __table_args__ = (
         CheckConstraint("version > 0", name="ck_scorecard_versions_version"),
         UniqueConstraint("job_id", "version"),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "job_id", "id"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)

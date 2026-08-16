@@ -56,7 +56,11 @@ class ApolloGateway:
             raise ValueError("page must be positive")
         if len(self._seen_provider_ids) >= _MAX_UNIQUE_PEOPLE:
             return SearchPage(
-                people=(), page=page, next_page=None, total_available=None
+                people=(),
+                page=page,
+                next_page=None,
+                total_available=None,
+                charged_units=(("estimated_credits", 0), ("search_pages", 0)),
             )
 
         try:
@@ -102,7 +106,15 @@ class ApolloGateway:
             page=page,
             next_page=next_page,
             total_available=total_available,
+            provider_request_id=_request_id(response.headers),
         )
+
+
+def _request_id(headers: httpx.Headers) -> str | None:
+    value = headers.get("x-request-id") or headers.get("request-id")
+    if value is None:
+        return None
+    return value.strip()[:255] or None
 
 
 def _search_payload(query: ProviderQuery, page: int) -> dict[str, object]:
