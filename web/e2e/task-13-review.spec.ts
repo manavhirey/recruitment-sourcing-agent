@@ -310,6 +310,7 @@ test("real invitation fragment is removed before the first server request", asyn
 
 test("production intake, scorecard, run, review, and shortlist components work together", async ({ page }, testInfo) => {
   await page.goto("/dev-preview?view=task13")
+  await page.waitForLoadState("networkidle")
 
   await expect(page.getByRole("heading", { level: 1, name: "Create sourcing brief" })).toBeVisible()
   await page.getByLabel("Client").selectOption(clientId)

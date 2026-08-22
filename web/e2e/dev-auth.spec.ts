@@ -13,6 +13,7 @@ test("developer override reaches the real BFF without company sign-in", async ({
     (await observedBefore.json()) as Array<Record<string, string>>
   ).length
   await page.goto("/dev-preview?view=task13")
+  await page.waitForLoadState("networkidle")
 
   await page.getByLabel("Client").selectOption(clientId)
   await page.getByLabel("Job title").fill("Senior Product Manager")
