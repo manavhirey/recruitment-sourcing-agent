@@ -47,6 +47,7 @@ x-web-environment: &web-environment
   OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
   API_BASE_URL: ${API_BASE_URL}
   TENANT_OPTIONS: ${TENANT_OPTIONS:-[]}
+  ENABLE_DEV_AUTH_OVERRIDE: ${ENABLE_DEV_AUTH_OVERRIDE:-false}
 
 services:
   api:

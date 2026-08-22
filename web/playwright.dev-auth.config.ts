@@ -1,8 +1,8 @@
 import { defineConfig, devices } from "@playwright/test"
 
-Reflect.deleteProperty(process.env, "NO_COLOR")
+import { e2eAuthSecret } from "./playwright.config"
 
-export const e2eAuthSecret = "x8V1qM3rT6yB9nC2pL5sF7hJ0kD4wZ6aQ8eR1tY3uI5oP7gH"
+Reflect.deleteProperty(process.env, "NO_COLOR")
 
 const serverEnvironment = {
   ...process.env,
@@ -13,7 +13,7 @@ const serverEnvironment = {
   OIDC_AUDIENCE: "http://127.0.0.1:8001/api",
   OIDC_CLIENT_ID: "e2e-client",
   OIDC_CLIENT_SECRET: "e2e-client-credential",
-  ENABLE_DEV_AUTH_OVERRIDE: "false",
+  ENABLE_DEV_AUTH_OVERRIDE: "true",
   TENANT_OPTIONS: JSON.stringify([
     { id: "00000000-0000-4000-8000-000000000001", name: "E2E Agency" },
   ]),
@@ -21,12 +21,9 @@ const serverEnvironment = {
 
 export default defineConfig({
   testDir: "./e2e",
-  testIgnore: ["dev-auth.spec.ts", "production-preview.spec.ts"],
-  fullyParallel: true,
-  workers: 1,
-  forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI ? 2 : 0,
-  reporter: "html",
+  testMatch: "dev-auth.spec.ts",
+  forbidOnly: true,
+  reporter: "list",
   webServer: [
     {
       command: "../backend/.venv/bin/uvicorn tests.e2e_task13_api:app --app-dir ../backend --host 127.0.0.1 --port 8001",
@@ -47,7 +44,6 @@ export default defineConfig({
     trace: "on-first-retry",
   },
   projects: [
-    { name: "desktop-chromium", use: { ...devices["Desktop Chrome"] } },
-    { name: "mobile-chromium", use: { ...devices["Pixel 7"] } },
+    { name: "developer-override", use: { ...devices["Desktop Chrome"] } },
   ],
 })

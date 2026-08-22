@@ -6,6 +6,7 @@ import { cookies } from "next/headers"
 import { z } from "zod"
 
 import type { TenantOption } from "@/lib/auth-config"
+import { requestDevelopmentAuthOverride } from "@/lib/dev-auth"
 
 const COOKIE_LIFETIME_SECONDS = 7 * 24 * 60 * 60
 const COOKIE_SIGNING_DOMAIN = "recruitment-sourcing:selected-tenant:v1"
@@ -119,6 +120,8 @@ export function tenantCookieSettings(environment = process.env.NODE_ENV) {
 }
 
 export async function selectedTenantId(): Promise<string | null> {
+  const developmentOverride = await requestDevelopmentAuthOverride()
+  if (developmentOverride) return developmentOverride.tenantId
   const secret = process.env.AUTH_SECRET
   if (!secret) throw new Error("authentication_configuration_invalid")
   const cookie = tenantCookieSettings()

@@ -45,4 +45,11 @@ describe("production environment", () => {
       AUTH_SECRET: "replace-with-at-least-32-random-characters",
     })).toThrow("production_configuration_invalid")
   })
+
+  it("rejects the developer authentication override in production", () => {
+    expect(() => assertProductionEnvironment({
+      ...validEnvironment,
+      ENABLE_DEV_AUTH_OVERRIDE: "true",
+    })).toThrow("production_configuration_invalid")
+  })
 })

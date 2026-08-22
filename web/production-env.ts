@@ -28,6 +28,7 @@ function secureUrl(value: string | undefined, baseOnly: boolean): boolean {
 
 export function assertProductionEnvironment(environment: Environment): void {
   if (
+    environment.ENABLE_DEV_AUTH_OVERRIDE === "true" ||
     !isStrongAuthSecret(environment.AUTH_SECRET) ||
     !secureUrl(environment.AUTH_URL, false) ||
     !secureUrl(environment.OIDC_ISSUER, false) ||

@@ -32,7 +32,8 @@ WORKDIR /app
 COPY --from=builder --chown=root:root /app/public ./public
 COPY --from=builder --chown=root:root /app/.next/standalone ./
 COPY --from=builder --chown=root:root /app/.next/static ./.next/static
+COPY --from=builder --chown=root:root /app/start-standalone.mjs ./start-standalone.mjs
 RUN chmod -R a-w /app
 USER 10001:10001
 EXPOSE 3000
-CMD ["node", "server.js"]
+CMD ["node", "start-standalone.mjs"]

@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "test": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest",
     "test:a11y": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run tests/a11y",
-    "e2e": "playwright test",
+    "e2e": "playwright test && npm run e2e:dev-auth",
+    "e2e:dev-auth": "playwright test --config=playwright.dev-auth.config.ts",
     "e2e:production-preview": "playwright test --config=playwright.production.config.ts",
     "api:generate": "node scripts/generate-api.mjs",
     "api:check": "node scripts/generate-api.mjs --check"

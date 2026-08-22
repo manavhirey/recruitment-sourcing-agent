@@ -10,6 +10,7 @@ import {
   serverAccessToken,
   type ServerJwt,
 } from "@/lib/auth-config"
+import { requestDevelopmentAuthOverride } from "@/lib/dev-auth"
 
 export {
   buildAuthOptions,
@@ -20,10 +21,14 @@ export {
 export type { ServerJwt, TenantOption } from "@/lib/auth-config"
 
 export async function auth(): Promise<Session | null> {
+  const developmentOverride = await requestDevelopmentAuthOverride()
+  if (developmentOverride) return developmentOverride.session
   return NextAuth(buildAuthOptions()).auth()
 }
 
 export async function readServerJwt(): Promise<ServerJwt | null> {
+  const developmentOverride = await requestDevelopmentAuthOverride()
+  if (developmentOverride) return developmentOverride.token
   const options = buildAuthOptions()
   const requestHeaders = new Headers(await headers())
   const request = new NextRequest(process.env.AUTH_URL!, {
