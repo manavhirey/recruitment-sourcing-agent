@@ -12,7 +12,7 @@ from alembic.config import Config
 from alembic.migration import MigrationContext
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, inspect, select, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -806,10 +806,14 @@ def _set_tenant(connection, tenant_id: UUID) -> None:
 
 
 def _grant_api(connection) -> None:
+    assert API_DATABASE_URL is not None
+    api_role = make_url(API_DATABASE_URL).username
+    assert api_role is not None
+    quoted_api_role = connection.dialect.identifier_preparer.quote(api_role)
     connection.execute(
         text(
             "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES "
-            "IN SCHEMA public TO sourcing_api_test"
+            f"IN SCHEMA public TO {quoted_api_role}"
         )
     )
 

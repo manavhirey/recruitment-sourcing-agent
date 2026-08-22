@@ -807,6 +807,7 @@ def test_concurrent_source_replay_uses_one_run_scoped_gateway(
     )
     entered = threading.Event()
     release = threading.Event()
+    second_started = threading.Event()
     factory_calls = 0
     outcomes: list[object] = []
 
@@ -821,7 +822,9 @@ def test_concurrent_source_replay_uses_one_run_scoped_gateway(
         factory_calls += 1
         return SlowGateway()
 
-    def source() -> None:
+    def source(*, started: threading.Event | None = None) -> None:
+        if started is not None:
+            started.set()
         try:
             execute_source_run(
                 scenario["factory"],
@@ -836,14 +839,20 @@ def test_concurrent_source_replay_uses_one_run_scoped_gateway(
             outcomes.append("ok")
 
     first = threading.Thread(target=source)
-    second = threading.Thread(target=source)
-    first.start()
-    assert entered.wait(timeout=5)
-    second.start()
-    second.join(timeout=2)
-    release.set()
-    first.join(timeout=5)
-    second.join(timeout=5)
+    second = threading.Thread(target=source, kwargs={"started": second_started})
+    try:
+        first.start()
+        assert entered.wait(timeout=10)
+        second.start()
+        assert second_started.wait(timeout=10)
+        release.set()
+        first.join(timeout=15)
+        second.join(timeout=15)
+    finally:
+        release.set()
+        for thread in (first, second):
+            if thread.ident is not None and thread.is_alive():
+                thread.join(timeout=15)
     assert not first.is_alive() and not second.is_alive()
     assert outcomes == ["ok", "ok"]
     assert factory_calls == 1

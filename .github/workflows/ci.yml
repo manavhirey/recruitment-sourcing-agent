@@ -181,6 +181,7 @@ jobs:
           docker run --rm -v "$PWD/loadtests:/loadtests:ro" grafana/k6@sha256:70af91f86cd8e142e0544a4edaf79835a80033f71974b92edd5ac36fd4442a7b inspect /loadtests/k6-sourcing.js
 
   launch-evidence:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     environment: recruiter-panel-approval
     steps:
