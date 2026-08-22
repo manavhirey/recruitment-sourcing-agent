@@ -1,1 +1,17 @@
 .worktrees/
+.env
+.DS_Store
+.superpowers/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+node_modules/
+.next/
+playwright-report/
+test-results/
+minio-data/

@@ -1,0 +1,201 @@
+x-runtime-common: &runtime-common
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  DATABASE_URL: ${COMPOSE_DATABASE_URL}
+  REDIS_URL: ${COMPOSE_REDIS_URL}
+  OBJECT_STORE_ENDPOINT: ${COMPOSE_OBJECT_STORE_ENDPOINT}
+  OBJECT_STORE_BUCKET: ${OBJECT_STORE_BUCKET:-provider-snapshots}
+  OBJECT_STORE_WRITER_ACCESS_KEY_ID: ${OBJECT_STORE_WRITER_ACCESS_KEY_ID}
+  OBJECT_STORE_WRITER_SECRET_ACCESS_KEY: ${OBJECT_STORE_WRITER_SECRET_ACCESS_KEY}
+  CONTACT_ENCRYPTION_KEY: ${CONTACT_ENCRYPTION_KEY}
+  SUPPRESSION_HMAC_KEY: ${SUPPRESSION_HMAC_KEY}
+  IDENTITY_HMAC_KEY: ${IDENTITY_HMAC_KEY}
+  IDENTITY_HMAC_KEY_VERSION: ${IDENTITY_HMAC_KEY_VERSION:-v1}
+  TELEMETRY_HMAC_KEY: ${TELEMETRY_HMAC_KEY}
+  WEBHOOK_HMAC_KEY: ${WEBHOOK_HMAC_KEY}
+  WEBHOOK_BASE_URL: ${WEBHOOK_BASE_URL}
+
+x-api-environment: &api-environment
+  <<: *runtime-common
+  OIDC_ISSUER: ${OIDC_ISSUER}
+  OIDC_AUDIENCE: ${OIDC_AUDIENCE}
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  SCORECARD_MODEL: ${SCORECARD_MODEL:-gpt-5-mini}
+
+x-worker-environment: &worker-environment
+  <<: *runtime-common
+  APOLLO_API_KEY: ${APOLLO_API_KEY}
+  APOLLO_REVEAL_PERSONAL_EMAILS: ${APOLLO_REVEAL_PERSONAL_EMAILS:-false}
+  APOLLO_REVEAL_PHONE_NUMBERS: ${APOLLO_REVEAL_PHONE_NUMBERS:-false}
+
+x-maintenance-environment: &maintenance-environment
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  MAINTENANCE_DATABASE_URL: ${COMPOSE_MAINTENANCE_DATABASE_URL}
+  REDIS_URL: ${COMPOSE_REDIS_URL}
+  OBJECT_STORE_ENDPOINT: ${COMPOSE_OBJECT_STORE_ENDPOINT}
+  OBJECT_STORE_BUCKET: ${OBJECT_STORE_BUCKET:-provider-snapshots}
+  OBJECT_STORE_DELETE_ACCESS_KEY_ID: ${OBJECT_STORE_DELETE_ACCESS_KEY_ID}
+  OBJECT_STORE_DELETE_SECRET_ACCESS_KEY: ${OBJECT_STORE_DELETE_SECRET_ACCESS_KEY}
+  TELEMETRY_HMAC_KEY: ${TELEMETRY_HMAC_KEY}
+
+x-web-environment: &web-environment
+  AUTH_URL: ${AUTH_URL}
+  AUTH_SECRET: ${AUTH_SECRET}
+  OIDC_ISSUER: ${OIDC_ISSUER}
+  OIDC_AUDIENCE: ${OIDC_AUDIENCE}
+  OIDC_AUDIENCE_COMPATIBILITY: ${OIDC_AUDIENCE_COMPATIBILITY:-false}
+  OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
+  OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+  API_BASE_URL: ${API_BASE_URL}
+  TENANT_OPTIONS: ${TENANT_OPTIONS:-[]}
+  ENABLE_DEV_AUTH_OVERRIDE: ${ENABLE_DEV_AUTH_OVERRIDE:-false}
+
+services:
+  api:
+    profiles: ["application"]
+    build:
+      context: ./backend
+    environment:
+      <<: *api-environment
+      METRICS_PORT: "9100"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--proxy-headers", "--forwarded-allow-ips=${TRUSTED_PROXY_IPS:-127.0.0.1}"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    ports: ["8000:8000"]
+    expose: ["9100"]
+    networks: [default, metrics-internal]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    profiles: ["application"]
+    build: { context: ./backend }
+    environment:
+      <<: *worker-environment
+      METRICS_PORT: "9101"
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO", "--queues=sourcing"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    expose: ["9101"]
+    networks: [default, metrics-internal]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  maintenance-worker:
+    profiles: ["application"]
+    build: { context: ./backend }
+    environment:
+      <<: *maintenance-environment
+      METRICS_PORT: "9102"
+    command: ["celery", "-A", "app.maintenance_worker.celery_app", "worker", "--loglevel=INFO", "--queues=maintenance"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    expose: ["9102"]
+    networks: [default, metrics-internal]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  scheduler:
+    profiles: ["application"]
+    build: { context: ./backend }
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      REDIS_URL: ${COMPOSE_REDIS_URL}
+    command: ["celery", "-A", "app.scheduler.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
+    depends_on:
+      redis: { condition: service_healthy }
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  web:
+    profiles: ["application"]
+    build: { context: ./web }
+    environment: *web-environment
+    depends_on:
+      api: { condition: service_healthy }
+    ports: ["3000:3000"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  postgres:
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    expose: ["5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/docker/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+    expose: ["6379"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2024-10-29T16-01-48Z@sha256:ebd2af76d40ff25ccc630533615f7ccd55fbe83d629a4b7c7a1b6311c1af3d6c
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    expose: ["9000", "9001"]
+    volumes: ["minio_data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    expose: ["9090"]
+    networks: [metrics-internal]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  prometheus_data:
+
+networks:
+  metrics-internal:
+    internal: true

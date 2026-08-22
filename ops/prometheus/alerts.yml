@@ -1,0 +1,67 @@
+groups:
+  - name: sourcing-launch-slos
+    rules:
+      - alert: SourcingRunStuck
+        expr: sum(sourcing_stuck_runs) > 0
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: Sourcing run exceeded its stage threshold
+      - alert: ProviderErrorRateHigh
+        expr: |
+          sum(rate(sourcing_provider_operations_total{outcome!="success"}[10m]))
+          /
+          clamp_min(sum(rate(sourcing_provider_operations_total[10m])), 0.001)
+          > 0.20
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: Provider operation error rate exceeded 20 percent for 10 minutes
+      - alert: ProviderAuthenticationFailure
+        expr: increase(sourcing_provider_operations_total{outcome=~"authentication_error|permission_error"}[5m]) > 0
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: Platform provider authentication or permission failed
+      - alert: SourcingQueueBacklog
+        expr: max(sourcing_queue_depth) > 1000
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: A sourcing queue has more than 1000 waiting messages
+      - alert: WebhookFailureBurst
+        expr: sum(increase(sourcing_webhook_failures_total[5m])) > 5
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: Webhook failure threshold exceeded
+      - alert: PrivacyWorkflowFailure
+        expr: sum(increase(sourcing_privacy_failures_total[5m])) > 0
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: A privacy workflow failed
+      - alert: SnapshotExpiryFailure
+        expr: increase(sourcing_snapshot_expiry_failures_total[15m]) > 0
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: Snapshot expiry has not completed safely
+      - alert: SourcingWorkerUnavailable
+        expr: min_over_time(up{job=~"sourcing-worker|sourcing-maintenance"}[2m]) == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: A sourcing worker metrics target is unavailable
+      - alert: TenantBudgetExhausted
+        expr: increase(sourcing_budget_exhaustion_total[5m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: A tenant-local sourcing budget was exhausted
+      - alert: CrossTenantDenialBurst
+        expr: increase(sourcing_cross_tenant_denials_total[5m]) > 10
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: Tenant-membership denials exceeded the approved baseline
