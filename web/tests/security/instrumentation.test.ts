@@ -11,7 +11,7 @@ describe("production runtime configuration", () => {
     const environment = {
       NODE_ENV: "production",
       ENABLE_DEV_AUTH_OVERRIDE: "true",
-      AUTH_SECRET: "v9Q2mN5tR8yC1pF4hJ7kL0wZ3aD6eG9sU2iO5bV8xM1qT4rY",
+      AUTH_SECRET: "A".repeat(43),
       AUTH_URL: "https://sourcing.example.com",
       OIDC_ISSUER: "https://identity.example.com/",
       OIDC_AUDIENCE: "https://api.example.com/",

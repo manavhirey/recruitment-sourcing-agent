@@ -18,7 +18,7 @@ not call LinkedIn, Apollo, or other providers.
    env \
      API_BASE_URL=http://127.0.0.1:8001 \
      AUTH_URL=http://127.0.0.1:3000 \
-     AUTH_SECRET=x8V1qM3rT6yB9nC2pL5sF7hJ0kD4wZ6aQ8eR1tY3uI5oP7gH \
+     AUTH_SECRET="$(openssl rand -base64 48 | tr -d '\n' | tr '+/' '-_')" \
      OIDC_ISSUER=http://127.0.0.1:8001/oidc \
      OIDC_AUDIENCE=http://127.0.0.1:8001/api \
      OIDC_CLIENT_ID=e2e-client \
