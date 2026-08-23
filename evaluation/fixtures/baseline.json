@@ -1,0 +1,8 @@
+{
+  "blocked": "recruiter_panel_required",
+  "requirements": {
+    "jobs_minimum": 30,
+    "judgments_per_job_minimum": 20,
+    "markets": ["IN", "US"]
+  }
+}

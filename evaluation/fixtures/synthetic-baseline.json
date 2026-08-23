@@ -1,0 +1,23 @@
+{
+  "classifications": {
+    "synthetic-in-product/candidate-in-01": "main",
+    "synthetic-in-product/candidate-in-02": "near_match",
+    "synthetic-in-product/candidate-in-03": "main",
+    "synthetic-in-product/candidate-in-04": "main",
+    "synthetic-us-data/candidate-us-01": "main",
+    "synthetic-us-data/candidate-us-02": "near_match",
+    "synthetic-us-data/candidate-us-03": "main",
+    "synthetic-us-data/candidate-us-04": "near_match"
+  },
+  "created_at": "2026-08-16T00:00:00Z",
+  "dataset_kind": "synthetic",
+  "dataset_sha256": "82ec5d2cda79893d3d921244c0ed8f5833f9fd6a20209c5041ca2d162e48b5b6",
+  "metrics": {
+    "hard_gate_f1": 1.0,
+    "hard_gate_precision": 1.0,
+    "hard_gate_recall": 1.0,
+    "ndcg_at_20": 0.9197207891481876,
+    "top_20_acceptance_proxy": 0.5
+  },
+  "scoring_version": "matching-v1"
+}

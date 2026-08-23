@@ -1,0 +1,87 @@
+import { render } from "@testing-library/react"
+import axe from "axe-core"
+
+import { ClientManager } from "@/components/clients/ClientManager"
+import { ReviewWorkspace } from "@/components/candidates/ReviewWorkspace"
+import { JobIntakeForm } from "@/components/jobs/JobIntakeForm"
+import { AgencyAlerts } from "@/components/layout/AgencyAlerts"
+import { AppShell } from "@/components/layout/AppShell"
+import { ScorecardEditor } from "@/components/scorecards/ScorecardEditor"
+import { authorizedClientsFixture, scorecardDraftFixture } from "@/tests/fixtures"
+import { priyaCandidateFixture } from "@/tests/review-fixtures"
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+
+async function expectNoAxeViolations(container: HTMLElement) {
+  const result = await axe.run(container, {
+    rules: {
+      // jsdom has no layout engine, so color contrast is covered by browser QA.
+      "color-contrast": { enabled: false },
+    },
+  })
+  expect(result.violations).toEqual([])
+}
+
+describe("core flow accessibility", () => {
+  it("keeps the responsive agency shell and intake form free of axe violations", async () => {
+    const { container } = render(
+      <AppShell
+        agency={{ id: "00000000-0000-4000-8000-000000000001", name: "Northstar Search" }}
+        user={{ name: "Avery Stone", email: "avery@example.test" }}
+        role="recruiter"
+        tenantOptions={[
+          { id: "00000000-0000-4000-8000-000000000001", name: "Northstar Search" },
+        ]}
+        activeJobs={[]}
+      >
+        <h1>New job</h1>
+        <JobIntakeForm clients={authorizedClientsFixture} />
+      </AppShell>,
+    )
+
+    await expectNoAxeViolations(container)
+  })
+
+  it("keeps scorecard review semantics free of axe violations", async () => {
+    const { container } = render(
+      <ScorecardEditor
+        draft={scorecardDraftFixture}
+        allowedIndustryCodes={["technology.fintech"]}
+      />,
+    )
+
+    await expectNoAxeViolations(container)
+  })
+
+  it("keeps recruiter and manager client views free of axe violations", async () => {
+    const { container } = render(
+      <main>
+        <h1>Clients</h1>
+        <ClientManager clients={authorizedClientsFixture} role="admin" />
+      </main>,
+    )
+
+    await expectNoAxeViolations(container)
+  })
+
+  it("keeps the evidence workspace and tenant alerts free of axe violations", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { container } = render(
+      <QueryClientProvider client={client}>
+        <main>
+          <h1>Senior Product Manager</h1>
+          <AgencyAlerts alerts={[]} />
+          <ReviewWorkspace
+            jobId={priyaCandidateFixture.job_id}
+            runId="00000000-0000-4000-8000-000000000301"
+            initialCandidates={{ items: [priyaCandidateFixture], next_cursor: null }}
+            initialSelectedCandidate={priyaCandidateFixture}
+            initialNearMatches={{ items: [], next_cursor: null }}
+            immutableScorecard={null}
+          />
+        </main>
+      </QueryClientProvider>,
+    )
+
+    await expectNoAxeViolations(container)
+  })
+})
