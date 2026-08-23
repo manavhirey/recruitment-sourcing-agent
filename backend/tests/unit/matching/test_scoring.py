@@ -155,9 +155,7 @@ def test_no_requirement_produces_no_scope_criterion(
         candidate_factory(years_experience=None),
     )
 
-    assert not any(
-        item.key == "component.years_experience" for item in result.criteria
-    )
+    assert not any(item.key == "component.years_experience" for item in result.criteria)
     assert not any(
         item.key == "component.scope_seniority_years" for item in result.criteria
     )

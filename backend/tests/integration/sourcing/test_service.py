@@ -4,6 +4,10 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
 from app.audit.models import AuditEvent
 from app.clients.models import ClientCompany
 from app.core.database import Base
@@ -13,9 +17,6 @@ from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
 from app.sourcing.models import SourcingRun
 from app.sourcing.service import SourcingError, SourcingService
 from app.sourcing.state_machine import RunState
-from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
 
 
 @pytest.fixture

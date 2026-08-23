@@ -515,9 +515,7 @@ class JobService:
             extraction_status=ExtractionStatus(record.extraction_status),
         )
         return confirmed.model_copy(
-            update={
-                "confirmed_inferred_items": sorted(confirmed.inferred_item_ids())
-            }
+            update={"confirmed_inferred_items": sorted(confirmed.inferred_item_ids())}
         )
 
     @staticmethod

@@ -2,6 +2,8 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
+
 from app.jobs.schemas import (
     ConfirmedScorecard,
     CriterionKind,
@@ -9,7 +11,6 @@ from app.jobs.schemas import (
     ScorecardDraft,
 )
 from app.jobs.seniority import SeniorityLevel
-from pydantic import ValidationError
 
 
 def _valid_draft(**overrides: object) -> ScorecardDraft:

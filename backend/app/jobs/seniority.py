@@ -50,7 +50,9 @@ def normalize_draft_seniority(values: Iterable[str]) -> tuple[SeniorityLevel, ..
         if value is None:
             raise ValueError(f"unknown seniority value: {raw}")
         requested.add(value)
-    return tuple(preset.value for preset in SENIORITY_PRESETS if preset.value in requested)
+    return tuple(
+        preset.value for preset in SENIORITY_PRESETS if preset.value in requested
+    )
 
 
 def validate_confirmed_seniority(values: Iterable[str]) -> tuple[SeniorityLevel, ...]:

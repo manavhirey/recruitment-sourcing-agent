@@ -61,7 +61,9 @@ class DefaultJobDescriptionExtractor:
             raise DocumentExtractionError("job_description_file_too_large")
 
         extension = Path(filename).suffix.casefold()
-        normalized_media_type = media_type.casefold() if media_type is not None else None
+        normalized_media_type = (
+            media_type.casefold() if media_type is not None else None
+        )
 
         if extension == ".docx" and data.startswith(OLE_SIGNATURE):
             raise DocumentExtractionError("job_description_file_unreadable")

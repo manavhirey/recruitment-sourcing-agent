@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+
 from app.jobs.schemas import (
     ConfirmedScorecard,
     CriterionKind,
@@ -83,9 +84,7 @@ def test_custom_bounds_omit_inactive_provider_seniority_filters() -> None:
 
 
 def test_multiple_presets_use_stable_union() -> None:
-    queries = QueryPlanner().compile(
-        _scorecard(seniority=["senior", "early_career"])
-    )
+    queries = QueryPlanner().compile(_scorecard(seniority=["senior", "early_career"]))
 
     assert all(
         query.seniorities
@@ -118,8 +117,7 @@ def test_query_planner_chunks_titles_and_bounds_queries() -> None:
     assert len(queries) == 8
     assert all(1 <= len(query.titles) <= 3 for query in queries)
     assert all(
-        query.seniorities
-        == ("senior", "manager", "director", "head", "vp", "c_suite")
+        query.seniorities == ("senior", "manager", "director", "head", "vp", "c_suite")
         for query in queries
     )
 

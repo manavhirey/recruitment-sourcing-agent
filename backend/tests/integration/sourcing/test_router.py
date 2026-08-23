@@ -4,6 +4,11 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
 from app.audit.models import AuditEvent
 from app.candidates.models import Candidate
 from app.clients.models import ClientCompany
@@ -22,10 +27,6 @@ from app.sourcing.models import (
     UsageLedger,
 )
 from app.sourcing.state_machine import RunState
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
 
 
 class StaticVerifier:

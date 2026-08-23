@@ -3,6 +3,11 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
 from app.clients.models import ClientCompany, ClientIndustry
 from app.core.config import Settings
 from app.core.database import Base, get_db
@@ -13,10 +18,6 @@ from app.jobs.models import Job
 from app.jobs.schemas import CriterionKind, ScorecardCriterion, ScorecardDraft
 from app.jobs.service import JobError, JobService
 from app.main import create_app
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
 
 
 class StaticVerifier:

@@ -224,13 +224,17 @@ def _patch_zip_member_headers(
         (b"PK\x03\x04", 26, 30, 6, 8),
         (b"PK\x01\x02", 28, 46, 8, 10),
     )
-    for marker, name_length_offset, name_offset, flag_offset, compression_offset in records:
+    for (
+        marker,
+        name_length_offset,
+        name_offset,
+        flag_offset,
+        compression_offset,
+    ) in records:
         offset = 0
         while (offset := data.find(marker, offset)) != -1:
             name_length = int.from_bytes(
-                data[
-                    offset + name_length_offset : offset + name_length_offset + 2
-                ],
+                data[offset + name_length_offset : offset + name_length_offset + 2],
                 "little",
             )
             current_filename = bytes(

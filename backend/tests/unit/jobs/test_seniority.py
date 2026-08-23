@@ -1,4 +1,5 @@
 import pytest
+
 from app.jobs.seniority import (
     SeniorityLevel,
     effective_experience_intervals,
@@ -42,9 +43,7 @@ def test_disjoint_presets_remain_disjoint():
 
 
 def test_open_custom_range_overrides_all_presets():
-    intervals = effective_experience_intervals(
-        [SeniorityLevel.EARLY_CAREER], 5, None
-    )
+    intervals = effective_experience_intervals([SeniorityLevel.EARLY_CAREER], 5, None)
     assert not any(interval.contains(3.0) for interval in intervals)
     assert any(interval.contains(5.0) for interval in intervals)
 

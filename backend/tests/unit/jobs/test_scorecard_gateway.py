@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+
 from app.jobs.llm import (
     OpenAIResponsesScorecardGateway,
     ScorecardExtractionError,
