@@ -3,11 +3,6 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
-
 from app.clients.models import ClientCompany, ClientIndustry
 from app.core.config import Settings
 from app.core.database import Base, get_db
@@ -18,6 +13,10 @@ from app.jobs.models import Job
 from app.jobs.schemas import CriterionKind, ScorecardCriterion, ScorecardDraft
 from app.jobs.service import JobError, JobService
 from app.main import create_app
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 
 class StaticVerifier:
@@ -111,7 +110,7 @@ def draft_job(
                     source_text="payments experience",
                 )
             ],
-            seniority=["manager"],
+            seniority=["mid_level"],
             minimum_years=5,
             maximum_years=12,
             locations=["India"],
@@ -135,6 +134,24 @@ def test_confirmed_scorecard_is_immutable(
     assert first.version == 1
     assert second.version == 2
     assert first.id != second.id
+
+
+def test_legacy_seniority_draft_reloads_as_editable_with_canonical_options(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["seniority"] = ["manager"]
+
+    reloaded = job_service.get_draft(owner_context, draft_job.id)
+
+    assert reloaded.draft.seniority == ["manager"]
+    assert [option.value for option in reloaded.seniority_options] == [
+        "early_career",
+        "mid_level",
+        "senior",
+    ]
 
 
 def test_confirmation_rejects_unapproved_adjacent_industry(
@@ -246,7 +263,7 @@ def test_unchanged_extracted_criterion_keeps_server_owned_provenance(
                 source_text="payments experience",
             )
         ],
-        seniority=["manager"],
+        seniority=["mid_level"],
         minimum_years=5,
         maximum_years=12,
         locations=["India"],
@@ -413,7 +430,7 @@ def test_double_extraction_failure_returns_editable_manual_draft(job_api) -> Non
                 "recruiter_entered": True,
             }
         ],
-        "seniority": ["manager"],
+        "seniority": ["mid_level"],
         "minimum_years": 5,
         "maximum_years": 12,
         "locations": ["India"],
@@ -638,7 +655,7 @@ def _draft_payload(title: str, criterion_key: str) -> dict[str, object]:
                 "source_text": f"{criterion_key} experience",
             }
         ],
-        "seniority": ["manager"],
+        "seniority": ["mid_level"],
         "minimum_years": 5,
         "maximum_years": 12,
         "locations": ["India"],

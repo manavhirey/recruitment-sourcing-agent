@@ -37,6 +37,11 @@ def extraction_instructions() -> str:
     return (
         "Extract only job-relevant criteria. Mark every inference. "
         "Never infer protected characteristics or work authorization. "
+        "Use only early_career, mid_level, or senior for seniority. "
+        "Put explicit numeric experience requirements in minimum_years and maximum_years; "
+        "numeric bounds override seniority presets. If a numeric bound is inferred rather "
+        "than stated, add the exact uncertainty 'Confirm inferred minimum years: N' or "
+        "'Confirm inferred maximum years: N' so recruiter confirmation is required. "
         "Return data that validates against the supplied scorecard schema."
     )
 

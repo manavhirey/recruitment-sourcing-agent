@@ -16,12 +16,15 @@ from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
 from app.jobs.schemas import (
     ClientContext,
     ConfirmedScorecard,
+    CriterionKind,
     EditableScorecardDraft,
     ExtractionStatus,
     ScorecardCriterion,
     ScorecardDraft,
     ScorecardDraftResponse,
+    SeniorityOption,
 )
+from app.jobs.seniority import SENIORITY_PRESETS
 
 
 class JobError(AppError):
@@ -481,13 +484,13 @@ class JobService:
             .where(ScorecardCriterionRecord.scorecard_version_id == record.id)
             .order_by(ScorecardCriterionRecord.position)
         )
-        draft = ScorecardDraft(
+        confirmed = ConfirmedScorecard(
             target_titles=record.target_titles,
             criteria=[
                 ScorecardCriterion(
                     key=criterion.key,
                     label=criterion.label,
-                    kind=criterion.kind,
+                    kind=CriterionKind(criterion.kind),
                     evidence_required=criterion.evidence_required,
                     source_text=criterion.source_text,
                     inferred=criterion.inferred,
@@ -505,32 +508,43 @@ class JobService:
             industry_code=record.industry_code,
             suggested_adjacent_industries=record.suggested_adjacent_industries,
             uncertainties=record.uncertainties,
-        )
-        confirmed_draft = draft.model_copy(
-            update={"confirmed_inferred_items": sorted(draft.inferred_item_ids())}
-        )
-        return ConfirmedScorecard(
-            **confirmed_draft.model_dump(),
             id=record.id,
             job_id=record.job_id,
             version=record.version,
             confirmed_at=record.confirmed_at,
             extraction_status=ExtractionStatus(record.extraction_status),
         )
+        return confirmed.model_copy(
+            update={
+                "confirmed_inferred_items": sorted(confirmed.inferred_item_ids())
+            }
+        )
 
     @staticmethod
     def _draft_response(job: Job) -> ScorecardDraftResponse:
+        if job.draft_payload is None:
+            draft: ScorecardDraft | EditableScorecardDraft = EditableScorecardDraft()
+        else:
+            try:
+                draft = ScorecardDraft.model_validate(job.draft_payload)
+            except ValidationError:
+                draft = EditableScorecardDraft.model_validate(job.draft_payload)
         return ScorecardDraftResponse(
             job_id=job.id,
             draft_revision=job.draft_revision,
-            draft=(
-                ScorecardDraft.model_validate(job.draft_payload)
-                if job.draft_payload is not None
-                else EditableScorecardDraft()
-            ),
+            draft=draft,
             original_job_description=job.job_description,
             extraction_status=ExtractionStatus(job.draft_extraction_status),
             extraction_warning=job.draft_extraction_warning,
+            seniority_options=tuple(
+                SeniorityOption(
+                    value=preset.value,
+                    label=preset.label,
+                    minimum_years=preset.minimum_years,
+                    maximum_years=preset.maximum_years,
+                )
+                for preset in SENIORITY_PRESETS
+            ),
         )
 
     def _authorize_client(self, context: RequestContext, client_id: UUID):

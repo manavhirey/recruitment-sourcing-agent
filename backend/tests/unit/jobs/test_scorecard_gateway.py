@@ -2,8 +2,11 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-
-from app.jobs.llm import OpenAIResponsesScorecardGateway, ScorecardExtractionError
+from app.jobs.llm import (
+    OpenAIResponsesScorecardGateway,
+    ScorecardExtractionError,
+    extraction_instructions,
+)
 from app.jobs.schemas import ClientContext, ScorecardDraft
 
 VALID_DRAFT = {
@@ -16,7 +19,7 @@ VALID_DRAFT = {
             "source_text": "payments experience",
         }
     ],
-    "seniority": ["manager"],
+    "seniority": ["mid_level"],
     "minimum_years": 5,
     "maximum_years": 12,
     "locations": ["India"],
@@ -76,6 +79,42 @@ def test_invalid_extraction_retries_once_with_validation_error(client_context) -
     assert "Validation errors from the prior attempt" in str(
         client.responses.calls[1]["input"]
     )
+
+
+def test_unknown_seniority_retries_with_its_validation_error(client_context) -> None:
+    invalid = {**VALID_DRAFT, "seniority": ["manager"]}
+    client = FakeOpenAI([invalid, VALID_DRAFT])
+    gateway = OpenAIResponsesScorecardGateway(client, "gpt-5-mini")
+
+    result = gateway.extract(
+        "Hire a product manager with payments experience.", client_context
+    )
+
+    assert result.seniority == ["mid_level"]
+    assert "unknown seniority value: manager" in str(client.responses.calls[1]["input"])
+
+
+def test_inferred_numeric_bound_requires_confirmation(client_context) -> None:
+    draft = {
+        **VALID_DRAFT,
+        "minimum_years": 5,
+        "maximum_years": None,
+        "uncertainties": ["Confirm inferred minimum years: 5"],
+    }
+    gateway = OpenAIResponsesScorecardGateway(FakeOpenAI([draft]), "gpt-5-mini")
+
+    result = gateway.extract(
+        "Hire a product manager with payments experience.", client_context
+    )
+
+    assert result.unresolved_inferred_items() == result.inferred_item_ids()
+
+
+def test_extraction_instructions_constrain_seniority_and_numeric_inference() -> None:
+    instructions = extraction_instructions()
+
+    assert "Use only early_career, mid_level, or senior for seniority." in instructions
+    assert "numeric bounds override seniority presets" in instructions
 
 
 def test_two_invalid_extractions_raise_typed_error(client_context) -> None:
