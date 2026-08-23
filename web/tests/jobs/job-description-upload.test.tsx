@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react"
+import { act, fireEvent, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { HttpResponse, http } from "msw"
 import { useState } from "react"
@@ -7,7 +7,13 @@ import { vi } from "vitest"
 import { JobDescriptionUpload } from "@/components/jobs/JobDescriptionUpload"
 import { server } from "@/tests/setup"
 
-function UploadHarness({ initialText = "" }: { initialText?: string }) {
+function UploadHarness({
+  initialText = "",
+  disabled = false,
+}: {
+  initialText?: string
+  disabled?: boolean
+}) {
   const [text, setText] = useState(initialText)
   const [busy, setBusy] = useState(false)
   const [source, setSource] = useState<string | null>(null)
@@ -15,7 +21,7 @@ function UploadHarness({ initialText = "" }: { initialText?: string }) {
     <>
       <JobDescriptionUpload
         currentText={text}
-        disabled={false}
+        disabled={disabled}
         onBusyChange={setBusy}
         onExtracted={(result) => {
           setText(result.text)
@@ -88,6 +94,24 @@ describe("JobDescriptionUpload", () => {
     expect(called).not.toHaveBeenCalled()
   })
 
+  it("guards programmatic file selection while submission is disabled", () => {
+    const called = vi.fn()
+    server.use(http.post("/api/bff/job-descriptions/extract", called))
+    render(<UploadHarness disabled />)
+
+    const input = screen.getByLabelText("Upload job description")
+    input.removeAttribute("disabled")
+    fireEvent.change(input, {
+      target: {
+        files: [
+          new File(["%PDF-1.4"], "role.pdf", { type: "application/pdf" }),
+        ],
+      },
+    })
+
+    expect(called).not.toHaveBeenCalled()
+  })
+
   it("extracts a DOCX and leaves the returned text editable", async () => {
     server.use(http.post("/api/bff/job-descriptions/extract", () => {
       return HttpResponse.json({
@@ -139,6 +163,24 @@ describe("JobDescriptionUpload", () => {
     expect(called).not.toHaveBeenCalled()
     await user.upload(screen.getByLabelText("Upload job description"), file)
     expect(screen.getByRole("dialog", { name: "Replace job description?" })).toBeVisible()
+  })
+
+  it("disables every replacement-modal action while submission is active", async () => {
+    const called = vi.fn()
+    server.use(http.post("/api/bff/job-descriptions/extract", called))
+    const user = userEvent.setup()
+    const { rerender } = render(<UploadHarness initialText="Keep this text" />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File(["%PDF-1.4"], "role.pdf", { type: "application/pdf" }),
+    )
+    rerender(<UploadHarness initialText="Keep this text" disabled />)
+
+    expect(screen.getByRole("button", { name: "Keep existing text" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "Replace text" })).toBeDisabled()
+    fireEvent.click(screen.getByRole("button", { name: "Replace text" }))
+    expect(called).not.toHaveBeenCalled()
   })
 
   it("replaces existing text only after the recruiter confirms", async () => {
@@ -251,6 +293,65 @@ describe("JobDescriptionUpload", () => {
     expect(keys).toHaveLength(2)
     expect(keys[0]).not.toBe("")
     expect(keys[0]).toBe(keys[1])
+  })
+
+  it("disables retry and guards it while submission is active", async () => {
+    const called = vi.fn(() =>
+      HttpResponse.json(
+        { code: "job_description_extraction_unavailable" },
+        { status: 503 },
+      ),
+    )
+    server.use(http.post("/api/bff/job-descriptions/extract", called))
+    const user = userEvent.setup()
+    const { rerender } = render(<UploadHarness />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File(["%PDF-1.4"], "role.pdf", { type: "application/pdf" }),
+    )
+    const retry = await screen.findByRole("button", { name: "Try again" })
+    rerender(<UploadHarness disabled />)
+
+    expect(retry).toBeDisabled()
+    fireEvent.click(retry)
+    expect(called).toHaveBeenCalledOnce()
+  })
+
+  it("guards a retry against two clicks in the same render", async () => {
+    let attempt = 0
+    let resolveRetry: ((value: Response) => void) | undefined
+    server.use(http.post("/api/bff/job-descriptions/extract", () => {
+      attempt += 1
+      if (attempt === 1) {
+        return HttpResponse.json(
+          { code: "job_description_extraction_unavailable" },
+          { status: 503 },
+        )
+      }
+      return new Promise<Response>((resolve) => {
+        resolveRetry = resolve
+      })
+    }))
+    const user = userEvent.setup()
+    render(<UploadHarness />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File(["%PDF-1.4"], "role.pdf", { type: "application/pdf" }),
+    )
+    const retry = await screen.findByRole("button", { name: "Try again" })
+    act(() => {
+      retry.dispatchEvent(new MouseEvent("click", { bubbles: true }))
+      retry.dispatchEvent(new MouseEvent("click", { bubbles: true }))
+    })
+
+    await vi.waitFor(() => expect(attempt).toBe(2))
+    resolveRetry?.(HttpResponse.json({
+      text: "Extracted text",
+      source: { filename: "role.pdf", media_type: "application/pdf" },
+    }))
+    expect(await screen.findByText("Extracted from role.pdf")).toBeVisible()
   })
 
   it("resets the native input so the same file can be selected after an error", async () => {

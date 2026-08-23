@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react"
+import { fireEvent, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { HttpResponse, http } from "msw"
 import { vi } from "vitest"
@@ -113,6 +113,71 @@ describe("JobIntakeForm", () => {
       source: { filename: "role.pdf", media_type: "application/pdf" },
     }))
     expect(await screen.findByText("Extracted from role.pdf")).toBeVisible()
+  })
+
+  it("does not start an extraction retry while job submission is active", async () => {
+    let extractionRequests = 0
+    let resolveJob: ((value: Response) => void) | undefined
+    server.use(
+      http.post("/api/bff/job-descriptions/extract", () => {
+        extractionRequests += 1
+        return HttpResponse.json(
+          { code: "job_description_extraction_unavailable" },
+          { status: 503 },
+        )
+      }),
+      http.post("/api/bff/jobs", () => new Promise<Response>((resolve) => {
+        resolveJob = resolve
+      })),
+      http.post("/api/bff/jobs/:jobId/scorecard/generate", () =>
+        HttpResponse.json({
+          job_id: "00000000-0000-4000-8000-000000000301",
+          draft_revision: 1,
+          draft: { target_titles: [], criteria: [], seniority: [], minimum_years: null, maximum_years: null, locations: [], industry_code: "", suggested_adjacent_industries: [], uncertainties: [] },
+          original_job_description: "Pasted role",
+          extraction_status: "manual_required",
+          extraction_warning: "Enter manually",
+          seniority_options: [],
+        }),
+      ),
+    )
+    const ready = vi.fn()
+    const user = userEvent.setup()
+    render(<JobIntakeForm clients={authorizedClientsFixture} onDraftReady={ready} />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File(["%PDF-1.4"], "role.pdf", { type: "application/pdf" }),
+    )
+    const retry = await screen.findByRole("button", { name: "Try again" })
+    await user.selectOptions(screen.getByLabelText("Client"), authorizedClientsFixture[0].id)
+    await user.type(screen.getByLabelText("Job title"), "Product Designer")
+    await user.type(screen.getByLabelText("Job description"), "Pasted role")
+    await user.click(screen.getByRole("button", { name: "Generate scorecard" }))
+
+    expect(await screen.findByRole("button", { name: "Generating…" })).toBeDisabled()
+    expect(retry).toBeDisabled()
+    fireEvent.click(retry)
+    expect(extractionRequests).toBe(1)
+
+    resolveJob?.(HttpResponse.json({
+      id: "00000000-0000-4000-8000-000000000301",
+      tenant_id: "00000000-0000-4000-8000-000000000001",
+      client_id: authorizedClientsFixture[0].id,
+      owner_user_id: "00000000-0000-4000-8000-000000000401",
+      title: "Product Designer",
+      job_description: "Pasted role",
+      location: null,
+      employment_model: null,
+      status: "awaiting_scorecard",
+      draft_revision: 0,
+      extraction_status: "ready",
+      extraction_warning: null,
+      current_scorecard_id: null,
+      created_at: "2026-08-16T00:00:00Z",
+      updated_at: "2026-08-16T00:00:00Z",
+    }))
+    await vi.waitFor(() => expect(ready).toHaveBeenCalledOnce())
   })
 
   it("reuses the same creation idempotency key when a safe retry is needed", async () => {

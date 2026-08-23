@@ -1,7 +1,11 @@
 import "server-only"
 
 import { apiFetch, ApiError, type ApiInit } from "@/lib/api"
-import { bffErrorResponse, bffPublicStatus } from "@/lib/bff"
+import { bffErrorResponse } from "@/lib/bff"
+import {
+  MultipartUploadError,
+  readMultipartUpload,
+} from "@/lib/multipart-upload"
 import { assertMutationOrigin, selectedTenantId } from "@/lib/tenant"
 
 const maximumFileBytes = 10_000_000
@@ -12,9 +16,27 @@ const supportedTypes = new Map([
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   ],
 ])
+const publicUpstreamErrors = new Map<string, number>([
+  ["job_description_file_required", 400],
+  ["tenant_required", 400],
+  ["invalid_token", 401],
+  ["unauthenticated", 401],
+  ["forbidden", 403],
+  ["tenant_not_found", 404],
+  ["job_description_file_too_large", 413],
+  ["job_description_type_unsupported", 415],
+  ["job_description_file_unreadable", 422],
+  ["job_description_text_missing", 422],
+  ["job_description_text_too_long", 422],
+  ["job_description_file_too_complex", 422],
+  ["authentication_unavailable", 503],
+  ["job_description_extraction_unavailable", 503],
+  ["api_unavailable", 502],
+])
 
 type DocumentExtractionDependencies = {
   appUrl: string
+  authenticate?: () => Promise<void>
   readTenant?: () => Promise<string | null>
   callApi?: (
     path: string,
@@ -23,14 +45,19 @@ type DocumentExtractionDependencies = {
   ) => Promise<unknown>
 }
 
-function hasSupportedType(file: File): boolean {
-  const name = file.name.toLowerCase()
+async function authenticateRequest(): Promise<void> {
+  const { readServerAccessToken } = await import("@/lib/auth")
+  await readServerAccessToken()
+}
+
+function hasSupportedType(filename: string, mediaType: string): boolean {
+  const name = filename.toLowerCase()
   const extension = [...supportedTypes.keys()].find((value) =>
     name.endsWith(value),
   )
   return (
     extension !== undefined &&
-    file.type.toLowerCase() === supportedTypes.get(extension)
+    mediaType.toLowerCase() === supportedTypes.get(extension)
   )
 }
 
@@ -54,30 +81,19 @@ export async function handleDocumentExtraction(
     return bffErrorResponse("job_description_type_unsupported", 415)
   }
 
-  let form: FormData
-  try {
-    form = await request.formData()
-  } catch {
-    return bffErrorResponse("job_description_file_required", 400)
+  const authenticate = dependencies.authenticate ?? (
+    dependencies.callApi === undefined ? authenticateRequest : undefined
+  )
+  if (authenticate) {
+    try {
+      await authenticate()
+    } catch (error) {
+      if (error instanceof Error && error.message === "unauthenticated") {
+        return bffErrorResponse("unauthenticated", 401)
+      }
+      return bffErrorResponse("authentication_unavailable", 503)
+    }
   }
-  if ([...form.keys()].some((key) => key !== "file")) {
-    return bffErrorResponse("job_description_file_required", 400)
-  }
-  const values = form.getAll("file")
-  if (values.length !== 1 || typeof values[0] === "string") {
-    return bffErrorResponse("job_description_file_required", 400)
-  }
-
-  const file = values[0]
-  if (file.size > maximumFileBytes) {
-    return bffErrorResponse("job_description_file_too_large", 413)
-  }
-  if (!hasSupportedType(file)) {
-    return bffErrorResponse("job_description_type_unsupported", 415)
-  }
-
-  const upstream = new FormData()
-  upstream.set("file", file, file.name)
 
   let tenantId: string | null
   try {
@@ -86,6 +102,31 @@ export async function handleDocumentExtraction(
     return bffErrorResponse("tenant_unavailable", 503)
   }
   if (!tenantId) return bffErrorResponse("tenant_required", 401)
+
+  let upload
+  try {
+    upload = await readMultipartUpload(request)
+  } catch (error) {
+    if (error instanceof MultipartUploadError) {
+      const status = error.code === "job_description_file_too_large" ? 413 : 400
+      return bffErrorResponse(error.code, status)
+    }
+    return bffErrorResponse("job_description_file_required", 400)
+  }
+  if (upload.contents.byteLength > maximumFileBytes) {
+    return bffErrorResponse("job_description_file_too_large", 413)
+  }
+  if (!hasSupportedType(upload.filename, upload.mediaType)) {
+    return bffErrorResponse("job_description_type_unsupported", 415)
+  }
+
+  const file = new File(
+    [Uint8Array.from(upload.contents).buffer],
+    upload.filename,
+    { type: upload.mediaType },
+  )
+  const upstream = new FormData()
+  upstream.set("file", file, upload.filename)
 
   try {
     const result = await (dependencies.callApi ?? apiFetch)(
@@ -104,7 +145,10 @@ export async function handleDocumentExtraction(
     })
   } catch (error) {
     if (error instanceof ApiError) {
-      return bffErrorResponse(error.code, bffPublicStatus(error))
+      const expectedStatus = publicUpstreamErrors.get(error.code)
+      if (expectedStatus === error.status) {
+        return bffErrorResponse(error.code, expectedStatus)
+      }
     }
     return bffErrorResponse("api_unavailable", 502)
   }

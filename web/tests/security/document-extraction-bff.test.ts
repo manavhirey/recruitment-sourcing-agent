@@ -54,6 +54,67 @@ function formWithFile(
   return form
 }
 
+const textEncoder = new TextEncoder()
+
+function rawUploadRequest(
+  chunks: readonly Uint8Array[],
+  consumed: number[],
+  options: {
+    boundary?: string
+    idempotencyKey?: string | null
+    origin?: string
+    signal?: AbortSignal
+  } = {},
+): Request {
+  const boundary = options.boundary ?? "raw-upload-boundary"
+  const origin = options.origin ?? appUrl
+  let index = 0
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index === chunks.length) {
+        controller.close()
+        return
+      }
+      consumed.push(index)
+      controller.enqueue(chunks[index])
+      index += 1
+    },
+  }, { highWaterMark: 0 })
+  const headers = new Headers({
+    "Content-Type": `multipart/form-data; boundary=${boundary}`,
+    Origin: origin,
+    "Sec-Fetch-Site": origin === appUrl ? "same-origin" : "cross-site",
+  })
+  if (options.idempotencyKey !== null) {
+    headers.set(
+      "Idempotency-Key",
+      options.idempotencyKey ?? "extract-intent",
+    )
+  }
+  const init: RequestInit & { duplex: "half" } = {
+    method: "POST",
+    headers,
+    body,
+    duplex: "half",
+    signal: options.signal,
+  }
+  return new Request(`${appUrl}/api/bff/job-descriptions/extract`, init)
+}
+
+function rawFileOpening(
+  boundary: string,
+  extraHeaders: readonly string[] = [],
+): Uint8Array {
+  return textEncoder.encode([
+    `--${boundary}`,
+    'Content-Disposition: form-data; name="file"; filename="role.pdf"',
+    "Content-Type: application/pdf",
+    ...extraHeaders,
+    "",
+    "",
+  ].join("\r\n"))
+}
+
 async function expectError(
   response: Response,
   status: number,
@@ -148,7 +209,7 @@ describe("document extraction BFF boundary", () => {
     )
 
     await expectError(response, 413, "job_description_file_too_large")
-    expect(readTenant).not.toHaveBeenCalled()
+    expect(readTenant).toHaveBeenCalledOnce()
     expect(callApi).not.toHaveBeenCalled()
   })
 
@@ -206,6 +267,51 @@ describe("document extraction BFF boundary", () => {
     expect(callApi).not.toHaveBeenCalled()
   })
 
+  it("consumes zero unknown-length body chunks when authentication fails", async () => {
+    const boundary = "unauthenticated-boundary"
+    const consumed: number[] = []
+    const readTenant = vi.fn(async () => tenantId)
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        rawFileOpening(boundary),
+        textEncoder.encode("%PDF-1.4 private"),
+        textEncoder.encode(`\r\n--${boundary}--\r\n`),
+      ], consumed, { boundary }),
+      {
+        appUrl,
+        authenticate: async () => {
+          throw new Error("unauthenticated")
+        },
+        readTenant,
+        callApi: vi.fn(),
+      },
+    )
+
+    await expectError(response, 401, "unauthenticated")
+    expect(consumed).toEqual([])
+    expect(readTenant).not.toHaveBeenCalled()
+  })
+
+  it("consumes zero unknown-length body chunks when no tenant is selected", async () => {
+    const boundary = "missing-tenant-boundary"
+    const consumed: number[] = []
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        rawFileOpening(boundary),
+        textEncoder.encode("%PDF-1.4 private"),
+        textEncoder.encode(`\r\n--${boundary}--\r\n`),
+      ], consumed, { boundary }),
+      {
+        appUrl,
+        readTenant: async () => null,
+        callApi: vi.fn(),
+      },
+    )
+
+    await expectError(response, 401, "tenant_required")
+    expect(consumed).toEqual([])
+  })
+
   it("returns a safe error when the selected tenant cannot be read", async () => {
     const callApi = vi.fn()
     const response = await handleDocumentExtraction(
@@ -220,6 +326,97 @@ describe("document extraction BFF boundary", () => {
     )
 
     await expectError(response, 503, "tenant_unavailable")
+    expect(callApi).not.toHaveBeenCalled()
+  })
+
+  it("consumes zero unknown-length body chunks when tenant lookup fails", async () => {
+    const boundary = "tenant-error-boundary"
+    const consumed: number[] = []
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        rawFileOpening(boundary),
+        textEncoder.encode("%PDF-1.4 private"),
+        textEncoder.encode(`\r\n--${boundary}--\r\n`),
+      ], consumed, { boundary }),
+      {
+        appUrl,
+        readTenant: async () => {
+          throw new Error("private cookie detail")
+        },
+        callApi: vi.fn(),
+      },
+    )
+
+    await expectError(response, 503, "tenant_unavailable")
+    expect(consumed).toEqual([])
+  })
+
+  it("stops an oversized unknown-length body at the first excess file byte", async () => {
+    const boundary = "oversized-raw-boundary"
+    const consumed: number[] = []
+    const callApi = vi.fn()
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        rawFileOpening(boundary),
+        new Uint8Array(10_000_000),
+        new Uint8Array(1),
+        textEncoder.encode("unread private tail"),
+        textEncoder.encode(`\r\n--${boundary}--\r\n`),
+      ], consumed, { boundary }),
+      {
+        appUrl,
+        readTenant: async () => tenantId,
+        callApi,
+      },
+    )
+
+    await expectError(response, 413, "job_description_file_too_large")
+    expect(consumed).toEqual([0, 1, 2])
+    expect(callApi).not.toHaveBeenCalled()
+  })
+
+  it("rejects multipart part headers beyond the bounded parser limit", async () => {
+    const boundary = "oversized-header-boundary"
+    const consumed: number[] = []
+    const callApi = vi.fn()
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        rawFileOpening(boundary, [`X-Oversized: ${"x".repeat(8_193)}`]),
+        textEncoder.encode("%PDF-1.4"),
+        textEncoder.encode(`\r\n--${boundary}--\r\n`),
+      ], consumed, { boundary }),
+      {
+        appUrl,
+        readTenant: async () => tenantId,
+        callApi,
+      },
+    )
+
+    await expectError(response, 400, "job_description_file_required")
+    expect(callApi).not.toHaveBeenCalled()
+  })
+
+  it("rejects multipart parts beyond the bounded header count", async () => {
+    const boundary = "header-count-boundary"
+    const consumed: number[] = []
+    const callApi = vi.fn()
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        rawFileOpening(
+          boundary,
+          Array.from({ length: 7 }, (_, index) => `X-Test-${index}: value`),
+        ),
+        textEncoder.encode("%PDF-1.4"),
+        textEncoder.encode(`\r\n--${boundary}--\r\n`),
+      ], consumed, { boundary }),
+      {
+        appUrl,
+        readTenant: async () => tenantId,
+        callApi,
+      },
+    )
+
+    await expectError(response, 400, "job_description_file_required")
     expect(callApi).not.toHaveBeenCalled()
   })
 
@@ -297,12 +494,25 @@ describe("document extraction BFF boundary", () => {
     expect(callApi).not.toHaveBeenCalled()
   })
 
-  it.each([413, 415, 422, 503])(
-    "preserves approved upstream status %i",
-    async (status) => {
+  it.each([
+    [400, "job_description_file_required"],
+    [400, "tenant_required"],
+    [401, "invalid_token"],
+    [404, "tenant_not_found"],
+    [413, "job_description_file_too_large"],
+    [415, "job_description_type_unsupported"],
+    [422, "job_description_file_unreadable"],
+    [422, "job_description_text_missing"],
+    [422, "job_description_text_too_long"],
+    [422, "job_description_file_too_complex"],
+    [503, "job_description_extraction_unavailable"],
+    [503, "authentication_unavailable"],
+  ])(
+    "preserves approved upstream error %i %s",
+    async (status, code) => {
       const callApi = vi
         .fn()
-        .mockRejectedValue(new ApiError(status, `upstream_${status}`))
+        .mockRejectedValue(new ApiError(status, code))
       const response = await handleDocumentExtraction(
         uploadRequest(formWithFile()),
         {
@@ -312,14 +522,16 @@ describe("document extraction BFF boundary", () => {
         },
       )
 
-      await expectError(response, status, `upstream_${status}`)
+      await expectError(response, status, code)
     },
   )
 
   it.each([
-    [new ApiError(500, "private_backend_failure"), "private_backend_failure"],
-    [new Error("private transport detail"), "api_unavailable"],
-  ])("maps an unsafe upstream failure to 502", async (error, code) => {
+    new ApiError(500, "private_backend_failure"),
+    new ApiError(422, "private_validation_detail"),
+    new ApiError(500, "job_description_file_unreadable"),
+    new Error("private transport detail"),
+  ])("maps an unapproved upstream failure to a safe 502", async (error) => {
     const response = await handleDocumentExtraction(
       uploadRequest(formWithFile()),
       {
@@ -329,7 +541,7 @@ describe("document extraction BFF boundary", () => {
       },
     )
 
-    await expectError(response, 502, code)
+    await expectError(response, 502, "api_unavailable")
   })
 
   it("forwards the caller abort signal to the upstream request", async () => {

@@ -1,25 +1,26 @@
 import asyncio
 import logging
-import threading
+import multiprocessing
+import os
+import time
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
-from io import BytesIO
+from multiprocessing.connection import Connection
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
+from httpx import Response
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
-from starlette.datastructures import Headers
-from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from app.core.config import Settings
 from app.core.database import Base, get_db
 from app.identity.models import Membership, Tenant, User
-from app.identity.schemas import IdentityClaims, RequestContext, Role
+from app.identity.schemas import IdentityClaims, Role
 from app.jobs.document_extraction import (
     DOCX_MEDIA_TYPE,
     DefaultJobDescriptionExtractor,
@@ -27,7 +28,10 @@ from app.jobs.document_extraction import (
     ExtractedJobDescription,
     JobDescriptionExtractor,
 )
-from app.jobs.document_router import extract_job_description
+from app.jobs.document_runner import (
+    JobDescriptionExtractionRunner,
+    ProcessJobDescriptionExtractionRunner,
+)
 from app.jobs.models import Job, ScorecardVersion
 from app.main import create_app
 from tests.job_description_fixtures import readable_docx, readable_pdf
@@ -41,26 +45,49 @@ class StaticVerifier:
         return self.claims
 
 
-class ReleasableBlockingExtractor:
-    def __init__(self) -> None:
-        self.entered = threading.Event()
-        self.release = threading.Event()
-        self.finished = threading.Event()
+class InlineExtractionRunner:
+    def __init__(self, extractor: JobDescriptionExtractor) -> None:
+        self.extractor = extractor
 
-    def extract(
-        self, *, data: bytes, filename: str, media_type: str | None
+    async def run(
+        self,
+        *,
+        data: bytes,
+        filename: str,
+        media_type: str | None,
+        timeout_seconds: float,
     ) -> ExtractedJobDescription:
-        self.entered.set()
-        try:
-            if not self.release.wait(timeout=1):
-                raise RuntimeError("test extractor release timed out")
-            return ExtractedJobDescription(
-                text="late text",
-                filename=filename,
-                media_type=media_type or "application/pdf",
-            )
-        finally:
-            self.finished.set()
+        return self.extractor.extract(
+            data=data,
+            filename=filename,
+            media_type=media_type,
+        )
+
+
+class TimeoutExtractionRunner:
+    async def run(
+        self,
+        *,
+        data: bytes,
+        filename: str,
+        media_type: str | None,
+        timeout_seconds: float,
+    ) -> ExtractedJobDescription:
+        raise TimeoutError("controlled runner timeout")
+
+
+def blocking_process_worker(
+    _connection: Connection,
+    _data: bytes,
+    _filename: str,
+    _media_type: str | None,
+) -> None:
+    Path(os.environ["DOCUMENT_TEST_WORKER_MARKER"]).write_text(
+        str(os.getpid()),
+        encoding="utf-8",
+    )
+    while True:
+        time.sleep(1)
 
 
 class RaisingExtractor:
@@ -70,14 +97,10 @@ class RaisingExtractor:
         raise RuntimeError(f"parser exposed {filename}: confidential extracted text")
 
 
-class ThreadRecordingExtractor:
-    def __init__(self) -> None:
-        self.thread_id: int | None = None
-
+class SuccessfulExtractor:
     def extract(
         self, *, data: bytes, filename: str, media_type: str | None
     ) -> ExtractedJobDescription:
-        self.thread_id = threading.get_ident()
         return ExtractedJobDescription(
             text="Senior Product Designer",
             filename=filename,
@@ -95,35 +118,12 @@ class TypedErrorExtractor:
         raise DocumentExtractionError(self.code)
 
 
-class LifecycleUpload(UploadFile):
-    def __init__(
-        self,
-        data: bytes | None = None,
-        *,
-        filename: str = "close-me.pdf",
-    ) -> None:
-        super().__init__(
-            file=BytesIO(readable_pdf() if data is None else data),
-            filename=filename,
-            headers=Headers({"content-type": "application/pdf"}),
-        )
-        self.close_completed = False
-
-    async def close(self) -> None:
-        await asyncio.sleep(0)
-        await super().close()
-        self.close_completed = True
-
-
-class ReadFailureUpload(LifecycleUpload):
-    async def read(self, size: int = -1) -> bytes:
-        raise OSError("controlled upload read failure")
-
-
 @contextmanager
 def _document_api(
     monkeypatch: pytest.MonkeyPatch,
-    extractor: JobDescriptionExtractor,
+    extractor: JobDescriptionExtractor | None = None,
+    *,
+    runner: JobDescriptionExtractionRunner | None = None,
 ) -> Iterator[dict[str, Any]]:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
@@ -147,9 +147,12 @@ def _document_api(
         other_tenant_id = other_tenant.id
         session.commit()
 
+    selected_runner = runner or InlineExtractionRunner(
+        extractor or DefaultJobDescriptionExtractor()
+    )
     app = create_app(
         Settings.for_test(),
-        job_description_extractor=extractor,
+        job_description_extraction_runner=selected_runner,
     )
     app.state.token_verifier = StaticVerifier(
         IdentityClaims(
@@ -181,6 +184,7 @@ def _document_api(
     try:
         with TestClient(app, raise_server_exceptions=False) as api:
             yield {
+                "app": app,
                 "api": api,
                 "headers": {
                     "Authorization": "Bearer signed-token",
@@ -208,6 +212,96 @@ def _post_files(document_api: dict[str, Any], parts: list[tuple[str, bytes, str]
         headers=document_api["headers"],
         files=[("file", part) for part in parts],
     )
+
+
+def _multipart_part(
+    boundary: str,
+    *,
+    name: str,
+    contents: bytes,
+    filename: str | None = None,
+    media_type: str | None = None,
+    extra_headers: tuple[tuple[str, str], ...] = (),
+) -> bytes:
+    disposition = f'Content-Disposition: form-data; name="{name}"'
+    if filename is not None:
+        disposition += f'; filename="{filename}"'
+    headers = [disposition]
+    if media_type is not None:
+        headers.append(f"Content-Type: {media_type}")
+    headers.extend(f"{key}: {value}" for key, value in extra_headers)
+    header_block = "\r\n".join(headers)
+    return f"--{boundary}\r\n{header_block}\r\n\r\n".encode() + contents + b"\r\n"
+
+
+def _streaming_post(
+    document_api: dict[str, Any],
+    chunks: list[tuple[str, bytes]],
+    *,
+    headers: dict[str, str],
+) -> tuple[Any, list[str]]:
+    consumed: list[str] = []
+
+    async def invoke() -> Response:
+        chunk_index = 0
+        response_complete = asyncio.Event()
+        response_status = 500
+        response_headers: list[tuple[bytes, bytes]] = []
+        response_body = bytearray()
+
+        async def receive() -> dict[str, object]:
+            nonlocal chunk_index
+            if chunk_index < len(chunks):
+                label, chunk = chunks[chunk_index]
+                chunk_index += 1
+                consumed.append(label)
+                return {
+                    "type": "http.request",
+                    "body": chunk,
+                    "more_body": chunk_index < len(chunks),
+                }
+            await response_complete.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, Any]) -> None:
+            nonlocal response_status, response_headers
+            if message["type"] == "http.response.start":
+                response_status = message["status"]
+                response_headers = message.get("headers", [])
+            elif message["type"] == "http.response.body":
+                response_body.extend(message.get("body", b""))
+                if not message.get("more_body", False):
+                    response_complete.set()
+
+        raw_headers = [
+            (key.lower().encode(), value.encode()) for key, value in headers.items()
+        ]
+        await document_api["app"](
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "https",
+                "path": "/api/v1/job-descriptions/extract",
+                "raw_path": b"/api/v1/job-descriptions/extract",
+                "query_string": b"",
+                "root_path": "",
+                "headers": raw_headers,
+                "client": ("127.0.0.1", 50000),
+                "server": ("testserver", 443),
+                "state": {},
+            },
+            receive,
+            send,
+        )
+        return Response(
+            response_status,
+            headers=response_headers,
+            content=bytes(response_body),
+        )
+
+    return asyncio.run(invoke()), consumed
 
 
 def test_pdf_extraction_returns_text_without_persisting_domain_rows(
@@ -320,6 +414,32 @@ def test_extraction_requires_authentication(document_api: dict[str, Any]) -> Non
     assert response.json() == {"detail": {"code": "invalid_token"}}
 
 
+def test_unauthenticated_raw_stream_consumes_zero_body_chunks(
+    document_api: dict[str, Any],
+) -> None:
+    boundary = "unauthenticated-boundary"
+    response, consumed = _streaming_post(
+        document_api,
+        [
+            (
+                "file",
+                _multipart_part(
+                    boundary,
+                    name="file",
+                    filename="role.pdf",
+                    media_type="application/pdf",
+                    contents=readable_pdf(),
+                ),
+            ),
+            ("closing", f"--{boundary}--\r\n".encode()),
+        ],
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 401
+    assert consumed == []
+
+
 def test_extraction_denies_an_authenticated_principal_outside_the_tenant(
     document_api: dict[str, Any],
 ) -> None:
@@ -336,6 +456,227 @@ def test_extraction_denies_an_authenticated_principal_outside_the_tenant(
     assert response.json() == {"detail": {"code": "tenant_not_found"}}
 
 
+def test_non_member_raw_stream_consumes_zero_body_chunks(
+    document_api: dict[str, Any],
+) -> None:
+    boundary = "non-member-boundary"
+    response, consumed = _streaming_post(
+        document_api,
+        [
+            (
+                "file",
+                _multipart_part(
+                    boundary,
+                    name="file",
+                    filename="role.pdf",
+                    media_type="application/pdf",
+                    contents=readable_pdf(),
+                ),
+            ),
+            ("closing", f"--{boundary}--\r\n".encode()),
+        ],
+        headers={
+            "Authorization": "Bearer signed-token",
+            "X-Tenant-ID": str(document_api["other_tenant_id"]),
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+
+    assert response.status_code == 404
+    assert consumed == []
+
+
+def test_chunked_oversized_raw_stream_stops_at_the_first_excess_byte(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _document_api(monkeypatch, SuccessfulExtractor()) as document_api:
+        boundary = "oversized-stream-boundary"
+        opening = _multipart_part(
+            boundary,
+            name="file",
+            filename="role.pdf",
+            media_type="application/pdf",
+            contents=b"",
+        )[:-2]
+        response, consumed = _streaming_post(
+            document_api,
+            [
+                ("opening", opening),
+                ("limit", b"x" * 10_000_000),
+                ("overflow", b"x"),
+                ("unread-file-tail", b"private tail"),
+                ("unread-closing", f"\r\n--{boundary}--\r\n".encode()),
+            ],
+            headers={
+                **document_api["headers"],
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": {"code": "job_description_file_too_large"}}
+    assert consumed == ["opening", "limit", "overflow"]
+
+
+def test_raw_stream_accepts_the_exact_ten_million_byte_file_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _document_api(monkeypatch, SuccessfulExtractor()) as document_api:
+        boundary = "exact-file-boundary"
+        opening = _multipart_part(
+            boundary,
+            name="file",
+            filename="role.pdf",
+            media_type="application/pdf",
+            contents=b"",
+        )[:-2]
+        response, consumed = _streaming_post(
+            document_api,
+            [
+                ("opening", opening),
+                ("file", b"x" * 10_000_000),
+                ("closing", f"\r\n--{boundary}--\r\n".encode()),
+            ],
+            headers={
+                **document_api["headers"],
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+
+    assert response.status_code == 200
+    assert consumed == ["opening", "file", "closing"]
+
+
+@pytest.mark.parametrize("unexpected_position", ["before", "after"])
+def test_raw_multipart_rejects_an_extra_non_file_part(
+    monkeypatch: pytest.MonkeyPatch,
+    unexpected_position: str,
+) -> None:
+    with _document_api(monkeypatch, SuccessfulExtractor()) as document_api:
+        boundary = "extra-field-boundary"
+        file_part = _multipart_part(
+            boundary,
+            name="file",
+            filename="role.pdf",
+            media_type="application/pdf",
+            contents=b"%PDF-1.4",
+        )
+        field_part = _multipart_part(
+            boundary,
+            name="job_id",
+            contents=b"private-job",
+        )
+        ordered = (
+            field_part + file_part
+            if unexpected_position == "before"
+            else file_part + field_part
+        )
+        response, _ = _streaming_post(
+            document_api,
+            [("body", ordered + f"--{boundary}--\r\n".encode())],
+            headers={
+                **document_api["headers"],
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"code": "job_description_file_required"}}
+
+
+def test_raw_multipart_rejects_oversized_part_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _document_api(monkeypatch, SuccessfulExtractor()) as document_api:
+        boundary = "header-limit-boundary"
+        response, _ = _streaming_post(
+            document_api,
+            [
+                (
+                    "body",
+                    _multipart_part(
+                        boundary,
+                        name="file",
+                        filename="role.pdf",
+                        media_type="application/pdf",
+                        contents=b"%PDF-1.4",
+                        extra_headers=(("X-Oversized", "x" * 1_025),),
+                    )
+                    + f"--{boundary}--\r\n".encode(),
+                )
+            ],
+            headers={
+                **document_api["headers"],
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"code": "job_description_file_required"}}
+
+
+def test_raw_multipart_rejects_too_many_part_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _document_api(monkeypatch, SuccessfulExtractor()) as document_api:
+        boundary = "header-count-boundary"
+        response, _ = _streaming_post(
+            document_api,
+            [
+                (
+                    "body",
+                    _multipart_part(
+                        boundary,
+                        name="file",
+                        filename="role.pdf",
+                        media_type="application/pdf",
+                        contents=b"%PDF-1.4",
+                        extra_headers=tuple(
+                            (f"X-Header-{index}", "value") for index in range(7)
+                        ),
+                    )
+                    + f"--{boundary}--\r\n".encode(),
+                )
+            ],
+            headers={
+                **document_api["headers"],
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"code": "job_description_file_required"}}
+
+
+def test_raw_multipart_requires_a_complete_closing_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _document_api(monkeypatch, SuccessfulExtractor()) as document_api:
+        boundary = "malformed-boundary"
+        response, _ = _streaming_post(
+            document_api,
+            [
+                (
+                    "body",
+                    _multipart_part(
+                        boundary,
+                        name="file",
+                        filename="role.pdf",
+                        media_type="application/pdf",
+                        contents=b"%PDF-1.4",
+                    ),
+                )
+            ],
+            headers={
+                **document_api["headers"],
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"code": "job_description_file_required"}}
+
+
 def test_openapi_documents_stable_extraction_responses() -> None:
     operation = create_app().openapi()["paths"]["/api/v1/job-descriptions/extract"][
         "post"
@@ -350,83 +691,62 @@ def test_openapi_documents_stable_extraction_responses() -> None:
         "422",
         "503",
     }
-
-
-def test_oversized_upload_reads_no_more_than_limit_plus_one_byte(
-    document_api: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    original_read = StarletteUploadFile.read
-    requested_sizes: list[int] = []
-    returned_bytes = 0
-
-    async def tracked_read(self: StarletteUploadFile, size: int = -1) -> bytes:
-        nonlocal returned_bytes
-        requested_sizes.append(size)
-        chunk = await original_read(self, size)
-        returned_bytes += len(chunk)
-        return chunk
-
-    monkeypatch.setattr(StarletteUploadFile, "read", tracked_read)
-
-    response = _post_files(
-        document_api,
-        [("oversized.pdf", b"x" * 10_100_000, "application/pdf")],
-    )
-
-    assert response.status_code == 413
-    assert returned_bytes == 10_000_001
-    assert max(requested_sizes) == 64 * 1024
-
-
-def test_extractor_runs_off_the_request_event_loop_thread(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    extractor = ThreadRecordingExtractor()
-    original_read = StarletteUploadFile.read
-    read_thread_ids: set[int] = set()
-
-    async def tracked_read(self: StarletteUploadFile, size: int = -1) -> bytes:
-        read_thread_ids.add(threading.get_ident())
-        return await original_read(self, size)
-
-    monkeypatch.setattr(StarletteUploadFile, "read", tracked_read)
-    with _document_api(monkeypatch, extractor) as document_api:
-        response = _post_files(
-            document_api,
-            [("role.pdf", readable_pdf(), "application/pdf")],
-        )
-
-    assert response.status_code == 200
-    assert len(read_thread_ids) == 1
-    assert extractor.thread_id is not None
-    assert extractor.thread_id not in read_thread_ids
+    assert operation["requestBody"] == {
+        "required": True,
+        "content": {
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["file"],
+                    "properties": {"file": {"type": "string", "format": "binary"}},
+                }
+            }
+        },
+    }
 
 
 def test_extractor_timeout_returns_stable_unavailable_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "app.jobs.document_router.EXTRACTION_TIMEOUT_SECONDS",
-        0.01,
-        raising=False,
-    )
-    extractor = ReleasableBlockingExtractor()
-    with _document_api(monkeypatch, extractor) as document_api:
-        try:
-            response = _post_files(
-                document_api,
-                [("slow.pdf", readable_pdf(), "application/pdf")],
-            )
-        finally:
-            extractor.release.set()
-            assert extractor.finished.wait(timeout=1)
+    with _document_api(
+        monkeypatch,
+        runner=TimeoutExtractionRunner(),
+    ) as document_api:
+        response = _post_files(
+            document_api,
+            [("slow.pdf", readable_pdf(), "application/pdf")],
+        )
 
     assert response.status_code == 503
-    assert extractor.entered.is_set()
     assert response.json() == {
         "detail": {"code": "job_description_extraction_unavailable"}
     }
+
+
+def test_timeout_does_not_return_while_real_parser_work_is_still_alive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "app.jobs.document_router.EXTRACTION_TIMEOUT_SECONDS",
+        3.0,
+        raising=False,
+    )
+    marker = tmp_path / "blocking-worker.pid"
+    monkeypatch.setenv("DOCUMENT_TEST_WORKER_MARKER", str(marker))
+    runner = ProcessJobDescriptionExtractionRunner(blocking_process_worker)
+    with _document_api(monkeypatch, runner=runner) as document_api:
+        response = _post_files(
+            document_api,
+            [("slow.pdf", b"blocking worker input", "application/pdf")],
+        )
+
+    assert response.status_code == 503
+    worker_pid = int(marker.read_text(encoding="utf-8"))
+    assert worker_pid not in {child.pid for child in multiprocessing.active_children()}
+    with pytest.raises(ProcessLookupError):
+        os.kill(worker_pid, 0)
 
 
 def test_unexpected_extractor_error_is_redacted_from_response_and_logs(
@@ -452,123 +772,3 @@ def test_unexpected_extractor_error_is_redacted_from_response_and_logs(
     assert "confidential extracted text" not in serialized
     assert filename not in response.text
     assert "confidential extracted text" not in response.text
-
-
-@pytest.mark.parametrize(
-    ("extractor", "expected_status"),
-    [
-        (DefaultJobDescriptionExtractor(), 200),
-        (RaisingExtractor(), 503),
-        (TypedErrorExtractor("job_description_text_missing"), 422),
-    ],
-)
-def test_upload_close_is_awaited_on_success_and_extractor_failures(
-    extractor: JobDescriptionExtractor,
-    expected_status: int,
-) -> None:
-    upload = LifecycleUpload()
-    context = RequestContext(tenant_id=uuid4(), user_id=uuid4(), role=Role.OWNER)
-
-    async def invoke() -> int:
-        try:
-            await extract_job_description(
-                _context=context,
-                extractor=extractor,
-                files=[upload],
-            )
-        except HTTPException as error:
-            return error.status_code
-        return 200
-
-    assert asyncio.run(invoke()) == expected_status
-    assert upload.close_completed is True
-
-
-@pytest.mark.parametrize(
-    ("upload", "expected_status"),
-    [
-        (LifecycleUpload(b"x" * 10_000_001), 413),
-        (ReadFailureUpload(), 503),
-    ],
-)
-def test_upload_close_is_awaited_on_bounded_read_failures(
-    upload: LifecycleUpload,
-    expected_status: int,
-) -> None:
-    context = RequestContext(tenant_id=uuid4(), user_id=uuid4(), role=Role.OWNER)
-
-    async def invoke() -> int:
-        try:
-            await extract_job_description(
-                _context=context,
-                extractor=DefaultJobDescriptionExtractor(),
-                files=[upload],
-            )
-        except HTTPException as error:
-            return error.status_code
-        return 200
-
-    assert asyncio.run(invoke()) == expected_status
-    assert upload.close_completed is True
-
-
-def test_upload_close_is_awaited_on_timeout_without_leaving_worker_work(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    upload = LifecycleUpload()
-    context = RequestContext(tenant_id=uuid4(), user_id=uuid4(), role=Role.OWNER)
-    cancelled = False
-
-    async def controlled_to_thread(*args: object, **kwargs: object) -> object:
-        nonlocal cancelled
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
-        raise AssertionError("controlled to_thread unexpectedly completed")
-
-    monkeypatch.setattr(
-        "app.jobs.document_router.EXTRACTION_TIMEOUT_SECONDS",
-        0.001,
-    )
-    monkeypatch.setattr(
-        "app.jobs.document_router.asyncio.to_thread",
-        controlled_to_thread,
-    )
-
-    async def invoke() -> int:
-        try:
-            await extract_job_description(
-                _context=context,
-                extractor=DefaultJobDescriptionExtractor(),
-                files=[upload],
-            )
-        except HTTPException as error:
-            return error.status_code
-        return 200
-
-    assert asyncio.run(invoke()) == 503
-    assert cancelled is True
-    assert upload.close_completed is True
-
-
-def test_every_upload_close_is_awaited_when_cardinality_is_invalid() -> None:
-    first = LifecycleUpload(filename="one.pdf")
-    second = LifecycleUpload(filename="two.pdf")
-    uploads: list[UploadFile] = [first, second]
-    context = RequestContext(tenant_id=uuid4(), user_id=uuid4(), role=Role.OWNER)
-
-    async def invoke() -> int:
-        try:
-            await extract_job_description(
-                _context=context,
-                extractor=DefaultJobDescriptionExtractor(),
-                files=uploads,
-            )
-        except HTTPException as error:
-            return error.status_code
-        return 200
-
-    assert asyncio.run(invoke()) == 400
-    assert [first.close_completed, second.close_completed] == [True, True]

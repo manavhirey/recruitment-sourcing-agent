@@ -59,6 +59,7 @@ export function JobDescriptionUpload({
   const [error, setError] = useState<string | null>(null)
   const [canRetry, setCanRetry] = useState(false)
   const intent = useRef<ExtractionIntent | null>(null)
+  const extractionInFlight = useRef(false)
   const errorAlert = useRef<HTMLParagraphElement>(null)
   const replaceButton = useRef<HTMLButtonElement>(null)
 
@@ -74,7 +75,8 @@ export function JobDescriptionUpload({
 
   async function extract() {
     const current = intent.current
-    if (!current || extracting) return
+    if (!current || disabled || extractionInFlight.current) return
+    extractionInFlight.current = true
     setError(null)
     setExtracting(true)
     onBusyChange(true)
@@ -94,12 +96,14 @@ export function JobDescriptionUpload({
     } catch (reason) {
       showError(reason instanceof Error ? reason.message : "job_description_extraction_unavailable")
     } finally {
+      extractionInFlight.current = false
       setExtracting(false)
       onBusyChange(false)
     }
   }
 
   function clearIntent() {
+    if (disabled || extractionInFlight.current) return
     intent.current = null
     setCanRetry(false)
     setConfirming(false)
@@ -108,7 +112,7 @@ export function JobDescriptionUpload({
   function selectFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.currentTarget.files?.[0]
     event.currentTarget.value = ""
-    if (!file) return
+    if (!file || disabled || extractionInFlight.current) return
     setError(null)
     const mediaType = inferredMediaType(file)
     if (!mediaType) {
@@ -147,7 +151,16 @@ export function JobDescriptionUpload({
       {error ? (
         <div className="upload-error">
           <p ref={errorAlert} className="field-error" role="alert" tabIndex={-1}>{error}</p>
-          {canRetry ? <button className="button button-secondary" type="button" onClick={() => void extract()}>Try again</button> : null}
+          {canRetry ? (
+            <button
+              className="button button-secondary"
+              type="button"
+              disabled={disabled || extracting}
+              onClick={() => void extract()}
+            >
+              Try again
+            </button>
+          ) : null}
         </div>
       ) : null}
       {confirming ? (
@@ -159,12 +172,21 @@ export function JobDescriptionUpload({
           <h3 id="replace-job-description-heading">Replace job description?</h3>
           <p>The uploaded document will replace the current job-description text. You can still edit the extracted text before generating a scorecard.</p>
           <div className="dialog-actions">
-            <button className="button button-secondary" type="button" onClick={clearIntent}>Keep existing text</button>
+            <button
+              className="button button-secondary"
+              type="button"
+              disabled={disabled || extracting}
+              onClick={clearIntent}
+            >
+              Keep existing text
+            </button>
             <button
               ref={replaceButton}
               className="button button-primary"
               type="button"
+              disabled={disabled || extracting}
               onClick={() => {
+                if (disabled || extractionInFlight.current) return
                 setConfirming(false)
                 void extract()
               }}

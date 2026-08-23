@@ -899,11 +899,6 @@ export interface components {
              */
             readonly id: string;
         };
-        /** Body_extract_job_description_api_v1_job_descriptions_extract_post */
-        readonly Body_extract_job_description_api_v1_job_descriptions_extract_post: {
-            /** File */
-            readonly file?: readonly string[] | null;
-        };
         /** CandidateDirectoryItem */
         readonly CandidateDirectoryItem: {
             /** Current Company */
@@ -2416,9 +2411,12 @@ export interface operations {
             readonly path?: never;
             readonly cookie?: never;
         };
-        readonly requestBody?: {
+        readonly requestBody: {
             readonly content: {
-                readonly "multipart/form-data": components["schemas"]["Body_extract_job_description_api_v1_job_descriptions_extract_post"];
+                readonly "multipart/form-data": {
+                    /** Format: binary */
+                    readonly file: string;
+                };
             };
         };
         readonly responses: {

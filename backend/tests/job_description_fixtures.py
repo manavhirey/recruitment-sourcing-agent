@@ -178,6 +178,18 @@ def pdf_with_pages(count: int) -> bytes:
     return output.getvalue()
 
 
+def pdf_with_decoded_content_sizes(sizes: tuple[int, ...]) -> bytes:
+    output = BytesIO()
+    writer = PdfWriter()
+    for size in sizes:
+        page = writer.add_blank_page(width=612, height=792)
+        stream = DecodedStreamObject()
+        stream.set_data(b" " * size)
+        page[NameObject("/Contents")] = writer._add_object(stream.flate_encode(9))
+    writer.write(output)
+    return output.getvalue()
+
+
 def docx_package_with_entries(count: int) -> bytes:
     output = BytesIO()
     with ZipFile(output, "w", ZIP_DEFLATED) as package:
@@ -255,9 +267,13 @@ def _patch_zip_member_headers(
             raise AssertionError(f"{filename!r} ZIP record not found")
 
 
-def docx_with_nested_archive(*, extension: str = ".zip") -> bytes:
+def docx_with_nested_archive(
+    *,
+    extension: str = ".zip",
+    signature: bytes = b"PK\x03\x04",
+) -> bytes:
     output = BytesIO(readable_docx())
     output.seek(0, 2)
     with ZipFile(output, "a", ZIP_DEFLATED) as package:
-        package.writestr(f"word/embeddings/nested{extension}", b"PK\x03\x04nested")
+        package.writestr(f"word/embeddings/nested{extension}", signature + b"nested")
     return output.getvalue()

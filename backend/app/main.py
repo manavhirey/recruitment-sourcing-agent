@@ -27,11 +27,11 @@ from app.core.telemetry import (
 )
 from app.crm.router import router as crm_router
 from app.identity.router import router as identity_router
-from app.jobs.document_extraction import (
-    DefaultJobDescriptionExtractor,
-    JobDescriptionExtractor,
-)
 from app.jobs.document_router import router as document_router
+from app.jobs.document_runner import (
+    JobDescriptionExtractionRunner,
+    ProcessJobDescriptionExtractionRunner,
+)
 from app.jobs.llm import OpenAIResponsesScorecardGateway, ScorecardGateway
 from app.jobs.router import router as jobs_router
 from app.privacy.router import router as privacy_router
@@ -142,7 +142,7 @@ def _dispatch_privacy_request(request_id: UUID, tenant_id: UUID) -> None:
 def create_app(
     settings: Settings | None = None,
     *,
-    job_description_extractor: JobDescriptionExtractor | None = None,
+    job_description_extraction_runner: JobDescriptionExtractionRunner | None = None,
     scorecard_gateway: ScorecardGateway | None = None,
     sourcing_dispatcher: SourcingDispatcher | None = None,
     enrichment_dispatcher: EnrichmentDispatcher | None = None,
@@ -156,10 +156,10 @@ def create_app(
     app.add_middleware(TransactionBoundaryMiddleware)
     app.state.settings = settings or get_settings()
     app.state.token_verifier = TokenVerifier(app.state.settings)
-    app.state.job_description_extractor = (
-        job_description_extractor
-        if job_description_extractor is not None
-        else DefaultJobDescriptionExtractor()
+    app.state.job_description_extraction_runner = (
+        job_description_extraction_runner
+        if job_description_extraction_runner is not None
+        else ProcessJobDescriptionExtractionRunner()
     )
     app.state.scorecard_gateway = scorecard_gateway or OpenAIResponsesScorecardGateway(
         OpenAI(api_key=app.state.settings.openai_api_key.get_secret_value()),

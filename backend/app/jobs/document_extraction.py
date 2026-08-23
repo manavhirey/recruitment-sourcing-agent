@@ -18,6 +18,7 @@ from app.core.errors import AppError
 MAX_FILE_BYTES = 10_000_000
 MAX_TEXT_LENGTH = 50_000
 MAX_PDF_PAGES = 200
+MAX_PDF_DECODED_BYTES = 50_000_000
 MAX_DOCX_ENTRIES = 2_000
 MAX_DOCX_EXPANDED_BYTES = 50_000_000
 DOCX_VALIDATION_CHUNK_BYTES = 64 * 1024
@@ -28,6 +29,12 @@ DOCX_MEDIA_TYPE = (
 )
 PDF_SIGNATURE = b"%PDF-"
 ZIP_SIGNATURE = b"PK\x03\x04"
+ZIP_SIGNATURES = (
+    ZIP_SIGNATURE,
+    b"PK\x01\x02",
+    b"PK\x05\x06",
+    b"PK\x07\x08",
+)
 OLE_SIGNATURE = bytes.fromhex("D0 CF 11 E0 A1 B1 1A E1")
 REQUIRED_DOCX_MEMBERS = {"[Content_Types].xml", "word/document.xml"}
 SUPPORTED_DOCX_COMPRESSION = {ZIP_STORED, ZIP_DEFLATED}
@@ -99,6 +106,14 @@ def _pdf_text(data: bytes) -> str:
             raise DocumentExtractionError("job_description_file_unreadable")
         if len(reader.pages) > MAX_PDF_PAGES:
             raise DocumentExtractionError("job_description_file_too_complex")
+        decoded_bytes = 0
+        for page in reader.pages:
+            contents = page.get_contents()
+            if contents is None:
+                continue
+            decoded_bytes += len(contents.get_data())
+            if decoded_bytes > MAX_PDF_DECODED_BYTES:
+                raise DocumentExtractionError("job_description_file_too_complex")
         return "\n\n".join(page.extract_text() or "" for page in reader.pages)
     except DocumentExtractionError:
         raise
@@ -162,7 +177,7 @@ def _validate_docx_package(data: bytes) -> None:
 
             if entry_size != entry.file_size or entry_crc != entry.CRC:
                 raise DocumentExtractionError("job_description_file_unreadable")
-            if signature == ZIP_SIGNATURE:
+            if signature in ZIP_SIGNATURES:
                 raise DocumentExtractionError("job_description_file_too_complex")
 
 

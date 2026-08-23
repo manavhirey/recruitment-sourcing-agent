@@ -19,6 +19,7 @@ from tests.job_description_fixtures import (
     empty_pdf,
     encrypted_pdf,
     interleaved_docx,
+    pdf_with_decoded_content_sizes,
     pdf_with_pages,
     readable_docx,
     readable_pdf,
@@ -273,6 +274,18 @@ def test_rejects_pdf_with_more_than_two_hundred_pages(
     )
 
 
+def test_rejects_aggregate_pdf_decoded_content_over_fifty_million_bytes(
+    extractor: DefaultJobDescriptionExtractor,
+) -> None:
+    assert_extraction_error(
+        extractor,
+        data=pdf_with_decoded_content_sizes((25_000_001, 25_000_000)),
+        filename="role.pdf",
+        media_type=PDF_MEDIA_TYPE,
+        code="job_description_file_too_complex",
+    )
+
+
 def test_rejects_docx_with_more_than_two_thousand_archive_entries(
     extractor: DefaultJobDescriptionExtractor,
 ) -> None:
@@ -317,6 +330,24 @@ def test_rejects_nested_archive_by_name_or_signature(
     assert_extraction_error(
         extractor,
         data=docx_with_nested_archive(extension=extension),
+        filename="role.docx",
+        media_type=DOCX_MEDIA_TYPE,
+        code="job_description_file_too_complex",
+    )
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [b"PK\x01\x02", b"PK\x05\x06", b"PK\x07\x08"],
+    ids=["central-directory", "empty-archive", "spanned-archive"],
+)
+def test_rejects_extensionless_nested_archive_for_every_zip_signature(
+    extractor: DefaultJobDescriptionExtractor,
+    signature: bytes,
+) -> None:
+    assert_extraction_error(
+        extractor,
+        data=docx_with_nested_archive(extension="", signature=signature),
         filename="role.docx",
         media_type=DOCX_MEDIA_TYPE,
         code="job_description_file_too_complex",

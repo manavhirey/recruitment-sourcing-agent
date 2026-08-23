@@ -1,22 +1,24 @@
 import asyncio
+from contextlib import suppress
 from typing import Annotated, NoReturn
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request
+from starlette.requests import ClientDisconnect
 
 from app.identity.dependencies import get_request_context
 from app.identity.schemas import RequestContext
 from app.jobs.document_extraction import (
-    MAX_FILE_BYTES,
-    DefaultJobDescriptionExtractor,
     DocumentExtractionError,
-    JobDescriptionExtractor,
+    ExtractedJobDescription,
 )
+from app.jobs.document_multipart import read_job_description_upload
+from app.jobs.document_runner import JobDescriptionExtractionRunner
 from app.jobs.schemas import JobDescriptionExtractionResponse
 
 router = APIRouter(prefix="/api/v1/job-descriptions", tags=["jobs"])
 
-READ_CHUNK_BYTES = 64 * 1024
 EXTRACTION_TIMEOUT_SECONDS = 10
+DISCONNECT_POLL_SECONDS = 0.05
 
 _DOCUMENT_ERROR_STATUS = {
     "job_description_file_required": 400,
@@ -30,11 +32,10 @@ _DOCUMENT_ERROR_STATUS = {
 }
 
 
-def get_document_extractor(request: Request) -> JobDescriptionExtractor:
-    extractor = getattr(request.app.state, "job_description_extractor", None)
-    if extractor is None:
-        return DefaultJobDescriptionExtractor()
-    return extractor
+def get_document_extraction_runner(
+    request: Request,
+) -> JobDescriptionExtractionRunner:
+    return request.app.state.job_description_extraction_runner
 
 
 def _raise_document_error(error: DocumentExtractionError) -> NoReturn:
@@ -46,16 +47,55 @@ def _raise_document_error(error: DocumentExtractionError) -> NoReturn:
     raise HTTPException(status_code=status_code, detail={"code": code}) from error
 
 
-async def _read_at_most(upload: UploadFile, max_bytes: int) -> bytes:
-    contents = bytearray()
+async def _wait_for_disconnect(request: Request) -> None:
     while True:
-        remaining = max_bytes + 1 - len(contents)
-        chunk = await upload.read(min(READ_CHUNK_BYTES, remaining))
-        if not chunk:
-            return bytes(contents)
-        contents.extend(chunk)
-        if len(contents) > max_bytes:
-            raise DocumentExtractionError("job_description_file_too_large")
+        try:
+            message = await asyncio.wait_for(
+                request.receive(),
+                timeout=DISCONNECT_POLL_SECONDS,
+            )
+        except TimeoutError:
+            continue
+        if message["type"] == "http.disconnect":
+            return
+
+
+async def _run_extraction(
+    request: Request,
+    runner: JobDescriptionExtractionRunner,
+    *,
+    data: bytes,
+    filename: str,
+    media_type: str | None,
+) -> ExtractedJobDescription:
+    worker = asyncio.create_task(
+        runner.run(
+            data=data,
+            filename=filename,
+            media_type=media_type,
+            timeout_seconds=EXTRACTION_TIMEOUT_SECONDS,
+        )
+    )
+    disconnect = asyncio.create_task(_wait_for_disconnect(request))
+    try:
+        finished, _ = await asyncio.wait(
+            (worker, disconnect),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnect in finished:
+            worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker
+            raise ClientDisconnect()
+        return await worker
+    finally:
+        disconnect.cancel()
+        if not worker.done():
+            worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker
+        with suppress(asyncio.CancelledError):
+            await disconnect
 
 
 @router.post(
@@ -69,28 +109,39 @@ async def _read_at_most(upload: UploadFile, max_bytes: int) -> bytes:
         422: {"description": "The uploaded document could not be extracted safely."},
         503: {"description": "Document extraction is temporarily unavailable."},
     },
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["file"],
+                        "properties": {"file": {"type": "string", "format": "binary"}},
+                    }
+                }
+            },
+        }
+    },
 )
 async def extract_job_description(
+    request: Request,
     _context: Annotated[RequestContext, Depends(get_request_context)],
-    extractor: Annotated[JobDescriptionExtractor, Depends(get_document_extractor)],
-    files: Annotated[list[UploadFile] | None, File(alias="file")] = None,
+    runner: Annotated[
+        JobDescriptionExtractionRunner,
+        Depends(get_document_extraction_runner),
+    ],
 ) -> JobDescriptionExtractionResponse:
-    uploads = files or []
-    if len(uploads) != 1:
-        for upload in uploads:
-            await upload.close()
-        _raise_document_error(DocumentExtractionError("job_description_file_required"))
-
-    upload = uploads[0]
     try:
-        data = await _read_at_most(upload, MAX_FILE_BYTES)
-        async with asyncio.timeout(EXTRACTION_TIMEOUT_SECONDS):
-            result = await asyncio.to_thread(
-                extractor.extract,
-                data=data,
-                filename=upload.filename or "",
-                media_type=upload.content_type,
-            )
+        upload = await read_job_description_upload(request)
+        result = await _run_extraction(
+            request,
+            runner,
+            data=upload.data,
+            filename=upload.filename,
+            media_type=upload.media_type,
+        )
     except TimeoutError as error:
         raise HTTPException(
             status_code=503,
@@ -98,13 +149,13 @@ async def extract_job_description(
         ) from error
     except DocumentExtractionError as error:
         _raise_document_error(error)
+    except ClientDisconnect:
+        raise
     except Exception as error:
         raise HTTPException(
             status_code=503,
             detail={"code": "job_description_extraction_unavailable"},
         ) from error
-    finally:
-        await upload.close()
 
     return JobDescriptionExtractionResponse(
         text=result.text,
