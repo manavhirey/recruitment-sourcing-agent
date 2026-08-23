@@ -273,6 +273,23 @@ export interface paths {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/api/v1/job-descriptions/extract": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /** Extract Job Description */
+        readonly post: operations["extract_job_description_api_v1_job_descriptions_extract_post"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/api/v1/jobs": {
         readonly parameters: {
             readonly query?: never;
@@ -882,6 +899,11 @@ export interface components {
              */
             readonly id: string;
         };
+        /** Body_extract_job_description_api_v1_job_descriptions_extract_post */
+        readonly Body_extract_job_description_api_v1_job_descriptions_extract_post: {
+            /** File */
+            readonly file?: readonly string[] | null;
+        };
         /** CandidateDirectoryItem */
         readonly CandidateDirectoryItem: {
             /** Current Company */
@@ -1269,6 +1291,19 @@ export interface components {
             readonly location?: string | null;
             /** Title */
             readonly title: string;
+        };
+        /** JobDescriptionExtractionResponse */
+        readonly JobDescriptionExtractionResponse: {
+            readonly source: components["schemas"]["JobDescriptionSource"];
+            /** Text */
+            readonly text: string;
+        };
+        /** JobDescriptionSource */
+        readonly JobDescriptionSource: {
+            /** Filename */
+            readonly filename: string;
+            /** Media Type */
+            readonly media_type: string;
         };
         /** JobPage */
         readonly JobPage: {
@@ -1716,7 +1751,7 @@ export interface components {
             /** Minimum Years */
             readonly minimum_years?: number | null;
             /** Seniority */
-            readonly seniority: readonly string[];
+            readonly seniority: readonly components["schemas"]["SeniorityLevel"][];
             /** Suggested Adjacent Industries */
             readonly suggested_adjacent_industries: readonly string[];
             /** Target Titles */
@@ -1740,6 +1775,8 @@ export interface components {
             readonly job_id: string;
             /** Original Job Description */
             readonly original_job_description: string;
+            /** Seniority Options */
+            readonly seniority_options: readonly components["schemas"]["SeniorityOption"][];
         };
         /** ScorecardDraftUpdate */
         readonly ScorecardDraftUpdate: {
@@ -1757,6 +1794,21 @@ export interface components {
             readonly draft: components["schemas"]["ScorecardDraft"];
             /** Expected Revision */
             readonly expected_revision: number;
+        };
+        /**
+         * SeniorityLevel
+         * @enum {string}
+         */
+        readonly SeniorityLevel: "early_career" | "mid_level" | "senior";
+        /** SeniorityOption */
+        readonly SeniorityOption: {
+            /** Label */
+            readonly label: string;
+            /** Maximum Years */
+            readonly maximum_years: number | null;
+            /** Minimum Years */
+            readonly minimum_years: number;
+            readonly value: components["schemas"]["SeniorityLevel"];
         };
         /** StageUpdate */
         readonly StageUpdate: {
@@ -2354,6 +2406,72 @@ export interface operations {
                 content: {
                     readonly "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+        };
+    };
+    readonly extract_job_description_api_v1_job_descriptions_extract_post: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: {
+            readonly content: {
+                readonly "multipart/form-data": components["schemas"]["Body_extract_job_description_api_v1_job_descriptions_extract_post"];
+            };
+        };
+        readonly responses: {
+            /** @description Successful Response */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["JobDescriptionExtractionResponse"];
+                };
+            };
+            /** @description Exactly one job description file is required. */
+            readonly 400: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication is required. */
+            readonly 401: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The uploaded file exceeds 10,000,000 bytes. */
+            readonly 413: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The uploaded document type is unsupported. */
+            readonly 415: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The uploaded document could not be extracted safely. */
+            readonly 422: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Document extraction is temporarily unavailable. */
+            readonly 503: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

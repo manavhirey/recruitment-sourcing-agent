@@ -45,8 +45,12 @@ export function bffErrorResponse(code: string, status: number): Response {
   )
 }
 
-function publicStatus(error: ApiError): number {
-  if ([400, 401, 403, 404, 409, 410, 422, 429].includes(error.status)) {
+export function bffPublicStatus(error: ApiError): number {
+  if (
+    [400, 401, 403, 404, 409, 410, 413, 415, 422, 429, 503].includes(
+      error.status,
+    )
+  ) {
     return error.status
   }
   return error.status === 504 ? 504 : 502
@@ -78,7 +82,7 @@ export async function handleBffRead(
     })
   } catch (error) {
     if (error instanceof ApiError) {
-      return bffErrorResponse(error.code, publicStatus(error))
+      return bffErrorResponse(error.code, bffPublicStatus(error))
     }
     return bffErrorResponse("api_unavailable", 502)
   }
@@ -146,7 +150,7 @@ export async function handleBffStream(
     })
   } catch (error) {
     if (error instanceof ApiError) {
-      return bffErrorResponse(error.code, publicStatus(error))
+      return bffErrorResponse(error.code, bffPublicStatus(error))
     }
     return bffErrorResponse("api_unavailable", 502)
   }
@@ -209,7 +213,7 @@ export async function handleBffMutation(
         })
   } catch (error) {
     if (error instanceof ApiError) {
-      return bffErrorResponse(error.code, publicStatus(error))
+      return bffErrorResponse(error.code, bffPublicStatus(error))
     }
     if (error instanceof Error && error.message === "unauthenticated") {
       return bffErrorResponse("unauthenticated", 401)
