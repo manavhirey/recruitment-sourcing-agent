@@ -45,11 +45,13 @@ const scorecardCriterionRequest = z
   })
   .strict()
 
+const seniorityLevel = z.enum(["early_career", "mid_level", "senior"])
+
 export const scorecardDraftRequest = z
   .object({
     target_titles: z.array(z.string().trim().min(1)).min(1).max(12),
     criteria: z.array(scorecardCriterionRequest).min(1).max(40),
-    seniority: z.array(z.string().trim().min(1)).max(8),
+    seniority: z.array(seniorityLevel).max(3),
     minimum_years: z.number().int().min(0).max(50).nullable(),
     maximum_years: z.number().int().min(0).max(50).nullable(),
     locations: z.array(z.string().trim().min(1)).max(20),

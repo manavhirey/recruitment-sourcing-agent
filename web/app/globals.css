@@ -353,6 +353,11 @@ input:hover, select:hover, textarea:hover { border-color: #7f929c; }
 .suggestion-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .75rem; background: #fffaf0; border: 1px solid #eddfbd; border-radius: .65rem; }
 .check-row { display: flex; align-items: flex-start; gap: .55rem; font-size: .86rem; font-weight: 700; }
 .check-row input { width: 1.1rem; min-height: 1.1rem; margin-top: .12rem; accent-color: var(--coral); }
+.seniority-controls { min-width: 0; margin: 0; padding: 0; border: 0; }
+.seniority-controls legend { margin-bottom: .4rem; font-size: .88rem; font-weight: 800; }
+.seniority-options { display: grid; gap: .45rem; }
+.custom-range-toggle { margin-top: .75rem; }
+.legacy-seniority { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
 .sticky-action { position: sticky; z-index: 10; bottom: 1rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem 1.15rem; color: white; background: rgb(16 38 63 / 96%); border-radius: .8rem; box-shadow: 0 15px 40px rgb(16 38 63 / 25%); backdrop-filter: blur(12px); }
 .sticky-action p { margin: 0; color: #dce5eb; font-size: .85rem; }
 

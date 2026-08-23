@@ -1,18 +1,57 @@
-import { render, screen } from "@testing-library/react"
+import { render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { HttpResponse, http } from "msw"
 import { vi } from "vitest"
 
 import { ScorecardEditor } from "@/components/scorecards/ScorecardEditor"
+import type { components } from "@/lib/generated-api"
 import { requiredInferenceIds } from "@/lib/inference-confirmations"
+import type { ScorecardDraftResponse } from "@/lib/schemas"
 import {
   manualRequiredDraftFixture,
   scorecardDraftFixture,
 } from "@/tests/fixtures"
 import { navigationMocks, server } from "@/tests/setup"
 
+type EditableScorecardDraft = components["schemas"]["EditableScorecardDraft"]
+
 describe("ScorecardEditor", () => {
   const allowedIndustryCodes = ["technology.fintech"]
+
+  function renderEditor(
+    overrides: Partial<EditableScorecardDraft> = {},
+    responseOverrides: Partial<ScorecardDraftResponse> = {},
+  ): void {
+    const draft = { ...scorecardDraftFixture.draft, ...overrides }
+    render(
+      <ScorecardEditor
+        draft={{
+          ...scorecardDraftFixture,
+          ...responseOverrides,
+          draft: {
+            ...draft,
+            confirmed_inferred_items: requiredInferenceIds(draft),
+          },
+        }}
+        allowedIndustryCodes={allowedIndustryCodes}
+      />,
+    )
+  }
+
+  function successfulFlow(onSave?: (body: unknown) => void) {
+    server.use(
+      http.put("/api/bff/jobs/:jobId/scorecard/draft", async ({ request }) => {
+        onSave?.(await request.json())
+        return HttpResponse.json({ ...scorecardDraftFixture, draft_revision: 3 })
+      }),
+      http.post("/api/bff/jobs/:jobId/scorecard/confirm", () =>
+        HttpResponse.json({ id: "scorecard-1" }),
+      ),
+      http.post("/api/bff/jobs/:jobId/runs", () =>
+        HttpResponse.json({ id: "run-1" }),
+      ),
+    )
+  }
 
   it("separates extracted criteria from inferred suggestions", () => {
     render(<ScorecardEditor draft={scorecardDraftFixture} allowedIndustryCodes={allowedIndustryCodes} />)
@@ -84,18 +123,174 @@ describe("ScorecardEditor", () => {
     expect(screen.queryByRole("option", { name: "Banking" })).not.toBeInTheDocument()
   })
 
-  it("makes extracted role constraints visible, editable, and locally valid", async () => {
+  it("renders zero, one, or multiple inclusive presets in server order", async () => {
     const user = userEvent.setup()
-    render(<ScorecardEditor draft={scorecardDraftFixture} allowedIndustryCodes={allowedIndustryCodes} />)
+    renderEditor(
+      { seniority: [], minimum_years: null, maximum_years: null },
+      { seniority_options: [
+        scorecardDraftFixture.seniority_options[2],
+        scorecardDraftFixture.seniority_options[0],
+        scorecardDraftFixture.seniority_options[1],
+      ] },
+    )
+    const group = screen.getByRole("group", { name: "Seniority requirements" })
+    const presets = within(group).getAllByRole("checkbox").slice(0, 3)
 
-    expect(screen.getByLabelText("Seniority")).toHaveValue("senior")
-    expect(screen.getByLabelText("Locations")).toHaveValue("New York, NY")
-    expect(screen.getByLabelText("Minimum years")).toHaveValue(5)
-    expect(screen.getByLabelText("Maximum years")).toHaveValue(null)
-    await user.type(screen.getByLabelText("Maximum years"), "3")
+    expect(presets.map((checkbox) => checkbox.parentElement?.textContent)).toEqual([
+      "Senior — 10+ years",
+      "Early-Career — 0–3 years",
+      "Mid-Level — 3–9 years",
+    ])
+    await user.click(within(group).getByRole("checkbox", { name: "Early-Career — 0–3 years" }))
+    await user.click(within(group).getByRole("checkbox", { name: "Mid-Level — 3–9 years" }))
+
+    expect(within(group).getByRole("checkbox", { name: "Early-Career — 0–3 years" })).toBeChecked()
+    expect(within(group).getByRole("checkbox", { name: "Mid-Level — 3–9 years" })).toBeChecked()
+    expect(within(group).getByRole("checkbox", { name: "Senior — 10+ years" })).not.toBeChecked()
+  })
+
+  it("submits selected presets in server order rather than click order", async () => {
+    const user = userEvent.setup()
+    const bodies: unknown[] = []
+    successfulFlow((body) => bodies.push(body))
+    renderEditor(
+      { seniority: [], minimum_years: null, maximum_years: null },
+      { seniority_options: [
+        scorecardDraftFixture.seniority_options[2],
+        scorecardDraftFixture.seniority_options[0],
+        scorecardDraftFixture.seniority_options[1],
+      ] },
+    )
+
+    await user.click(screen.getByRole("checkbox", { name: "Early-Career — 0–3 years" }))
+    await user.click(screen.getByRole("checkbox", { name: "Senior — 10+ years" }))
+    await user.click(screen.getByRole("button", { name: "Confirm and source" }))
+    await vi.waitFor(() => expect(bodies).toHaveLength(1))
+
+    expect(bodies[0]).toMatchObject({
+      draft: {
+        seniority: ["senior", "early_career"],
+        minimum_years: null,
+        maximum_years: null,
+      },
+    })
+  })
+
+  it("requires a bound and makes a custom range visibly override stored presets", async () => {
+    const user = userEvent.setup()
+    renderEditor({
+      seniority: ["early_career"],
+      minimum_years: null,
+      maximum_years: null,
+    })
+
+    await user.click(screen.getByRole("checkbox", { name: "Use custom experience range" }))
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "This custom range overrides the selected seniority levels.",
+    )
+    expect(screen.getByRole("checkbox", { name: "Early-Career — 0–3 years" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "Confirm and source" })).toBeDisabled()
+    await user.type(screen.getByLabelText("Minimum years"), "5")
+    expect(screen.getByRole("button", { name: "Confirm and source" })).toBeEnabled()
+  })
+
+  it("accepts and submits a maximum-only custom range", async () => {
+    const user = userEvent.setup()
+    const bodies: unknown[] = []
+    successfulFlow((body) => bodies.push(body))
+    renderEditor({ seniority: ["senior"], minimum_years: null, maximum_years: null })
+
+    await user.click(screen.getByRole("checkbox", { name: "Use custom experience range" }))
+    await user.type(screen.getByLabelText("Maximum years"), "8")
+    await user.click(screen.getByRole("button", { name: "Confirm and source" }))
+    await vi.waitFor(() => expect(bodies).toHaveLength(1))
+
+    expect(bodies[0]).toMatchObject({
+      draft: { seniority: ["senior"], minimum_years: null, maximum_years: 8 },
+    })
+  })
+
+  it("rejects inverted bounded ranges until the inclusive ordering is valid", async () => {
+    const user = userEvent.setup()
+    renderEditor({ seniority: [], minimum_years: null, maximum_years: null })
+
+    await user.click(screen.getByRole("checkbox", { name: "Use custom experience range" }))
+    await user.type(screen.getByLabelText("Minimum years"), "9")
+    await user.type(screen.getByLabelText("Maximum years"), "8")
 
     expect(screen.getByText("Maximum years cannot be less than minimum years.")).toBeVisible()
     expect(screen.getByRole("button", { name: "Confirm and source" })).toBeDisabled()
+    await user.clear(screen.getByLabelText("Maximum years"))
+    await user.type(screen.getByLabelText("Maximum years"), "9")
+    expect(screen.getByRole("button", { name: "Confirm and source" })).toBeEnabled()
+  })
+
+  it("preserves presets while custom is active and clears both bounds when disabled", async () => {
+    const user = userEvent.setup()
+    const bodies: unknown[] = []
+    successfulFlow((body) => bodies.push(body))
+    renderEditor({ seniority: ["mid_level"], minimum_years: null, maximum_years: null })
+
+    const custom = screen.getByRole("checkbox", { name: "Use custom experience range" })
+    await user.click(custom)
+    await user.type(screen.getByLabelText("Minimum years"), "4")
+    await user.type(screen.getByLabelText("Maximum years"), "7")
+    expect(screen.getByRole("checkbox", { name: "Mid-Level — 3–9 years" })).toBeChecked()
+    await user.click(custom)
+
+    expect(screen.queryByLabelText("Minimum years")).not.toBeInTheDocument()
+    expect(screen.queryByLabelText("Maximum years")).not.toBeInTheDocument()
+    expect(screen.getByRole("checkbox", { name: "Mid-Level — 3–9 years" })).toBeChecked()
+    await user.click(screen.getByRole("button", { name: "Confirm and source" }))
+    await vi.waitFor(() => expect(bodies).toHaveLength(1))
+    expect(bodies[0]).toMatchObject({
+      draft: { seniority: ["mid_level"], minimum_years: null, maximum_years: null },
+    })
+  })
+
+  it("requires confirmation for an inferred custom bound", async () => {
+    render(
+      <ScorecardEditor
+        draft={{
+          ...scorecardDraftFixture,
+          draft: {
+            ...scorecardDraftFixture.draft,
+            minimum_years: 5,
+            maximum_years: null,
+            uncertainties: ["Confirm inferred minimum years: 5"],
+            confirmed_inferred_items: [],
+          },
+        }}
+        allowedIndustryCodes={allowedIndustryCodes}
+      />,
+    )
+
+    expect(screen.getByRole("checkbox", { name: "Use custom experience range" })).toBeChecked()
+    expect(screen.getByLabelText("Minimum years")).toHaveValue(5)
+    expect(screen.getByRole("button", { name: "Confirm and source" })).toBeDisabled()
+    await userEvent.click(screen.getByRole("checkbox", {
+      name: /Confirm suggested Confirm inferred minimum years: 5/i,
+    }))
+    for (const checkbox of screen.getAllByRole("checkbox", { name: /Confirm suggested/i })) {
+      if (!(checkbox as HTMLInputElement).checked) await userEvent.click(checkbox)
+    }
+    expect(screen.getByRole("button", { name: "Confirm and source" })).toBeEnabled()
+  })
+
+  it("blocks unknown historical seniority until it is explicitly removed", async () => {
+    renderEditor({ seniority: ["manager"] })
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Unrecognized historical seniority: manager",
+    )
+    expect(screen.getByRole("checkbox", { name: "Early-Career — 0–3 years" })).not.toBeChecked()
+    expect(screen.getByRole("checkbox", { name: "Mid-Level — 3–9 years" })).not.toBeChecked()
+    expect(screen.getByRole("checkbox", { name: "Senior — 10+ years" })).not.toBeChecked()
+    expect(screen.getByRole("button", { name: "Confirm and source" })).toBeDisabled()
+    await userEvent.click(screen.getByRole("button", { name: "Remove manager" }))
+    expect(screen.queryByText("Unrecognized historical seniority: manager")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Confirm and source" })).toBeEnabled()
   })
 
   it("shows an empty editable draft when extraction requires manual entry", () => {
@@ -188,7 +383,14 @@ describe("ScorecardEditor", () => {
     )
     render(
       <ScorecardEditor
-        draft={scorecardDraftFixture}
+        draft={{
+          ...scorecardDraftFixture,
+          draft: {
+            ...scorecardDraftFixture.draft,
+            minimum_years: null,
+            maximum_years: null,
+          },
+        }}
         allowedIndustryCodes={allowedIndustryCodes}
         onStarted={started}
       />,
@@ -203,6 +405,8 @@ describe("ScorecardEditor", () => {
     expect(screen.getByLabelText("Target titles")).toBeDisabled()
     expect(screen.getByDisplayValue("Led product-led growth")).toBeDisabled()
     expect(screen.getAllByRole("checkbox", { name: /Confirm suggested/i })[0]).toBeDisabled()
+    expect(screen.getByRole("checkbox", { name: "Senior — 10+ years" })).toBeDisabled()
+    expect(screen.getByRole("checkbox", { name: "Use custom experience range" })).toBeDisabled()
     finishSave?.(HttpResponse.json({ ...scorecardDraftFixture, draft_revision: 3 }))
     await vi.waitFor(() => expect(started).toHaveBeenCalledOnce())
   })

@@ -19,6 +19,7 @@ import type {
   ScorecardCriterion,
   ScorecardDraft,
   ScorecardDraftResponse,
+  SeniorityLevel,
   SourcingRun,
 } from "@/lib/schemas"
 
@@ -90,8 +91,8 @@ export function ScorecardEditor({
   const [targetTitlesInput, setTargetTitlesInput] = useState(
     () => (response.draft.target_titles ?? []).join(", "),
   )
-  const [seniorityInput, setSeniorityInput] = useState(
-    () => (response.draft.seniority ?? []).join(", "),
+  const [customEnabled, setCustomEnabled] = useState(
+    () => response.draft.minimum_years != null || response.draft.maximum_years != null,
   )
   const [locationsInput, setLocationsInput] = useState(
     () => (response.draft.locations ?? []).join("\n"),
@@ -141,8 +142,15 @@ export function ScorecardEditor({
     .filter((id) => confirmedSuggestions.has(id))
     .sort()
   const allSuggestionsResolved = suggestions.every((item) => confirmedSuggestions.has(item.id))
+  const canonicalSeniority = new Set(
+    response.seniority_options.map((option) => option.value),
+  )
+  const unrecognizedSeniority = draft.seniority.filter(
+    (value) => !canonicalSeniority.has(value as SeniorityLevel),
+  )
   const minimumYears = draft.minimum_years ?? null
   const maximumYears = draft.maximum_years ?? null
+  const customBoundsPresent = minimumYears !== null || maximumYears !== null
   const yearsValid =
     minimumYears === null ||
     maximumYears === null ||
@@ -156,6 +164,8 @@ export function ScorecardEditor({
       (criterion.recruiter_entered && criterion.lawful_requirement_confirmed),
     ) &&
     Boolean(draft.industry_code) &&
+    unrecognizedSeniority.length === 0 &&
+    (!customEnabled || customBoundsPresent) &&
     yearsValid
 
   function updateCriterion(index: number, patch: Partial<ScorecardCriterion>) {
@@ -221,6 +231,9 @@ export function ScorecardEditor({
     setAdjacencyError(null)
     const mutationDraft: ScorecardEditorDraft = {
       ...draft,
+      seniority: response.seniority_options
+        .map((option) => option.value)
+        .filter((value) => draft.seniority.includes(value)),
       confirmed_inferred_items: confirmedInferenceIds,
     }
     const fingerprint = JSON.stringify(mutationDraft)
@@ -418,23 +431,82 @@ export function ScorecardEditor({
             </p>
           ) : null}
         </div>
-        <div className="field-row">
-          <div className="field">
-            <label htmlFor="seniority">Seniority</label>
-            <input
-              id="seniority"
-              value={seniorityInput}
-              onChange={(event) => {
-                setSeniorityInput(event.target.value)
-                setDraft((current) => ({
-                  ...current,
-                  seniority: listValues(event.target.value, ","),
-                }))
-                intent.current = null
-              }}
-              placeholder="Senior, lead"
-            />
-          </div>
+        <div className="field-row role-constraints">
+          <fieldset className="field seniority-controls">
+            <legend>Seniority requirements</legend>
+            <div className="seniority-options">
+              {response.seniority_options.map((option) => {
+                const checked = draft.seniority.includes(option.value)
+                const range = option.maximum_years === null
+                  ? `${option.minimum_years}+ years`
+                  : `${option.minimum_years}–${option.maximum_years} years`
+                return (
+                  <label className="check-row" key={option.value}>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={submitting || customEnabled}
+                      onChange={() => {
+                        setDraft((current) => ({
+                          ...current,
+                          seniority: checked
+                            ? current.seniority.filter((value) => value !== option.value)
+                            : [...current.seniority, option.value],
+                        }))
+                        intent.current = null
+                      }}
+                    />
+                    {option.label} — {range}
+                  </label>
+                )
+              })}
+            </div>
+            {unrecognizedSeniority.map((value) => (
+              <div className="field-error legacy-seniority" key={value} role="alert">
+                <span>Unrecognized historical seniority: {value}</span>
+                <button
+                  className="button button-danger-quiet"
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => {
+                    setDraft((current) => ({
+                      ...current,
+                      seniority: current.seniority.filter((item) => item !== value),
+                    }))
+                    intent.current = null
+                  }}
+                >
+                  Remove {value}
+                </button>
+              </div>
+            ))}
+            <label className="check-row custom-range-toggle">
+              <input
+                type="checkbox"
+                checked={customEnabled}
+                disabled={submitting}
+                onChange={(event) => {
+                  if (event.target.checked) {
+                    setCustomEnabled(true)
+                  } else {
+                    setCustomEnabled(false)
+                    setDraft((current) => ({
+                      ...current,
+                      minimum_years: null,
+                      maximum_years: null,
+                    }))
+                  }
+                  intent.current = null
+                }}
+              />
+              Use custom experience range
+            </label>
+            {customEnabled ? (
+              <p className="field-hint" role="status">
+                This custom range overrides the selected seniority levels.
+              </p>
+            ) : null}
+          </fieldset>
           <div className="field">
             <label htmlFor="locations">Locations</label>
             <textarea
@@ -453,52 +525,63 @@ export function ScorecardEditor({
             />
           </div>
         </div>
-        <div className="field-row">
-          <div className="field">
-            <label htmlFor="minimum-years">Minimum years</label>
-            <input
-              id="minimum-years"
-              type="number"
-              min={0}
-              max={50}
-              value={draft.minimum_years ?? ""}
-              onChange={(event) => {
-                setDraft((current) => ({
-                  ...current,
-                  minimum_years: event.target.value === ""
-                    ? null
-                    : Number(event.target.value),
-                }))
-                intent.current = null
-              }}
-            />
-          </div>
-          <div className="field">
-            <label htmlFor="maximum-years">Maximum years</label>
-            <input
-              id="maximum-years"
-              type="number"
-              min={0}
-              max={50}
-              value={draft.maximum_years ?? ""}
-              aria-invalid={!yearsValid || undefined}
-              aria-describedby={!yearsValid ? "years-error" : undefined}
-              onChange={(event) => {
-                setDraft((current) => ({
-                  ...current,
-                  maximum_years: event.target.value === ""
-                    ? null
-                    : Number(event.target.value),
-                }))
-                intent.current = null
-              }}
-            />
-          </div>
-        </div>
-        {!yearsValid ? (
-          <p id="years-error" className="field-error" role="alert">
-            Maximum years cannot be less than minimum years.
-          </p>
+        {customEnabled ? (
+          <>
+            <div className="field-row">
+              <div className="field">
+                <label htmlFor="minimum-years">Minimum years</label>
+                <input
+                  id="minimum-years"
+                  type="number"
+                  min={0}
+                  max={50}
+                  value={draft.minimum_years ?? ""}
+                  aria-invalid={!yearsValid || undefined}
+                  aria-describedby={!yearsValid ? "years-error" : undefined}
+                  onChange={(event) => {
+                    setDraft((current) => ({
+                      ...current,
+                      minimum_years: event.target.value === ""
+                        ? null
+                        : Number(event.target.value),
+                    }))
+                    intent.current = null
+                  }}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="maximum-years">Maximum years</label>
+                <input
+                  id="maximum-years"
+                  type="number"
+                  min={0}
+                  max={50}
+                  value={draft.maximum_years ?? ""}
+                  aria-invalid={!yearsValid || undefined}
+                  aria-describedby={!yearsValid ? "years-error" : undefined}
+                  onChange={(event) => {
+                    setDraft((current) => ({
+                      ...current,
+                      maximum_years: event.target.value === ""
+                        ? null
+                        : Number(event.target.value),
+                    }))
+                    intent.current = null
+                  }}
+                />
+              </div>
+            </div>
+            {!customBoundsPresent ? (
+              <p className="field-error" role="alert">
+                Enter a minimum or maximum year.
+              </p>
+            ) : null}
+            {!yearsValid ? (
+              <p id="years-error" className="field-error" role="alert">
+                Maximum years cannot be less than minimum years.
+              </p>
+            ) : null}
+          </>
         ) : null}
       </section>
 
