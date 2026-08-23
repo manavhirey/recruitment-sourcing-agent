@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import pytest
 from app.jobs.schemas import (
     ConfirmedScorecard,
     CriterionKind,
@@ -25,7 +26,7 @@ def _scorecard(**overrides: object) -> ConfirmedScorecard:
                 kind=CriterionKind.MUST_HAVE,
             )
         ],
-        "seniority": ["Senior"],
+        "seniority": ["senior"],
         "minimum_years": None,
         "maximum_years": None,
         "locations": ["New York, NY"],
@@ -53,7 +54,47 @@ def test_query_planner_separates_exact_and_adjacent_industries() -> None:
     assert any(query.industry_codes == ("technology.fintech",) for query in queries)
 
 
-def test_query_planner_chunks_titles_maps_seniority_and_bounds_queries() -> None:
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [
+        ("early_career", ("entry", "intern")),
+        ("mid_level", ("entry", "senior", "manager")),
+        (
+            "senior",
+            ("senior", "manager", "director", "head", "vp", "c_suite"),
+        ),
+    ],
+)
+def test_query_planner_maps_canonical_presets_for_recall(
+    level: str, expected: tuple[str, ...]
+) -> None:
+    queries = QueryPlanner().compile(_scorecard(seniority=[level]))
+
+    assert queries
+    assert all(query.seniorities == expected for query in queries)
+
+
+def test_custom_bounds_omit_inactive_provider_seniority_filters() -> None:
+    queries = QueryPlanner().compile(
+        _scorecard(seniority=["senior"], minimum_years=5, maximum_years=8)
+    )
+
+    assert all(query.seniorities == () for query in queries)
+
+
+def test_multiple_presets_use_stable_union() -> None:
+    queries = QueryPlanner().compile(
+        _scorecard(seniority=["senior", "early_career"])
+    )
+
+    assert all(
+        query.seniorities
+        == ("entry", "intern", "senior", "manager", "director", "head", "vp", "c_suite")
+        for query in queries
+    )
+
+
+def test_query_planner_chunks_titles_and_bounds_queries() -> None:
     scorecard = _scorecard(
         target_titles=[
             "Product Manager",
@@ -64,7 +105,7 @@ def test_query_planner_chunks_titles_maps_seniority_and_bounds_queries() -> None
             "Head of Product",
             "Director of Product",
         ],
-        seniority=["Vice President", "C-Level", "Individual Contributor", "unknown"],
+        seniority=["senior"],
         suggested_adjacent_industries=[
             "technology.fintech",
             "consumer",
@@ -76,7 +117,11 @@ def test_query_planner_chunks_titles_maps_seniority_and_bounds_queries() -> None
 
     assert len(queries) == 8
     assert all(1 <= len(query.titles) <= 3 for query in queries)
-    assert all(query.seniorities == ("vp", "c_suite") for query in queries)
+    assert all(
+        query.seniorities
+        == ("senior", "manager", "director", "head", "vp", "c_suite")
+        for query in queries
+    )
 
 
 def test_query_planner_keeps_job_relevant_keywords_and_deduplicates_stably() -> None:

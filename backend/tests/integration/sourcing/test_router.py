@@ -4,11 +4,6 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
-
 from app.audit.models import AuditEvent
 from app.candidates.models import Candidate
 from app.clients.models import ClientCompany
@@ -27,6 +22,10 @@ from app.sourcing.models import (
     UsageLedger,
 )
 from app.sourcing.state_machine import RunState
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 
 class StaticVerifier:
@@ -105,7 +104,7 @@ def sourcing_api(
             job_id=job.id,
             version=1,
             target_titles=["Product Manager"],
-            seniority=["manager"],
+            seniority=["mid_level"],
             minimum_years=None,
             maximum_years=None,
             locations=[],
@@ -289,6 +288,31 @@ def test_start_status_activity_and_cancel_routes_are_idempotent(
     }
     with Session(sourcing_api["engine"]) as session:
         assert session.scalar(select(func.count()).select_from(SourcingRun)) == 1
+
+
+def test_start_rejects_unknown_historical_seniority_with_conflict(
+    sourcing_api: dict[str, Any],
+) -> None:
+    with Session(sourcing_api["engine"]) as session:
+        scorecard = session.scalar(
+            select(ScorecardVersion).where(
+                ScorecardVersion.job_id == sourcing_api["job_id"]
+            )
+        )
+        assert scorecard is not None
+        scorecard.seniority = ["manager"]
+        session.commit()
+
+    response = sourcing_api["api"].post(
+        f"/api/v1/jobs/{sourcing_api['job_id']}/runs",
+        headers={**_headers(sourcing_api), "Idempotency-Key": "legacy-scorecard"},
+        json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "scorecard_seniority_revision_required"}
+    }
 
 
 def test_start_replay_recovers_a_committed_run_after_dispatch_failure(

@@ -155,6 +155,7 @@ def _raise_sourcing_error(error: SourcingError) -> NoReturn:
         "active_run_exists": status.HTTP_409_CONFLICT,
         "scorecard_run_exists": status.HTTP_409_CONFLICT,
         "scorecard_required": status.HTTP_409_CONFLICT,
+        "scorecard_seniority_revision_required": status.HTTP_409_CONFLICT,
         "idempotency_conflict": status.HTTP_409_CONFLICT,
         "usage_reservation_conflict": status.HTTP_409_CONFLICT,
         "usage_reconciliation_conflict": status.HTTP_409_CONFLICT,

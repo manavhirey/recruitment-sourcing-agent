@@ -4,10 +4,6 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
-
 from app.audit.models import AuditEvent
 from app.clients.models import ClientCompany
 from app.core.database import Base
@@ -17,6 +13,9 @@ from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
 from app.sourcing.models import SourcingRun
 from app.sourcing.service import SourcingError, SourcingService
 from app.sourcing.state_machine import RunState
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 
 @pytest.fixture
@@ -63,7 +62,7 @@ def service_scenario() -> Generator[dict[str, Any], None, None]:
             job_id=confirmed_job.id,
             version=1,
             target_titles=["Product Manager"],
-            seniority=["manager"],
+            seniority=["mid_level"],
             minimum_years=None,
             maximum_years=None,
             locations=[],
@@ -119,6 +118,32 @@ def test_start_requires_a_confirmed_immutable_scorecard(
             scenario["unconfirmed_job"].id,
             idempotency_key="start-unconfirmed",
         )
+
+
+def test_unknown_historical_seniority_requires_revision_before_run(
+    service_scenario: dict[str, Any],
+) -> None:
+    scenario = service_scenario
+    scorecard = scenario["session"].scalar(
+        select(ScorecardVersion).where(
+            ScorecardVersion.id == scenario["confirmed_job"].current_scorecard_id
+        )
+    )
+    assert scorecard is not None
+    scorecard.seniority = ["manager"]
+    scenario["session"].flush()
+    service = SourcingService(scenario["session"], b"test-suppression-key")
+
+    with pytest.raises(SourcingError, match="scorecard_seniority_revision_required"):
+        service.start_with_outcome(
+            scenario["context"],
+            scenario["confirmed_job"].id,
+            idempotency_key="legacy-run",
+        )
+
+    assert (
+        scenario["session"].scalar(select(func.count()).select_from(SourcingRun)) == 0
+    )
 
 
 def test_start_is_idempotent_and_binds_a_new_key_to_a_pending_run(

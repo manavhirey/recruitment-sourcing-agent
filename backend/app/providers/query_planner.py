@@ -2,29 +2,13 @@ from collections.abc import Iterable
 
 from app.clients.taxonomy import IndustryTaxonomy
 from app.jobs.schemas import ConfirmedScorecard, CriterionKind
+from app.jobs.seniority import SeniorityLevel, validate_confirmed_seniority
 from app.providers.base import ProviderQuery
 
-_APOLLO_SENIORITY_ALIASES = {
-    "owner": "owner",
-    "founder": "founder",
-    "c suite": "c_suite",
-    "c-suite": "c_suite",
-    "c_level": "c_suite",
-    "c level": "c_suite",
-    "c-level": "c_suite",
-    "c_suite": "c_suite",
-    "partner": "partner",
-    "vice president": "vp",
-    "vice-president": "vp",
-    "vp": "vp",
-    "head": "head",
-    "director": "director",
-    "manager": "manager",
-    "senior": "senior",
-    "entry": "entry",
-    "entry level": "entry",
-    "entry-level": "entry",
-    "intern": "intern",
+_APOLLO_BY_LEVEL = {
+    SeniorityLevel.EARLY_CAREER: ("entry", "intern"),
+    SeniorityLevel.MID_LEVEL: ("entry", "senior", "manager"),
+    SeniorityLevel.SENIOR: ("senior", "manager", "director", "head", "vp", "c_suite"),
 }
 
 
@@ -45,6 +29,15 @@ def _chunks(values: tuple[str, ...], size: int) -> Iterable[tuple[str, ...]]:
         yield values[index : index + size]
 
 
+def _provider_seniorities(scorecard: ConfirmedScorecard) -> tuple[str, ...]:
+    if scorecard.minimum_years is not None or scorecard.maximum_years is not None:
+        return ()
+    levels = validate_confirmed_seniority(scorecard.seniority)
+    return _stable_unique(
+        value for level in levels for value in _APOLLO_BY_LEVEL[level]
+    )
+
+
 class QueryPlanner:
     def __init__(
         self,
@@ -58,11 +51,7 @@ class QueryPlanner:
 
     def compile(self, scorecard: ConfirmedScorecard) -> tuple[ProviderQuery, ...]:
         titles = _stable_unique(scorecard.target_titles)
-        seniorities = _stable_unique(
-            mapped
-            for value in scorecard.seniority
-            if (mapped := _APOLLO_SENIORITY_ALIASES.get(value.strip().casefold()))
-        )
+        seniorities = _provider_seniorities(scorecard)
         locations = _stable_unique(scorecard.locations)
         criterion_keywords = _stable_unique(
             criterion.label
