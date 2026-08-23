@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-23
 
-**Status:** Design approved; written-spec review pending
+**Status:** Approved for implementation planning
 
 **Parent request:** `docs/feature-requests/recruitment-scorecard-improvements.md`
 
