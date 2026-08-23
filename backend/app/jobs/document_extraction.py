@@ -1,8 +1,10 @@
+from binascii import crc32
+from copy import copy
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Protocol
-from zipfile import BadZipFile, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile
 
 from docx import Document
 from docx.opc.exceptions import PackageNotFoundError
@@ -18,6 +20,7 @@ MAX_TEXT_LENGTH = 50_000
 MAX_PDF_PAGES = 200
 MAX_DOCX_ENTRIES = 2_000
 MAX_DOCX_EXPANDED_BYTES = 50_000_000
+DOCX_VALIDATION_CHUNK_BYTES = 64 * 1024
 
 PDF_MEDIA_TYPE = "application/pdf"
 DOCX_MEDIA_TYPE = (
@@ -27,6 +30,7 @@ PDF_SIGNATURE = b"%PDF-"
 ZIP_SIGNATURE = b"PK\x03\x04"
 OLE_SIGNATURE = bytes.fromhex("D0 CF 11 E0 A1 B1 1A E1")
 REQUIRED_DOCX_MEMBERS = {"[Content_Types].xml", "word/document.xml"}
+SUPPORTED_DOCX_COMPRESSION = {ZIP_STORED, ZIP_DEFLATED}
 
 
 @dataclass(frozen=True)
@@ -59,11 +63,7 @@ class DefaultJobDescriptionExtractor:
         extension = Path(filename).suffix.casefold()
         normalized_media_type = media_type.casefold() if media_type is not None else None
 
-        if (
-            extension == ".docx"
-            and normalized_media_type == DOCX_MEDIA_TYPE
-            and data.startswith(OLE_SIGNATURE)
-        ):
+        if extension == ".docx" and data.startswith(OLE_SIGNATURE):
             raise DocumentExtractionError("job_description_file_unreadable")
 
         if (
@@ -114,13 +114,54 @@ def _validate_docx_package(data: bytes) -> None:
         names = {entry.filename for entry in entries}
         if not REQUIRED_DOCX_MEMBERS <= names:
             raise DocumentExtractionError("job_description_file_unreadable")
+        if any(entry.flag_bits & 1 for entry in entries):
+            raise DocumentExtractionError("job_description_file_unreadable")
         if any(
-            entry.filename.casefold().endswith(".zip")
-            or package.open(entry).read(4) == ZIP_SIGNATURE
-            for entry in entries
-            if not entry.is_dir()
+            entry.compress_type not in SUPPORTED_DOCX_COMPRESSION for entry in entries
         ):
             raise DocumentExtractionError("job_description_file_too_complex")
+
+        actual_expanded_bytes = 0
+        for entry in entries:
+            if entry.is_dir():
+                if entry.file_size or entry.compress_size:
+                    raise DocumentExtractionError("job_description_file_unreadable")
+                continue
+            if entry.filename.casefold().endswith(".zip"):
+                raise DocumentExtractionError("job_description_file_too_complex")
+
+            probe = copy(entry)
+            probe.file_size = MAX_DOCX_EXPANDED_BYTES + DOCX_VALIDATION_CHUNK_BYTES
+            entry_size = 0
+            entry_crc = 0
+            signature = b""
+            try:
+                with package.open(probe) as contents:
+                    while chunk := contents.read(DOCX_VALIDATION_CHUNK_BYTES):
+                        if len(signature) < len(ZIP_SIGNATURE):
+                            signature = (signature + chunk)[: len(ZIP_SIGNATURE)]
+                        entry_size += len(chunk)
+                        actual_expanded_bytes += len(chunk)
+                        if actual_expanded_bytes > MAX_DOCX_EXPANDED_BYTES:
+                            raise DocumentExtractionError(
+                                "job_description_file_too_complex"
+                            )
+                        entry_crc = crc32(chunk, entry_crc)
+            except DocumentExtractionError:
+                raise
+            except NotImplementedError as error:
+                raise DocumentExtractionError(
+                    "job_description_file_too_complex"
+                ) from error
+            except RuntimeError as error:
+                raise DocumentExtractionError(
+                    "job_description_file_unreadable"
+                ) from error
+
+            if entry_size != entry.file_size or entry_crc != entry.CRC:
+                raise DocumentExtractionError("job_description_file_unreadable")
+            if signature == ZIP_SIGNATURE:
+                raise DocumentExtractionError("job_description_file_too_complex")
 
 
 def _docx_text(data: bytes) -> str:

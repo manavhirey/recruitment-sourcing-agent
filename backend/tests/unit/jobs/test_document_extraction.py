@@ -1,4 +1,5 @@
 import pytest
+
 from app.jobs.document_extraction import (
     DefaultJobDescriptionExtractor,
     DocumentExtractionError,
@@ -7,10 +8,13 @@ from app.jobs.document_extraction import (
 from tests.job_description_fixtures import (
     docx_package_with_entries,
     docx_with_declared_expanded_bytes,
+    docx_with_encrypted_member,
     docx_with_external_relationship,
+    docx_with_forged_small_expanded_size,
     docx_with_malformed_document_xml,
     docx_with_nested_archive,
     docx_with_text,
+    docx_with_unsupported_compression,
     empty_docx,
     empty_pdf,
     encrypted_pdf,
@@ -196,6 +200,44 @@ def test_classifies_ole_docx_as_unreadable(
     )
 
 
+@pytest.mark.parametrize("media_type", [None, PDF_MEDIA_TYPE])
+def test_classifies_ole_docx_as_unreadable_before_trusting_media_type(
+    extractor: DefaultJobDescriptionExtractor,
+    media_type: str | None,
+) -> None:
+    assert_extraction_error(
+        extractor,
+        data=bytes.fromhex("D0 CF 11 E0 A1 B1 1A E1") + b"encrypted",
+        filename="role.docx",
+        media_type=media_type,
+        code="job_description_file_unreadable",
+    )
+
+
+def test_classifies_encrypted_docx_zip_member_as_unreadable(
+    extractor: DefaultJobDescriptionExtractor,
+) -> None:
+    assert_extraction_error(
+        extractor,
+        data=docx_with_encrypted_member(),
+        filename="role.docx",
+        media_type=DOCX_MEDIA_TYPE,
+        code="job_description_file_unreadable",
+    )
+
+
+def test_rejects_unsupported_docx_compression_as_too_complex(
+    extractor: DefaultJobDescriptionExtractor,
+) -> None:
+    assert_extraction_error(
+        extractor,
+        data=docx_with_unsupported_compression(),
+        filename="role.docx",
+        media_type=DOCX_MEDIA_TYPE,
+        code="job_description_file_too_complex",
+    )
+
+
 @pytest.mark.parametrize(
     ("data", "filename", "media_type"),
     [
@@ -249,6 +291,18 @@ def test_rejects_docx_with_more_than_fifty_million_declared_expanded_bytes(
     assert_extraction_error(
         extractor,
         data=docx_with_declared_expanded_bytes(50_000_001),
+        filename="role.docx",
+        media_type=DOCX_MEDIA_TYPE,
+        code="job_description_file_too_complex",
+    )
+
+
+def test_rejects_actual_docx_expansion_when_central_metadata_underreports(
+    extractor: DefaultJobDescriptionExtractor,
+) -> None:
+    assert_extraction_error(
+        extractor,
+        data=docx_with_forged_small_expanded_size(50_000_001),
         filename="role.docx",
         media_type=DOCX_MEDIA_TYPE,
         code="job_description_file_too_complex",

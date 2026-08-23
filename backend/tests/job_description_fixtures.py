@@ -71,6 +71,58 @@ def docx_with_malformed_document_xml() -> bytes:
     return output.getvalue()
 
 
+def docx_with_encrypted_member() -> bytes:
+    data = bytearray(readable_docx())
+    _patch_zip_member_headers(
+        data,
+        filename=b"word/document.xml",
+        flag_bits=1,
+    )
+    return bytes(data)
+
+
+def docx_with_unsupported_compression() -> bytes:
+    data = bytearray(readable_docx())
+    _patch_zip_member_headers(
+        data,
+        filename=b"word/document.xml",
+        compression_method=99,
+    )
+    return bytes(data)
+
+
+def docx_with_forged_small_expanded_size(actual_size: int) -> bytes:
+    prefix = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<w:document xmlns:w="http://schemas.openxmlformats.org/'
+        b'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'
+    )
+    suffix = b"</w:t></w:r></w:p></w:body></w:document>"
+    padding_size = actual_size - len(prefix) - len(suffix)
+    if padding_size < 0:
+        raise ValueError("actual_size is too small for document XML")
+
+    output = BytesIO()
+    with ZipFile(BytesIO(readable_docx())) as source, ZipFile(output, "w") as target:
+        for entry in source.infolist():
+            if entry.filename != "word/document.xml":
+                target.writestr(entry, source.read(entry))
+                continue
+            with target.open(entry, "w") as document_xml:
+                document_xml.write(prefix)
+                chunk = b"x" * 1_000_000
+                remaining = padding_size
+                while remaining:
+                    portion = chunk[: min(remaining, len(chunk))]
+                    document_xml.write(portion)
+                    remaining -= len(portion)
+                document_xml.write(suffix)
+
+    data = bytearray(output.getvalue())
+    _patch_central_file_size(data, b"word/document.xml", 1)
+    return bytes(data)
+
+
 def readable_pdf() -> bytes:
     return text_pdf("Senior Product Designer")
 
@@ -144,16 +196,59 @@ def docx_with_declared_expanded_bytes(size: int) -> bytes:
         package.writestr("padding.bin", b"x")
 
     data = bytearray(output.getvalue())
+    _patch_central_file_size(data, b"padding.bin", size)
+    return bytes(data)
+
+
+def _patch_central_file_size(data: bytearray, filename: bytes, size: int) -> None:
     marker = b"PK\x01\x02"
     offset = 0
     while (offset := data.find(marker, offset)) != -1:
         name_length = int.from_bytes(data[offset + 28 : offset + 30], "little")
-        filename = bytes(data[offset + 46 : offset + 46 + name_length])
-        if filename == b"padding.bin":
+        current_filename = bytes(data[offset + 46 : offset + 46 + name_length])
+        if current_filename == filename:
             data[offset + 24 : offset + 28] = pack("<I", size)
-            return bytes(data)
+            return
         offset += 4
-    raise AssertionError("padding.bin central-directory record not found")
+    raise AssertionError(f"{filename!r} central-directory record not found")
+
+
+def _patch_zip_member_headers(
+    data: bytearray,
+    *,
+    filename: bytes,
+    flag_bits: int | None = None,
+    compression_method: int | None = None,
+) -> None:
+    records = (
+        (b"PK\x03\x04", 26, 30, 6, 8),
+        (b"PK\x01\x02", 28, 46, 8, 10),
+    )
+    for marker, name_length_offset, name_offset, flag_offset, compression_offset in records:
+        offset = 0
+        while (offset := data.find(marker, offset)) != -1:
+            name_length = int.from_bytes(
+                data[
+                    offset + name_length_offset : offset + name_length_offset + 2
+                ],
+                "little",
+            )
+            current_filename = bytes(
+                data[offset + name_offset : offset + name_offset + name_length]
+            )
+            if current_filename == filename:
+                if flag_bits is not None:
+                    data[offset + flag_offset : offset + flag_offset + 2] = pack(
+                        "<H", flag_bits
+                    )
+                if compression_method is not None:
+                    data[
+                        offset + compression_offset : offset + compression_offset + 2
+                    ] = pack("<H", compression_method)
+                break
+            offset += 4
+        else:
+            raise AssertionError(f"{filename!r} ZIP record not found")
 
 
 def docx_with_nested_archive(*, extension: str = ".zip") -> bytes:
