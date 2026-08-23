@@ -8,6 +8,7 @@ from app.candidates.schemas import CandidateExperienceProfile, CandidateProfile
 from app.clients.taxonomy import IndustryTaxonomy
 from app.jobs.legal_policy import DEFAULT_SCORECARD_LEGAL_POLICY
 from app.jobs.schemas import ConfirmedScorecard, CriterionKind, ScorecardCriterion
+from app.jobs.seniority import effective_experience_intervals
 from app.matching.schemas import (
     CriterionEvaluation,
     EvidenceState,
@@ -27,23 +28,6 @@ _SKILL_ALIASES = {
     "payments platform experience": "payments",
     "structured query language": "sql",
     "sql analytics experience": "sql",
-}
-_SENIORITY_ALIASES = {
-    "entry level": "entry",
-    "junior": "entry",
-    "jr": "entry",
-    "individual contributor": "individual_contributor",
-    "ic": "individual_contributor",
-    "manager": "manager",
-    "senior": "senior",
-    "sr": "senior",
-    "lead": "lead",
-    "head": "head",
-    "director": "director",
-    "vice president": "vp",
-    "vp": "vp",
-    "c level": "c_suite",
-    "c suite": "c_suite",
 }
 _LOCATION_ALIASES = {
     "new york": "new york ny",
@@ -157,7 +141,7 @@ class MatchingEngine:
         role_score = _allocate_supported_points(role_atoms, 35)
 
         scope_atoms = self._scope_evaluations(scorecard, candidate)
-        scope_score = _allocate_supported_points(scope_atoms, 25)
+        scope_score = _allocate_supported_points(scope_atoms, 25) if scope_atoms else 0
 
         industry_atom = self._industry_evaluation(scorecard, candidate)
         industry_score = industry_atom.points
@@ -296,66 +280,34 @@ class MatchingEngine:
     def _scope_evaluations(
         self, scorecard: ConfirmedScorecard, candidate: CandidateProfile
     ) -> list[_AtomicEvaluation]:
-        atoms: list[_AtomicEvaluation] = []
-        if scorecard.seniority:
-            if candidate.seniority is None:
-                atoms.append(
-                    _unknown_atom(
-                        "component.seniority", "Seniority", "candidate seniority"
-                    )
-                )
-            else:
-                candidate_level = _canonical_seniority(candidate.seniority)
-                target_levels = {
-                    _canonical_seniority(value) for value in scorecard.seniority
-                }
-                atoms.append(
-                    _evidenced_atom(
-                        key="component.seniority",
-                        label="Seniority",
-                        supported=candidate_level in target_levels,
-                        evidence=(candidate.seniority,),
-                        source_refs=("candidate.seniority",),
-                        evidence_name="candidate seniority",
-                    )
-                )
-        if scorecard.minimum_years is not None or scorecard.maximum_years is not None:
-            if candidate.years_experience is None:
-                atoms.append(
-                    _unknown_atom(
-                        "component.years_experience",
-                        "Years of experience",
-                        "candidate years of experience",
-                    )
-                )
-            else:
-                meets_minimum = (
-                    scorecard.minimum_years is None
-                    or candidate.years_experience >= scorecard.minimum_years
-                )
-                meets_maximum = (
-                    scorecard.maximum_years is None
-                    or candidate.years_experience <= scorecard.maximum_years
-                )
-                atoms.append(
-                    _evidenced_atom(
-                        key="component.years_experience",
-                        label="Years of experience",
-                        supported=meets_minimum and meets_maximum,
-                        evidence=(str(candidate.years_experience),),
-                        source_refs=("candidate.years_experience",),
-                        evidence_name="candidate years of experience",
-                    )
-                )
-        if not atoms:
-            atoms.append(
+        intervals = effective_experience_intervals(
+            scorecard.seniority,
+            scorecard.minimum_years,
+            scorecard.maximum_years,
+        )
+        if not intervals:
+            return []
+        if candidate.years_experience is None:
+            return [
                 _unknown_atom(
-                    "component.scope_seniority_years",
-                    "Scope, seniority, and years",
-                    "confirmed scope or experience requirement",
+                    "component.years_experience",
+                    "Years of experience",
+                    "candidate years of experience",
                 )
+            ]
+        return [
+            _evidenced_atom(
+                key="component.years_experience",
+                label="Years of experience",
+                supported=any(
+                    interval.contains(candidate.years_experience)
+                    for interval in intervals
+                ),
+                evidence=(str(candidate.years_experience),),
+                source_refs=("candidate.years_experience",),
+                evidence_name="candidate years of experience",
             )
-        return atoms
+        ]
 
     def _industry_evaluation(
         self, scorecard: ConfirmedScorecard, candidate: CandidateProfile
@@ -719,11 +671,6 @@ def _title_matches(candidate_title: str, target_title: str) -> bool:
     candidate = _normalize_title(candidate_title)
     target = _normalize_title(target_title)
     return candidate == target or set(target.split()) <= set(candidate.split())
-
-
-def _canonical_seniority(value: str) -> str:
-    normalized = _normalize(value)
-    return _SENIORITY_ALIASES.get(normalized, normalized.replace(" ", "_"))
 
 
 def _canonical_location(value: str) -> str:
