@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import threading
-import time
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from io import BytesIO
@@ -42,16 +41,26 @@ class StaticVerifier:
         return self.claims
 
 
-class BlockingExtractor:
+class ReleasableBlockingExtractor:
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
     def extract(
         self, *, data: bytes, filename: str, media_type: str | None
     ) -> ExtractedJobDescription:
-        time.sleep(0.1)
-        return ExtractedJobDescription(
-            text="late text",
-            filename=filename,
-            media_type=media_type or "application/pdf",
-        )
+        self.entered.set()
+        try:
+            if not self.release.wait(timeout=1):
+                raise RuntimeError("test extractor release timed out")
+            return ExtractedJobDescription(
+                text="late text",
+                filename=filename,
+                media_type=media_type or "application/pdf",
+            )
+        finally:
+            self.finished.set()
 
 
 class RaisingExtractor:
@@ -87,10 +96,15 @@ class TypedErrorExtractor:
 
 
 class LifecycleUpload(UploadFile):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        data: bytes | None = None,
+        *,
+        filename: str = "close-me.pdf",
+    ) -> None:
         super().__init__(
-            file=BytesIO(readable_pdf()),
-            filename="close-me.pdf",
+            file=BytesIO(readable_pdf() if data is None else data),
+            filename=filename,
             headers=Headers({"content-type": "application/pdf"}),
         )
         self.close_completed = False
@@ -99,6 +113,11 @@ class LifecycleUpload(UploadFile):
         await asyncio.sleep(0)
         await super().close()
         self.close_completed = True
+
+
+class ReadFailureUpload(LifecycleUpload):
+    async def read(self, size: int = -1) -> bytes:
+        raise OSError("controlled upload read failure")
 
 
 @contextmanager
@@ -119,11 +138,13 @@ def _document_api(
         email="document-api-owner@agency.test",
         display_name="Document API Owner",
     )
+    other_tenant = Tenant(id=uuid4(), slug=f"document-api-other-{uuid4().hex}")
     with Session(engine) as session:
-        session.add_all((tenant, owner))
+        session.add_all((tenant, other_tenant, owner))
         session.flush()
         session.add(Membership(tenant_id=tenant.id, user_id=owner.id, role=Role.OWNER))
         tenant_id = tenant.id
+        other_tenant_id = other_tenant.id
         session.commit()
 
     app = create_app(
@@ -165,6 +186,7 @@ def _document_api(
                     "Authorization": "Bearer signed-token",
                     "X-Tenant-ID": str(tenant_id),
                 },
+                "other_tenant_id": other_tenant_id,
                 "count_jobs": lambda: count_rows(Job),
                 "count_scorecards": lambda: count_rows(ScorecardVersion),
             }
@@ -298,6 +320,22 @@ def test_extraction_requires_authentication(document_api: dict[str, Any]) -> Non
     assert response.json() == {"detail": {"code": "invalid_token"}}
 
 
+def test_extraction_denies_an_authenticated_principal_outside_the_tenant(
+    document_api: dict[str, Any],
+) -> None:
+    response = document_api["api"].post(
+        "/api/v1/job-descriptions/extract",
+        headers={
+            **document_api["headers"],
+            "X-Tenant-ID": str(document_api["other_tenant_id"]),
+        },
+        files={"file": ("role.pdf", readable_pdf(), "application/pdf")},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": {"code": "tenant_not_found"}}
+
+
 def test_openapi_documents_stable_extraction_responses() -> None:
     operation = create_app().openapi()["paths"]["/api/v1/job-descriptions/extract"][
         "post"
@@ -373,13 +411,19 @@ def test_extractor_timeout_returns_stable_unavailable_error(
         0.01,
         raising=False,
     )
-    with _document_api(monkeypatch, BlockingExtractor()) as document_api:
-        response = _post_files(
-            document_api,
-            [("slow.pdf", readable_pdf(), "application/pdf")],
-        )
+    extractor = ReleasableBlockingExtractor()
+    with _document_api(monkeypatch, extractor) as document_api:
+        try:
+            response = _post_files(
+                document_api,
+                [("slow.pdf", readable_pdf(), "application/pdf")],
+            )
+        finally:
+            extractor.release.set()
+            assert extractor.finished.wait(timeout=1)
 
     assert response.status_code == 503
+    assert extractor.entered.is_set()
     assert response.json() == {
         "detail": {"code": "job_description_extraction_unavailable"}
     }
@@ -415,9 +459,10 @@ def test_unexpected_extractor_error_is_redacted_from_response_and_logs(
     [
         (DefaultJobDescriptionExtractor(), 200),
         (RaisingExtractor(), 503),
+        (TypedErrorExtractor("job_description_text_missing"), 422),
     ],
 )
-def test_upload_close_is_awaited_on_success_and_extractor_failure(
+def test_upload_close_is_awaited_on_success_and_extractor_failures(
     extractor: JobDescriptionExtractor,
     expected_status: int,
 ) -> None:
@@ -437,3 +482,93 @@ def test_upload_close_is_awaited_on_success_and_extractor_failure(
 
     assert asyncio.run(invoke()) == expected_status
     assert upload.close_completed is True
+
+
+@pytest.mark.parametrize(
+    ("upload", "expected_status"),
+    [
+        (LifecycleUpload(b"x" * 10_000_001), 413),
+        (ReadFailureUpload(), 503),
+    ],
+)
+def test_upload_close_is_awaited_on_bounded_read_failures(
+    upload: LifecycleUpload,
+    expected_status: int,
+) -> None:
+    context = RequestContext(tenant_id=uuid4(), user_id=uuid4(), role=Role.OWNER)
+
+    async def invoke() -> int:
+        try:
+            await extract_job_description(
+                _context=context,
+                extractor=DefaultJobDescriptionExtractor(),
+                files=[upload],
+            )
+        except HTTPException as error:
+            return error.status_code
+        return 200
+
+    assert asyncio.run(invoke()) == expected_status
+    assert upload.close_completed is True
+
+
+def test_upload_close_is_awaited_on_timeout_without_leaving_worker_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upload = LifecycleUpload()
+    context = RequestContext(tenant_id=uuid4(), user_id=uuid4(), role=Role.OWNER)
+    cancelled = False
+
+    async def controlled_to_thread(*args: object, **kwargs: object) -> object:
+        nonlocal cancelled
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        raise AssertionError("controlled to_thread unexpectedly completed")
+
+    monkeypatch.setattr(
+        "app.jobs.document_router.EXTRACTION_TIMEOUT_SECONDS",
+        0.001,
+    )
+    monkeypatch.setattr(
+        "app.jobs.document_router.asyncio.to_thread",
+        controlled_to_thread,
+    )
+
+    async def invoke() -> int:
+        try:
+            await extract_job_description(
+                _context=context,
+                extractor=DefaultJobDescriptionExtractor(),
+                files=[upload],
+            )
+        except HTTPException as error:
+            return error.status_code
+        return 200
+
+    assert asyncio.run(invoke()) == 503
+    assert cancelled is True
+    assert upload.close_completed is True
+
+
+def test_every_upload_close_is_awaited_when_cardinality_is_invalid() -> None:
+    first = LifecycleUpload(filename="one.pdf")
+    second = LifecycleUpload(filename="two.pdf")
+    uploads: list[UploadFile] = [first, second]
+    context = RequestContext(tenant_id=uuid4(), user_id=uuid4(), role=Role.OWNER)
+
+    async def invoke() -> int:
+        try:
+            await extract_job_description(
+                _context=context,
+                extractor=DefaultJobDescriptionExtractor(),
+                files=uploads,
+            )
+        except HTTPException as error:
+            return error.status_code
+        return 200
+
+    assert asyncio.run(invoke()) == 400
+    assert [first.close_completed, second.close_completed] == [True, True]
