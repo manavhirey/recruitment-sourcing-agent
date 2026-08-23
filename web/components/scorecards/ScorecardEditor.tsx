@@ -29,6 +29,10 @@ type ScorecardEditorProps = {
   onStarted?: (run: SourcingRun) => void
 }
 
+type ScorecardEditorDraft = Omit<ScorecardDraft, "seniority"> & {
+  seniority: string[]
+}
+
 type ScorecardIntent = {
   fingerprint: string
   saveKey: string
@@ -71,7 +75,7 @@ export function ScorecardEditor({
   onStarted,
 }: ScorecardEditorProps) {
   const router = useRouter()
-  const [draft, setDraft] = useState<ScorecardDraft>(() => ({
+  const [draft, setDraft] = useState<ScorecardEditorDraft>(() => ({
     target_titles: [...(response.draft.target_titles ?? [])],
     criteria: (response.draft.criteria ?? []).map((criterion) => ({ ...criterion })),
     seniority: [...(response.draft.seniority ?? [])],
@@ -215,7 +219,7 @@ export function ScorecardEditor({
     setError(null)
     setIndustryError(null)
     setAdjacencyError(null)
-    const mutationDraft: ScorecardDraft = {
+    const mutationDraft: ScorecardEditorDraft = {
       ...draft,
       confirmed_inferred_items: confirmedInferenceIds,
     }

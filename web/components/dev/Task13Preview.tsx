@@ -40,6 +40,11 @@ export const previewDraft: ScorecardDraftResponse = {
   original_job_description: "Lead a payments platform and product-led growth strategy.",
   extraction_status: "ready",
   extraction_warning: null,
+  seniority_options: [
+    { value: "early_career", label: "Early-Career", minimum_years: 0, maximum_years: 3 },
+    { value: "mid_level", label: "Mid-Level", minimum_years: 3, maximum_years: 9 },
+    { value: "senior", label: "Senior", minimum_years: 10, maximum_years: null },
+  ],
   draft: {
     target_titles: ["Senior Product Manager"],
     criteria: [
