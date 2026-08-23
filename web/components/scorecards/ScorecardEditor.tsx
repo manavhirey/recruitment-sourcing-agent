@@ -69,6 +69,10 @@ function listValues(value: string, separator: string): string[] {
     .filter(Boolean)
 }
 
+function isValidExperienceBound(value: number | null): boolean {
+  return value === null || (Number.isInteger(value) && value >= 0 && value <= 50)
+}
+
 export function ScorecardEditor({
   draft: response,
   allowedIndustryCodes,
@@ -151,10 +155,13 @@ export function ScorecardEditor({
   const minimumYears = draft.minimum_years ?? null
   const maximumYears = draft.maximum_years ?? null
   const customBoundsPresent = minimumYears !== null || maximumYears !== null
-  const yearsValid =
+  const minimumYearsValid = isValidExperienceBound(minimumYears)
+  const maximumYearsValid = isValidExperienceBound(maximumYears)
+  const yearsOrdered =
     minimumYears === null ||
     maximumYears === null ||
     minimumYears <= maximumYears
+  const yearsValid = minimumYearsValid && maximumYearsValid && yearsOrdered
   const structurallyValid =
     draft.target_titles.some((title) => title.trim()) &&
     draft.criteria.length > 0 &&
@@ -536,8 +543,14 @@ export function ScorecardEditor({
                   min={0}
                   max={50}
                   value={draft.minimum_years ?? ""}
-                  aria-invalid={!yearsValid || undefined}
-                  aria-describedby={!yearsValid ? "years-error" : undefined}
+                  aria-invalid={!minimumYearsValid || !yearsOrdered || undefined}
+                  aria-describedby={
+                    !minimumYearsValid
+                      ? "minimum-years-error"
+                      : !yearsOrdered
+                        ? "years-error"
+                        : undefined
+                  }
                   onChange={(event) => {
                     setDraft((current) => ({
                       ...current,
@@ -557,8 +570,14 @@ export function ScorecardEditor({
                   min={0}
                   max={50}
                   value={draft.maximum_years ?? ""}
-                  aria-invalid={!yearsValid || undefined}
-                  aria-describedby={!yearsValid ? "years-error" : undefined}
+                  aria-invalid={!maximumYearsValid || !yearsOrdered || undefined}
+                  aria-describedby={
+                    !maximumYearsValid
+                      ? "maximum-years-error"
+                      : !yearsOrdered
+                        ? "years-error"
+                        : undefined
+                  }
                   onChange={(event) => {
                     setDraft((current) => ({
                       ...current,
@@ -576,7 +595,17 @@ export function ScorecardEditor({
                 Enter a minimum or maximum year.
               </p>
             ) : null}
-            {!yearsValid ? (
+            {!minimumYearsValid ? (
+              <p id="minimum-years-error" className="field-error" role="alert">
+                Minimum years must be a whole number from 0 to 50.
+              </p>
+            ) : null}
+            {!maximumYearsValid ? (
+              <p id="maximum-years-error" className="field-error" role="alert">
+                Maximum years must be a whole number from 0 to 50.
+              </p>
+            ) : null}
+            {!yearsOrdered ? (
               <p id="years-error" className="field-error" role="alert">
                 Maximum years cannot be less than minimum years.
               </p>

@@ -211,6 +211,38 @@ describe("ScorecardEditor", () => {
     })
   })
 
+  it.each([
+    { label: "Minimum years", value: "-1", error: "Minimum years must be a whole number from 0 to 50." },
+    { label: "Minimum years", value: "51", error: "Minimum years must be a whole number from 0 to 50." },
+    { label: "Minimum years", value: "1.5", error: "Minimum years must be a whole number from 0 to 50." },
+    { label: "Maximum years", value: "-1", error: "Maximum years must be a whole number from 0 to 50." },
+    { label: "Maximum years", value: "51", error: "Maximum years must be a whole number from 0 to 50." },
+    { label: "Maximum years", value: "1.5", error: "Maximum years must be a whole number from 0 to 50." },
+  ])("blocks an invalid custom bound before PUT: $label = $value", async ({ label, value, error }) => {
+    const user = userEvent.setup()
+    let putRequests = 0
+    server.use(
+      http.put("/api/bff/jobs/:jobId/scorecard/draft", () => {
+        putRequests += 1
+        return HttpResponse.json({ ...scorecardDraftFixture, draft_revision: 3 })
+      }),
+    )
+    renderEditor({ seniority: [], minimum_years: null, maximum_years: null })
+
+    await user.click(screen.getByRole("checkbox", { name: "Use custom experience range" }))
+    const input = screen.getByLabelText(label)
+    await user.type(input, value)
+
+    expect(input).toHaveAttribute("aria-invalid", "true")
+    const errorId = input.getAttribute("aria-describedby")
+    expect(errorId).toBeTruthy()
+    expect(document.getElementById(errorId ?? "")).toHaveTextContent(error)
+    const confirm = screen.getByRole("button", { name: "Confirm and source" })
+    expect(confirm).toBeDisabled()
+    await user.click(confirm)
+    expect(putRequests).toBe(0)
+  })
+
   it("rejects inverted bounded ranges until the inclusive ordering is valid", async () => {
     const user = userEvent.setup()
     renderEditor({ seniority: [], minimum_years: null, maximum_years: null })
