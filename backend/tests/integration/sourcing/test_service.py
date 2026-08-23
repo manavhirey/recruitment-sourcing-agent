@@ -7,7 +7,7 @@ import pytest
 from app.audit.models import AuditEvent
 from app.clients.models import ClientCompany
 from app.core.database import Base
-from app.identity.models import Tenant, User
+from app.identity.models import IdentityIdempotencyKey, Tenant, User
 from app.identity.schemas import RequestContext, Role
 from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
 from app.sourcing.models import SourcingRun
@@ -143,6 +143,12 @@ def test_unknown_historical_seniority_requires_revision_before_run(
 
     assert (
         scenario["session"].scalar(select(func.count()).select_from(SourcingRun)) == 0
+    )
+    assert (
+        scenario["session"].scalar(
+            select(func.count()).select_from(IdentityIdempotencyKey)
+        )
+        == 0
     )
 
 
