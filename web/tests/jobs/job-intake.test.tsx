@@ -28,6 +28,93 @@ describe("JobIntakeForm", () => {
     expect(screen.getByText("Select a client")).toHaveAttribute("role", "alert")
   })
 
+  it("extracts a PDF into the editable job-description field without including source metadata in job creation", async () => {
+    let createBody: Record<string, unknown> | undefined
+    server.use(
+      http.post("/api/bff/job-descriptions/extract", () =>
+        HttpResponse.json({
+          text: "Senior Product Designer\nLead growth design.",
+          source: { filename: "role.pdf", media_type: "application/pdf" },
+        }),
+      ),
+      http.post("/api/bff/jobs", async ({ request }) => {
+        createBody = await request.json() as Record<string, unknown>
+        return HttpResponse.json({
+          id: "00000000-0000-4000-8000-000000000301",
+          tenant_id: "00000000-0000-4000-8000-000000000001",
+          client_id: authorizedClientsFixture[0].id,
+          owner_user_id: "00000000-0000-4000-8000-000000000401",
+          title: "Product Designer",
+          job_description: "Senior Product Designer\nLead growth design. Edited",
+          location: null,
+          employment_model: null,
+          status: "awaiting_scorecard",
+          draft_revision: 0,
+          extraction_status: "ready",
+          extraction_warning: null,
+          current_scorecard_id: null,
+          created_at: "2026-08-16T00:00:00Z",
+          updated_at: "2026-08-16T00:00:00Z",
+        })
+      }),
+      http.post("/api/bff/jobs/:jobId/scorecard/generate", () =>
+        HttpResponse.json({
+          job_id: "00000000-0000-4000-8000-000000000301",
+          draft_revision: 1,
+          draft: { target_titles: [], criteria: [], seniority: [], minimum_years: null, maximum_years: null, locations: [], industry_code: "", suggested_adjacent_industries: [], uncertainties: [] },
+          original_job_description: "Senior Product Designer\nLead growth design. Edited",
+          extraction_status: "manual_required",
+          extraction_warning: "Enter manually",
+          seniority_options: [],
+        }),
+      ),
+    )
+    const ready = vi.fn()
+    const user = userEvent.setup()
+    render(<JobIntakeForm clients={authorizedClientsFixture} onDraftReady={ready} />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File(["%PDF-1.4"], "role.pdf", { type: "application/pdf" }),
+    )
+    const description = await screen.findByLabelText("Job description")
+    expect(description).toHaveValue("Senior Product Designer\nLead growth design.")
+    await user.type(description, " Edited")
+    await user.selectOptions(screen.getByLabelText("Client"), authorizedClientsFixture[0].id)
+    await user.type(screen.getByLabelText("Job title"), "Product Designer")
+    await user.click(screen.getByRole("button", { name: "Generate scorecard" }))
+
+    await vi.waitFor(() => expect(ready).toHaveBeenCalledOnce())
+    expect(createBody).toEqual({
+      client_id: authorizedClientsFixture[0].id,
+      title: "Product Designer",
+      job_description: "Senior Product Designer\nLead growth design. Edited",
+      location: null,
+      employment_model: null,
+    })
+  })
+
+  it("disables generation while an extraction is in progress while preserving paste-only intake", async () => {
+    let resolveExtraction: ((value: Response) => void) | undefined
+    server.use(http.post("/api/bff/job-descriptions/extract", () => new Promise<Response>((resolve) => {
+      resolveExtraction = resolve
+    })))
+    const user = userEvent.setup()
+    render(<JobIntakeForm clients={authorizedClientsFixture} />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File(["%PDF-1.4"], "role.pdf", { type: "application/pdf" }),
+    )
+    expect(await screen.findByRole("status")).toHaveTextContent("Extracting job description…")
+    expect(screen.getByRole("button", { name: "Generate scorecard" })).toBeDisabled()
+    resolveExtraction?.(HttpResponse.json({
+      text: "Pasted-or-extracted job description",
+      source: { filename: "role.pdf", media_type: "application/pdf" },
+    }))
+    expect(await screen.findByText("Extracted from role.pdf")).toBeVisible()
+  })
+
   it("reuses the same creation idempotency key when a safe retry is needed", async () => {
     const keys: string[] = []
     let attempt = 0
