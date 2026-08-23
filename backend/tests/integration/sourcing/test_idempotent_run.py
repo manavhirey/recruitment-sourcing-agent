@@ -182,7 +182,7 @@ def sourcing_scenario() -> Generator[dict[str, Any], None, None]:
             job_id=job_id,
             version=1,
             target_titles=["Product Manager"],
-            seniority=["manager"],
+            seniority=["mid_level"],
             minimum_years=None,
             maximum_years=None,
             locations=["New York, NY"],
@@ -575,7 +575,7 @@ def test_plan_and_match_tasks_replay_through_production_checkpoints(
             result.classification in {"main", "near_match"} for result in results
         )
         assert all(result.evidence is not None for result in results)
-        assert all(result.scoring_version == "matching-v1" for result in results)
+        assert all(result.scoring_version == "matching-v2" for result in results)
         assert (
             session.scalar(
                 select(func.count())

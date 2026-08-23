@@ -16,8 +16,8 @@
     "hard_gate_f1": 1.0,
     "hard_gate_precision": 1.0,
     "hard_gate_recall": 1.0,
-    "ndcg_at_20": 0.9197207891481876,
+    "ndcg_at_20": 0.9598603945740938,
     "top_20_acceptance_proxy": 0.5
   },
-  "scoring_version": "matching-v1"
+  "scoring_version": "matching-v2"
 }

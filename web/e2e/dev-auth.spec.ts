@@ -17,7 +17,7 @@ test("developer override reaches the real BFF without company sign-in", async ({
 
   await page.getByLabel("Client").selectOption(clientId)
   await page.getByLabel("Job title").fill("Senior Product Manager")
-  await page.getByLabel("Job description").fill(
+  await page.getByRole("textbox", { name: "Job description" }).fill(
     "Lead a payments platform and product-led growth strategy.",
   )
   await page.getByLabel("Location").fill("New York, NY")
