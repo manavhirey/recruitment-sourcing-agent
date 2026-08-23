@@ -31,6 +31,63 @@ function UploadHarness({ initialText = "" }: { initialText?: string }) {
 }
 
 describe("JobDescriptionUpload", () => {
+  it.each([
+    ["role.pdf", "", "application/pdf"],
+    ["role.docx", "application/octet-stream", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+  ])("accepts %s with a generic MIME type and normalizes it for the BFF", async (filename, type, mediaType) => {
+    server.use(http.post("/api/bff/job-descriptions/extract", async ({ request }) => {
+      expect(await request.text()).toContain(`Content-Type: ${mediaType}`)
+      return HttpResponse.json({
+        text: "Extracted text",
+        source: { filename, media_type: mediaType },
+      })
+    }))
+    const user = userEvent.setup({ applyAccept: false })
+    render(<UploadHarness />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File(["document"], filename, { type }),
+    )
+
+    expect(await screen.findByText(`Extracted from ${filename}`)).toBeVisible()
+  })
+
+  it("accepts a job description file at the exact 10 MB limit", async () => {
+    const called = vi.fn(() => HttpResponse.json({
+      text: "Extracted text",
+      source: { filename: "role.pdf", media_type: "application/pdf" },
+    }))
+    server.use(http.post("/api/bff/job-descriptions/extract", called))
+    const user = userEvent.setup()
+    render(<UploadHarness />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File([new Uint8Array(10_000_000)], "role.pdf", { type: "application/pdf" }),
+    )
+
+    expect(await screen.findByText("Extracted from role.pdf")).toBeVisible()
+    expect(called).toHaveBeenCalledOnce()
+  })
+
+  it("rejects a job description file over 10 MB locally and focuses the alert", async () => {
+    const called = vi.fn()
+    server.use(http.post("/api/bff/job-descriptions/extract", called))
+    const user = userEvent.setup()
+    render(<UploadHarness />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File([new Uint8Array(10_000_001)], "role.pdf", { type: "application/pdf" }),
+    )
+
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("The job description file must be 10 MB or smaller.")
+    await vi.waitFor(() => expect(alert).toHaveFocus())
+    expect(called).not.toHaveBeenCalled()
+  })
+
   it("extracts a DOCX and leaves the returned text editable", async () => {
     server.use(http.post("/api/bff/job-descriptions/extract", () => {
       return HttpResponse.json({

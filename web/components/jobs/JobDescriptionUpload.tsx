@@ -6,9 +6,11 @@ import { ModalDialog } from "@/components/layout/ModalDialog"
 import { responseJson } from "@/lib/client-response"
 import type { JobDescriptionExtraction } from "@/lib/schemas"
 
-const supportedTypes = new Set([
-  "application/pdf",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+const maximumFileBytes = 10_000_000
+
+const supportedTypes = new Map([
+  [".pdf", "application/pdf"],
+  [".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
 ])
 
 const extractionMessages: Record<string, string> = {
@@ -34,11 +36,16 @@ export type JobDescriptionUploadProps = {
   onExtracted: (result: JobDescriptionExtraction) => void
 }
 
-function supportedFile(file: File): boolean {
+function inferredMediaType(file: File): string | null {
   const name = file.name.toLowerCase()
-  return supportedTypes.has(file.type.toLowerCase()) && (
-    name.endsWith(".pdf") || name.endsWith(".docx")
-  )
+  return [...supportedTypes].find(([extension]) => name.endsWith(extension))?.[1] ?? null
+}
+
+function canonicalFile(file: File, mediaType: string): File {
+  return new File([file], file.name, {
+    type: mediaType,
+    lastModified: file.lastModified,
+  })
 }
 
 export function JobDescriptionUpload({
@@ -103,13 +110,20 @@ export function JobDescriptionUpload({
     event.currentTarget.value = ""
     if (!file) return
     setError(null)
-    if (!supportedFile(file)) {
+    const mediaType = inferredMediaType(file)
+    if (!mediaType) {
       intent.current = null
       setCanRetry(false)
       showError("job_description_type_unsupported")
       return
     }
-    intent.current = { file, key: crypto.randomUUID() }
+    if (file.size > maximumFileBytes) {
+      intent.current = null
+      setCanRetry(false)
+      showError("job_description_file_too_large")
+      return
+    }
+    intent.current = { file: canonicalFile(file, mediaType), key: crypto.randomUUID() }
     setCanRetry(true)
     if (currentText.trim()) {
       setConfirming(true)
