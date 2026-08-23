@@ -18,11 +18,18 @@ const marcusId = "00000000-0000-4000-8000-000000000502"
 const authSecret = "x8V1qM3rT6yB9nC2pL5sF7hJ0kD4wZ6aQ8eR1tY3uI5oP7gH"
 const jobTitle = "Senior Product Manager"
 const extractedJobDescription = "Senior Product Designer\nLead product design for the growth team."
+const recruiterEditedJobDescription = "Senior Product Designer\nLead growth product design."
 
 type ObservedBffRequest = {
   method: string
   path: string
 }
+
+type InterceptorChecks = {
+  createJobDescriptionMatched: boolean
+}
+
+const interceptorChecks = new WeakMap<Page, InterceptorChecks>()
 
 function observeBffRequests(page: Page): ObservedBffRequest[] {
   const observed: ObservedBffRequest[] = []
@@ -116,6 +123,7 @@ const marcus = {
 
 async function interceptProductionBff(page: Page) {
   let currentRun = run()
+  interceptorChecks.set(page, { createJobDescriptionMatched: false })
   await page.route("**/api/bff/**", async (route) => {
     const request = route.request()
     const url = new URL(request.url())
@@ -153,6 +161,12 @@ async function interceptProductionBff(page: Page) {
       return
     }
     if (pathname === "/api/bff/jobs" && method === "POST") {
+      const requestBody = request.postDataJSON() as { job_description?: unknown }
+      const checks = interceptorChecks.get(page)
+      if (checks) {
+        checks.createJobDescriptionMatched =
+          requestBody.job_description === recruiterEditedJobDescription
+      }
       await json({
         id: jobId,
         tenant_id: tenantId,
@@ -368,12 +382,13 @@ for (const file of [
     await page.getByLabel("Upload job description", { exact: true }).setInputFiles(file)
     const description = page.getByRole("textbox", { name: "Job description" })
     await expect(description).toHaveValue(extractedJobDescription)
-    await description.fill("Senior Product Designer\nLead growth product design.")
+    await description.fill(recruiterEditedJobDescription)
     await page.getByLabel("Client").selectOption(clientId)
     await page.getByLabel("Job title").fill(jobTitle)
     await page.getByRole("button", { name: "Generate scorecard" }).click()
 
     await expect(page.getByRole("heading", { level: 1, name: "Review scorecard" })).toBeVisible()
+    expect(interceptorChecks.get(page)?.createJobDescriptionMatched).toBe(true)
     expect(observed).toEqual([
       { method: "POST", path: "/api/bff/job-descriptions/extract" },
       { method: "POST", path: "/api/bff/jobs" },
