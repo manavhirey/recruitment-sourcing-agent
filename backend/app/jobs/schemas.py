@@ -117,7 +117,6 @@ class ScorecardContent(BaseModel):
         return criterion_ids | adjacent_ids | uncertainty_ids
 
 
-
 class ScorecardDraft(ScorecardContent):
     seniority: list[SeniorityLevel] = Field(max_length=3)  # type: ignore[assignment]
 
@@ -153,6 +152,20 @@ class ScorecardDraft(ScorecardContent):
 class ExtractionStatus(StrEnum):
     READY = "ready"
     MANUAL_REQUIRED = "manual_required"
+
+
+class JobDescriptionSource(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    filename: str
+    media_type: str
+
+
+class JobDescriptionExtractionResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    text: str = Field(min_length=1, max_length=50_000)
+    source: JobDescriptionSource
 
 
 class ClientContext(BaseModel):
