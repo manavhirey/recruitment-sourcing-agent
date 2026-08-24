@@ -53,7 +53,7 @@ def _draft(title: str, key: str) -> ScorecardDraft:
                 source_text=f"{key} experience",
             )
         ],
-        seniority=["manager"],
+        seniority=["senior"],
         minimum_years=5,
         maximum_years=12,
         locations=["India"],

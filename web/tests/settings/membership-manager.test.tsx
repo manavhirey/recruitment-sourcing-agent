@@ -16,6 +16,10 @@ const member = {
   active: true,
 }
 
+function futureExpiry(): string {
+  return new Date(Date.now() + 60 * 60 * 1_000).toISOString()
+}
+
 afterEach(() => vi.restoreAllMocks())
 
 describe("MembershipManager", () => {
@@ -33,7 +37,7 @@ describe("MembershipManager", () => {
         return HttpResponse.json({
           invitation_id: "00000000-0000-4000-8000-000000000901",
           token: "one-time-secret",
-          expires_at: "2026-08-23T00:00:00Z",
+          expires_at: futureExpiry(),
         }, { headers: { "Cache-Control": "no-store" } })
       }),
     )
@@ -67,7 +71,7 @@ describe("MembershipManager", () => {
       return HttpResponse.json({
         invitation_id: `00000000-0000-4000-8000-00000000090${issued}`,
         token: `one-time-secret-${issued}`,
-        expires_at: "2026-08-23T00:00:00Z",
+        expires_at: futureExpiry(),
       })
     }))
     render(<MembershipManager role="owner" members={[member]} clients={[]} />)

@@ -49,6 +49,8 @@ type SuggestedItem = {
   kind: "criterion" | "adjacent" | "uncertainty"
 }
 
+const existingRunCodes = new Set(["active_run_exists", "scorecard_run_exists"])
+
 function newCriterion(kind: ScorecardCriterion["kind"], position: number): ScorecardCriterion {
   return {
     key: `manual_${kind}_${position + 1}`,
@@ -229,6 +231,10 @@ export function ScorecardEditor({
     intent.current = null
   }
 
+  function openJobWorkspace() {
+    router.push(`/jobs/${response.job_id}`)
+  }
+
   async function confirmAndSource() {
     if (inFlight.current || !allSuggestionsResolved || !structurallyValid) return
     inFlight.current = true
@@ -297,7 +303,7 @@ export function ScorecardEditor({
         }),
       )
       if (onStarted) onStarted(run)
-      else router.push("/jobs")
+      else openJobWorkspace()
     } catch (caught) {
       if (reauthenticateExpiredSession(caught, router)) return
       const code = caught instanceof Error ? caught.message : "request_failed"
@@ -305,6 +311,8 @@ export function ScorecardEditor({
         setIndustryError("Choose an industry assigned to this client.")
       } else if (code === "scorecard_adjacency_not_approved") {
         setAdjacencyError("Delete adjacent industries that are not approved for this client.")
+      } else if (existingRunCodes.has(code)) {
+        openJobWorkspace()
       } else {
         setError(
           code === "scorecard_revision_conflict"
@@ -338,12 +346,12 @@ export function ScorecardEditor({
         }),
       )
       if (onStarted) onStarted(run)
-      else router.push("/jobs")
+      else openJobWorkspace()
     } catch (caught) {
       if (reauthenticateExpiredSession(caught, router)) return
       const code = caught instanceof Error ? caught.message : "request_failed"
-      if (code === "active_run_exists" || code === "scorecard_run_exists") {
-        router.push("/jobs")
+      if (existingRunCodes.has(code)) {
+        openJobWorkspace()
       } else {
         setError("Sourcing was not started. Retry uses the same safe request.")
       }
