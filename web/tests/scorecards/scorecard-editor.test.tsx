@@ -458,6 +458,34 @@ describe("ScorecardEditor", () => {
     )
   })
 
+  it.each(["active_run_exists", "scorecard_run_exists"])(
+    "opens the job workspace when confirmation races with %s",
+    async (code) => {
+      server.use(
+        http.put("/api/bff/jobs/:jobId/scorecard/draft", () =>
+          HttpResponse.json({ ...scorecardDraftFixture, draft_revision: 3 }),
+        ),
+        http.post("/api/bff/jobs/:jobId/scorecard/confirm", () =>
+          HttpResponse.json({ id: "scorecard-1" }),
+        ),
+        http.post("/api/bff/jobs/:jobId/runs", () =>
+          HttpResponse.json({ code }, { status: 409 }),
+        ),
+      )
+      renderEditor()
+
+      await userEvent.click(
+        screen.getByRole("button", { name: "Confirm and source" }),
+      )
+
+      await vi.waitFor(() =>
+        expect(navigationMocks.push).toHaveBeenCalledWith(
+          `/jobs/${scorecardDraftFixture.job_id}`,
+        ),
+      )
+    },
+  )
+
   it("attaches an authoritative client-industry failure to the selector", async () => {
     const user = userEvent.setup()
     server.use(
