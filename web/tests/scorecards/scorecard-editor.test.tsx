@@ -443,6 +443,21 @@ describe("ScorecardEditor", () => {
     await vi.waitFor(() => expect(started).toHaveBeenCalledOnce())
   })
 
+  it("opens the job workspace after starting sourcing", async () => {
+    successfulFlow()
+    renderEditor()
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm and source" }),
+    )
+
+    await vi.waitFor(() =>
+      expect(navigationMocks.push).toHaveBeenCalledWith(
+        `/jobs/${scorecardDraftFixture.job_id}`,
+      ),
+    )
+  })
+
   it("attaches an authoritative client-industry failure to the selector", async () => {
     const user = userEvent.setup()
     server.use(
@@ -505,6 +520,57 @@ describe("ScorecardEditor", () => {
     expect(sourceKeys).toHaveLength(2)
     expect(new Set(sourceKeys).size).toBe(1)
   })
+
+  it("opens the job workspace when sourcing a confirmed scorecard", async () => {
+    server.use(
+      http.post("/api/bff/jobs/:jobId/runs", () =>
+        HttpResponse.json({ id: "run-1" }),
+      ),
+    )
+    render(
+      <ScorecardEditor
+        draft={scorecardDraftFixture}
+        allowedIndustryCodes={allowedIndustryCodes}
+        alreadyConfirmed
+      />,
+    )
+
+    await userEvent.click(screen.getByRole("button", { name: "Start sourcing" }))
+
+    await vi.waitFor(() =>
+      expect(navigationMocks.push).toHaveBeenCalledWith(
+        `/jobs/${scorecardDraftFixture.job_id}`,
+      ),
+    )
+  })
+
+  it.each(["active_run_exists", "scorecard_run_exists"])(
+    "opens the job workspace when the API reports %s",
+    async (code) => {
+      server.use(
+        http.post("/api/bff/jobs/:jobId/runs", () =>
+          HttpResponse.json({ code }, { status: 409 }),
+        ),
+      )
+      render(
+        <ScorecardEditor
+          draft={scorecardDraftFixture}
+          allowedIndustryCodes={allowedIndustryCodes}
+          alreadyConfirmed
+        />,
+      )
+
+      await userEvent.click(
+        screen.getByRole("button", { name: "Start sourcing" }),
+      )
+
+      await vi.waitFor(() =>
+        expect(navigationMocks.push).toHaveBeenCalledWith(
+          `/jobs/${scorecardDraftFixture.job_id}`,
+        ),
+      )
+    },
+  )
 
   it("reauthenticates when sourcing from an open page with an expired session", async () => {
     server.use(

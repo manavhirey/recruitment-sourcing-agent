@@ -297,7 +297,7 @@ export function ScorecardEditor({
         }),
       )
       if (onStarted) onStarted(run)
-      else router.push("/jobs")
+      else router.push(`/jobs/${response.job_id}`)
     } catch (caught) {
       if (reauthenticateExpiredSession(caught, router)) return
       const code = caught instanceof Error ? caught.message : "request_failed"
@@ -338,12 +338,12 @@ export function ScorecardEditor({
         }),
       )
       if (onStarted) onStarted(run)
-      else router.push("/jobs")
+      else router.push(`/jobs/${response.job_id}`)
     } catch (caught) {
       if (reauthenticateExpiredSession(caught, router)) return
       const code = caught instanceof Error ? caught.message : "request_failed"
       if (code === "active_run_exists" || code === "scorecard_run_exists") {
-        router.push("/jobs")
+        router.push(`/jobs/${response.job_id}`)
       } else {
         setError("Sourcing was not started. Retry uses the same safe request.")
       }

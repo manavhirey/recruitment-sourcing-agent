@@ -319,9 +319,8 @@ test("real authenticated route crosses Next BFF and deterministic FastAPI", asyn
   expect(createdJobId).toMatch(/^[0-9a-f-]{36}$/)
   await expect(page.getByRole("heading", { level: 1, name: "Senior Product Manager" })).toBeVisible()
   await page.getByRole("button", { name: "Confirm and source" }).click()
-  await expect(page).toHaveURL(/\/jobs$/)
+  await expect(page).toHaveURL(new RegExp(`/jobs/${createdJobId}$`))
 
-  await page.goto(`/jobs/${createdJobId}`)
   await expect(page.getByRole("heading", { level: 1, name: "Senior Product Manager" })).toBeVisible()
   await expect(page.getByRole("button", { name: /Priya Sharma.*92/ })).toBeVisible()
   await page.getByRole("button", { name: "Shortlist" }).click()
