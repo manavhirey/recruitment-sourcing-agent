@@ -414,6 +414,50 @@ describe("document extraction BFF boundary", () => {
     expect(callApi).not.toHaveBeenCalled()
   })
 
+  it("rejects ordinary quoted multipart boundary parameters", async () => {
+    const boundary = "quoted-boundary"
+    const consumed: number[] = []
+    const callApi = vi.fn().mockResolvedValue({
+      text: "Role",
+      source: { filename: "role.pdf", media_type: "application/pdf" },
+    })
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        rawFileOpening(boundary),
+        textEncoder.encode("%PDF-1.4"),
+        textEncoder.encode(`\r\n--${boundary}--\r\n`),
+      ], consumed, { boundary: `"${boundary}"` }),
+      { appUrl, readTenant: async () => tenantId, callApi },
+    )
+
+    await expectError(response, 400, "job_description_file_required")
+    expect(callApi).not.toHaveBeenCalled()
+  })
+
+  it("rejects escaped-quote multipart boundary parser differentials", async () => {
+    const declaredBoundary = '"probe\\"actual"'
+    const probeBoundary = "probe\\"
+    const actualBoundary = 'probe"actual'
+    const consumed: number[] = []
+    const callApi = vi.fn().mockResolvedValue({
+      text: "Role",
+      source: { filename: "role.pdf", media_type: "application/pdf" },
+    })
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        rawFileOpening(probeBoundary),
+        textEncoder.encode("ignored preamble\r\n"),
+        rawFileOpening(actualBoundary, [`X-Oversized: ${"x".repeat(8_193)}`]),
+        textEncoder.encode("%PDF-1.4"),
+        textEncoder.encode(`\r\n--${actualBoundary}--\r\n`),
+      ], consumed, { boundary: declaredBoundary }),
+      { appUrl, readTenant: async () => tenantId, callApi },
+    )
+
+    await expectError(response, 400, "job_description_file_required")
+    expect(callApi).not.toHaveBeenCalled()
+  })
+
   it("rejects multipart parts beyond the bounded header count", async () => {
     const boundary = "header-count-boundary"
     const consumed: number[] = []

@@ -33,10 +33,10 @@ function declaredBodyTooLarge(request: Request): boolean {
 }
 
 function multipartBoundary(contentType: string): string | null {
-  const match = /(?:^|;)\s*boundary=(?:"([^"]*)"|([^;\s"]+))/i.exec(
+  const match = /(?:^|;)\s*boundary=([!#$%&'*+\-.^_`|~0-9A-Za-z]+)\s*(?:;|$)/i.exec(
     contentType,
   )
-  const boundary = match?.[1] ?? match?.[2]
+  const boundary = match?.[1]
   if (
     !boundary ||
     Buffer.byteLength(boundary, "latin1") > 70 ||

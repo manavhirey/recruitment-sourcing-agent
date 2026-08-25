@@ -4,7 +4,7 @@
 
 **Goal:** Close the two security findings that keep PR #4 in draft: multipart preambles bypassing BFF part-header limits and PDF Form XObject streams bypassing the decoded-byte limit.
 
-**Architecture:** Treat the browser-facing multipart ingress as a strict profile: extract the declared boundary, require its opening delimiter at byte zero, and measure only the actual first part header block. For PDFs, walk every reachable Form XObject resource iteratively, deduplicate stream objects, and add their decoded bytes to the existing document-wide budget before text extraction.
+**Architecture:** Treat the browser-facing multipart ingress as a strict profile: accept only browser-generated unquoted token boundary parameters, require the opening delimiter at byte zero, and measure only the actual first part header block. For PDFs, walk every reachable Form XObject resource iteratively, deduplicate stream objects, and add their decoded bytes to the existing document-wide budget before text extraction.
 
 **Tech Stack:** TypeScript, Next.js BFF, `@fastify/busboy`, Vitest, Python 3.12, `pypdf`, pytest.
 
@@ -14,6 +14,7 @@
 
 - Preserve the exact public error codes: malformed multipart is `job_description_file_required`; excessive body/file size is `job_description_file_too_large`; excessive decoded PDF complexity is `job_description_file_too_complex`.
 - Preserve the 10,000,000-byte file limit, 8,192-byte multipart part-header limit, 8-header-pair limit, and 50,000,000-byte aggregate decoded-PDF limit.
+- Reject every quoted multipart boundary parameter; supported browser `FormData` requests use unquoted token values.
 - Authentication and tenant resolution must still occur before any request-body read.
 - Do not add OCR or persist uploaded source documents.
 - Use strict TDD: add each regression test first, run it against the vulnerable implementation, record the expected failure, then write production code.
@@ -71,12 +72,14 @@ Expected: FAIL because the current probe treats the preamble’s first blank lin
 
 - [ ] **Step 3: Make the multipart probe boundary-aware**
 
-Add a private boundary parser that accepts quoted and unquoted boundary parameters, rejects missing/empty/CRLF/over-70-byte values, and returns the exact boundary Busboy is expected to parse.
+Add a private boundary parser that accepts only complete unquoted HTTP token boundary parameters and rejects every quoted, missing, empty, CRLF, or over-70-byte value. This deliberately avoids duplicating Busboy's quoted-string escaping rules.
 
 ```ts
 function multipartBoundary(contentType: string): string | null {
-  const match = /(?:^|;)\s*boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType)
-  const boundary = match?.[1] ?? match?.[2]
+  const match = /(?:^|;)\s*boundary=([!#$%&'*+\-.^_`|~0-9A-Za-z]+)\s*(?:;|$)/i.exec(
+    contentType,
+  )
+  const boundary = match?.[1]
   if (
     !boundary ||
     Buffer.byteLength(boundary, "latin1") > 70 ||
