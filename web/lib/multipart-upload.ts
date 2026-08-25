@@ -32,6 +32,20 @@ function declaredBodyTooLarge(request: Request): boolean {
   return Number.isSafeInteger(parsed) && parsed > maximumBodyBytes
 }
 
+function multipartBoundary(contentType: string): string | null {
+  const match = /(?:^|;)\s*boundary=(?:"([^"]*)"|([^;\s"]+))/i.exec(
+    contentType,
+  )
+  const boundary = match?.[1] ?? match?.[2]
+  if (
+    !boundary ||
+    Buffer.byteLength(boundary, "latin1") > 70 ||
+    boundary.includes("\r") ||
+    boundary.includes("\n")
+  ) return null
+  return boundary
+}
+
 export async function readMultipartUpload(
   request: Request,
 ): Promise<MultipartUpload> {
@@ -48,6 +62,11 @@ export async function readMultipartUpload(
   if (!request.body) {
     throw new MultipartUploadError("job_description_file_required")
   }
+  const boundary = multipartBoundary(contentType)
+  if (boundary === null) {
+    throw new MultipartUploadError("job_description_file_required")
+  }
+  const openingDelimiter = Buffer.from(`--${boundary}\r\n`, "latin1")
 
   let parser
   try {
@@ -135,19 +154,32 @@ export async function readMultipartUpload(
           headerProbe,
           Buffer.from(value).subarray(0, Math.max(0, remaining)),
         ])
-        const headerEnd = headerProbe.indexOf("\r\n\r\n")
+        const delimiterProbeBytes = Math.min(
+          headerProbe.byteLength,
+          openingDelimiter.byteLength,
+        )
+        if (
+          !headerProbe
+            .subarray(0, delimiterProbeBytes)
+            .equals(openingDelimiter.subarray(0, delimiterProbeBytes))
+        ) {
+          throw new MultipartUploadError("job_description_file_required")
+        }
+        const headerEnd = headerProbe.indexOf(
+          "\r\n\r\n",
+          openingDelimiter.byteLength,
+        )
         if (headerEnd >= 0) {
-          const boundaryEnd = headerProbe.indexOf("\r\n")
-          const headerCount = boundaryEnd < 0
-            ? 0
-            : headerProbe
-              .subarray(boundaryEnd + 2, headerEnd)
-              .toString("latin1")
-              .split("\r\n")
-              .filter(Boolean).length
+          const headerSlice = headerProbe.subarray(
+            openingDelimiter.byteLength,
+            headerEnd,
+          )
+          const headerCount = headerSlice
+            .toString("latin1")
+            .split("\r\n")
+            .filter(Boolean).length
           if (
-            boundaryEnd < 2 ||
-            headerEnd - boundaryEnd - 2 > maximumHeaderBytes ||
+            headerSlice.byteLength > maximumHeaderBytes ||
             headerCount > maximumHeaderPairs
           ) {
             throw new MultipartUploadError(

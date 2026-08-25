@@ -5,7 +5,13 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE
 from pypdf import PdfWriter
-from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+from pypdf.generic import (
+    ArrayObject,
+    DecodedStreamObject,
+    DictionaryObject,
+    NameObject,
+    NumberObject,
+)
 
 
 def readable_docx() -> bytes:
@@ -186,6 +192,48 @@ def pdf_with_decoded_content_sizes(sizes: tuple[int, ...]) -> bytes:
         stream = DecodedStreamObject()
         stream.set_data(b" " * size)
         page[NameObject("/Contents")] = writer._add_object(stream.flate_encode(9))
+    writer.write(output)
+    return output.getvalue()
+
+
+def pdf_with_form_xobject_decoded_sizes(sizes: tuple[int, ...]) -> bytes:
+    if not sizes:
+        raise ValueError("at least one Form XObject size is required")
+
+    output = BytesIO()
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    next_form = None
+    for index in range(len(sizes) - 1, -1, -1):
+        content = b""
+        resources = DictionaryObject()
+        if next_form is not None:
+            name = NameObject(f"/Form{index + 1}")
+            content = f"q {name} Do Q".encode()
+            resources[NameObject("/XObject")] = DictionaryObject({name: next_form})
+        if len(content) > sizes[index]:
+            raise ValueError("Form XObject size is too small for nested content")
+
+        stream = DecodedStreamObject()
+        stream.set_data(content.ljust(sizes[index], b" "))
+        stream.update(
+            {
+                NameObject("/Type"): NameObject("/XObject"),
+                NameObject("/Subtype"): NameObject("/Form"),
+                NameObject("/BBox"): ArrayObject(
+                    [NumberObject(0), NumberObject(0), NumberObject(1), NumberObject(1)]
+                ),
+                NameObject("/Resources"): resources,
+            }
+        )
+        next_form = writer._add_object(stream.flate_encode(9))
+
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/XObject"): DictionaryObject({NameObject("/Form0"): next_form})}
+    )
+    page_content = DecodedStreamObject()
+    page_content.set_data(b"q /Form0 Do Q")
+    page[NameObject("/Contents")] = writer._add_object(page_content)
     writer.write(output)
     return output.getvalue()
 

@@ -11,7 +11,9 @@ from docx.opc.exceptions import PackageNotFoundError
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from pypdf import PdfReader
-from pypdf.errors import PdfReadError
+from pypdf._page import PageObject
+from pypdf.errors import PyPdfError
+from pypdf.generic import DictionaryObject, IndirectObject, PdfObject, StreamObject
 
 from app.core.errors import AppError
 
@@ -99,6 +101,61 @@ class DefaultJobDescriptionExtractor:
         )
 
 
+def _pdf_decoded_stream_bytes(page: PageObject) -> int:
+    decoded_bytes = 0
+    pending_resources: list[PdfObject | None] = [page.get("/Resources")]
+    seen_streams: set[tuple[int, int] | int] = set()
+    while pending_resources:
+        resource_reference = pending_resources.pop()
+        if resource_reference is None:
+            continue
+        resources = resource_reference.get_object()
+        if not isinstance(resources, DictionaryObject):
+            raise DocumentExtractionError("job_description_file_unreadable")
+
+        xobject_reference = resources.get("/XObject")
+        if xobject_reference is None:
+            continue
+        if not isinstance(xobject_reference, PdfObject):
+            raise DocumentExtractionError("job_description_file_unreadable")
+        xobjects = xobject_reference.get_object()
+        if not isinstance(xobjects, DictionaryObject):
+            raise DocumentExtractionError("job_description_file_unreadable")
+
+        for stream_reference in xobjects.values():
+            if not isinstance(stream_reference, PdfObject):
+                raise DocumentExtractionError("job_description_file_unreadable")
+            stream = stream_reference.get_object()
+            if not isinstance(stream, StreamObject):
+                raise DocumentExtractionError("job_description_file_unreadable")
+            if stream.get("/Subtype") != "/Form":
+                continue
+
+            indirect_reference = (
+                stream_reference
+                if isinstance(stream_reference, IndirectObject)
+                else stream.indirect_reference
+            )
+            stream_key: tuple[int, int] | int = (
+                (indirect_reference.idnum, indirect_reference.generation)
+                if isinstance(indirect_reference, IndirectObject)
+                else id(stream)
+            )
+            if stream_key in seen_streams:
+                continue
+            seen_streams.add(stream_key)
+
+            decoded_bytes += len(stream.get_data())
+            if decoded_bytes > MAX_PDF_DECODED_BYTES:
+                raise DocumentExtractionError("job_description_file_too_complex")
+
+            form_resources = stream.get("/Resources")
+            if form_resources is not None and not isinstance(form_resources, PdfObject):
+                raise DocumentExtractionError("job_description_file_unreadable")
+            pending_resources.append(form_resources)
+    return decoded_bytes
+
+
 def _pdf_text(data: bytes) -> str:
     try:
         reader = PdfReader(BytesIO(data), strict=True)
@@ -109,15 +166,17 @@ def _pdf_text(data: bytes) -> str:
         decoded_bytes = 0
         for page in reader.pages:
             contents = page.get_contents()
-            if contents is None:
-                continue
-            decoded_bytes += len(contents.get_data())
+            if contents is not None:
+                decoded_bytes += len(contents.get_data())
+                if decoded_bytes > MAX_PDF_DECODED_BYTES:
+                    raise DocumentExtractionError("job_description_file_too_complex")
+            decoded_bytes += _pdf_decoded_stream_bytes(page)
             if decoded_bytes > MAX_PDF_DECODED_BYTES:
                 raise DocumentExtractionError("job_description_file_too_complex")
         return "\n\n".join(page.extract_text() or "" for page in reader.pages)
     except DocumentExtractionError:
         raise
-    except (PdfReadError, OSError, ValueError, KeyError) as error:
+    except (PyPdfError, NotImplementedError, OSError, ValueError, KeyError) as error:
         raise DocumentExtractionError("job_description_file_unreadable") from error
 
 

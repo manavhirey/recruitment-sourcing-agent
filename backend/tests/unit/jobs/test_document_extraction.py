@@ -1,5 +1,6 @@
 import pytest
 
+from app.jobs import document_extraction
 from app.jobs.document_extraction import (
     DefaultJobDescriptionExtractor,
     DocumentExtractionError,
@@ -20,6 +21,7 @@ from tests.job_description_fixtures import (
     encrypted_pdf,
     interleaved_docx,
     pdf_with_decoded_content_sizes,
+    pdf_with_form_xobject_decoded_sizes,
     pdf_with_pages,
     readable_docx,
     readable_pdf,
@@ -280,6 +282,34 @@ def test_rejects_aggregate_pdf_decoded_content_over_fifty_million_bytes(
     assert_extraction_error(
         extractor,
         data=pdf_with_decoded_content_sizes((25_000_001, 25_000_000)),
+        filename="role.pdf",
+        media_type=PDF_MEDIA_TYPE,
+        code="job_description_file_too_complex",
+    )
+
+
+def test_rejects_pdf_when_form_xobject_exceeds_decoded_budget(
+    extractor: DefaultJobDescriptionExtractor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(document_extraction, "MAX_PDF_DECODED_BYTES", 100)
+    assert_extraction_error(
+        extractor,
+        data=pdf_with_form_xobject_decoded_sizes((101,)),
+        filename="role.pdf",
+        media_type=PDF_MEDIA_TYPE,
+        code="job_description_file_too_complex",
+    )
+
+
+def test_rejects_pdf_when_nested_form_xobject_exceeds_decoded_budget(
+    extractor: DefaultJobDescriptionExtractor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(document_extraction, "MAX_PDF_DECODED_BYTES", 100)
+    assert_extraction_error(
+        extractor,
+        data=pdf_with_form_xobject_decoded_sizes((16, 85)),
         filename="role.pdf",
         media_type=PDF_MEDIA_TYPE,
         code="job_description_file_too_complex",

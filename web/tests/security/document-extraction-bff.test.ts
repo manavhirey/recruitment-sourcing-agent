@@ -396,6 +396,24 @@ describe("document extraction BFF boundary", () => {
     expect(callApi).not.toHaveBeenCalled()
   })
 
+  it("rejects a preamble that could hide oversized part headers", async () => {
+    const boundary = "preamble-header-boundary"
+    const consumed: number[] = []
+    const callApi = vi.fn()
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        textEncoder.encode("accepted preamble\r\n\r\n"),
+        rawFileOpening(boundary, [`X-Oversized: ${"x".repeat(8_193)}`]),
+        textEncoder.encode("%PDF-1.4"),
+        textEncoder.encode(`\r\n--${boundary}--\r\n`),
+      ], consumed, { boundary }),
+      { appUrl, readTenant: async () => tenantId, callApi },
+    )
+
+    await expectError(response, 400, "job_description_file_required")
+    expect(callApi).not.toHaveBeenCalled()
+  })
+
   it("rejects multipart parts beyond the bounded header count", async () => {
     const boundary = "header-count-boundary"
     const consumed: number[] = []
