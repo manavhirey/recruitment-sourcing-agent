@@ -590,6 +590,78 @@ def test_plan_and_match_tasks_replay_through_production_checkpoints(
         )
 
 
+def test_historical_seniority_match_task_fails_once_and_replays_as_noop(
+    sourcing_scenario: dict[str, Any],
+) -> None:
+    scenario = sourcing_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    execute_source_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        gateway_factory=HundredPersonGateway,
+        idempotency_key="source:historical-seniority",
+    )
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        scorecard = session.get(ScorecardVersion, run.scorecard_version_id)
+        assert scorecard is not None
+        scorecard.seniority = ["manager"]
+        session.commit()
+
+    execute_match_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        idempotency_key="match:historical-seniority",
+    )
+    execute_match_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        idempotency_key="match:historical-seniority",
+    )
+
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        assert run.state is RunState.FAILED
+        assert run.current_stage == RunState.FAILED.value
+        assert run.error_code == "scorecard_seniority_revision_required"
+        assert run.error_message == (
+            "The scorecard must be revised before matching can continue."
+        )
+        assert run.completed_at is not None
+        checkpoint = session.scalar(
+            select(RunCheckpoint).where(
+                RunCheckpoint.run_id == run.id,
+                RunCheckpoint.idempotency_key == "match:historical-seniority",
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.status == "completed"
+        assert checkpoint.payload == {
+            "state": "failed",
+            "error_code": "scorecard_seniority_revision_required",
+        }
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(RunCandidate)
+                .where(
+                    RunCandidate.run_id == run.id,
+                    RunCandidate.match_score.is_not(None),
+                )
+            )
+            == 0
+        )
+
+
 @pytest.mark.parametrize(
     ("first_page_succeeds", "expected_state", "expected_count"),
     [

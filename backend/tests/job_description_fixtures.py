@@ -9,6 +9,7 @@ from pypdf.generic import (
     ArrayObject,
     DecodedStreamObject,
     DictionaryObject,
+    EncodedStreamObject,
     NameObject,
     NumberObject,
 )
@@ -192,6 +193,29 @@ def pdf_with_decoded_content_sizes(sizes: tuple[int, ...]) -> bytes:
         stream = DecodedStreamObject()
         stream.set_data(b" " * size)
         page[NameObject("/Contents")] = writer._add_object(stream.flate_encode(9))
+    writer.write(output)
+    return output.getvalue()
+
+
+def pdf_with_run_length_decoded_size(size: int) -> bytes:
+    encoded = bytearray()
+    remaining = size
+    while remaining:
+        run_size = min(128, remaining)
+        if run_size == 1:
+            encoded.extend((0, 32))
+        else:
+            encoded.extend((257 - run_size, 32))
+        remaining -= run_size
+    encoded.append(128)
+
+    output = BytesIO()
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    stream = EncodedStreamObject()
+    stream._data = bytes(encoded)
+    stream[NameObject("/Filter")] = NameObject("/RunLengthDecode")
+    page[NameObject("/Contents")] = writer._add_object(stream)
     writer.write(output)
     return output.getvalue()
 

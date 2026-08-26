@@ -76,6 +76,25 @@ class TimeoutExtractionRunner:
         raise TimeoutError("controlled runner timeout")
 
 
+class DisconnectingExtractionRunner:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    async def run(
+        self,
+        *,
+        data: bytes,
+        filename: str,
+        media_type: str | None,
+        timeout_seconds: float,
+    ) -> ExtractedJobDescription:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
 def blocking_process_worker(
     _connection: Connection,
     _data: bytes,
@@ -234,6 +253,25 @@ def _multipart_part(
     return f"--{boundary}\r\n{header_block}\r\n\r\n".encode() + contents + b"\r\n"
 
 
+def _multipart_part_with_header_bytes(boundary: str, header_bytes: int) -> bytes:
+    headers = [
+        'Content-Disposition: form-data; name="file"; filename="role.pdf"',
+        "Content-Type: application/pdf",
+        "X-Padding: ",
+    ]
+    fixed_bytes = len("\r\n".join(headers).encode())
+    if header_bytes < fixed_bytes:
+        raise ValueError("header_bytes is too small")
+    return _multipart_part(
+        boundary,
+        name="file",
+        filename="role.pdf",
+        media_type="application/pdf",
+        contents=b"%PDF-1.4",
+        extra_headers=(("X-Padding", "x" * (header_bytes - fixed_bytes)),),
+    )
+
+
 def _streaming_post(
     document_api: dict[str, Any],
     chunks: list[tuple[str, bytes]],
@@ -302,6 +340,65 @@ def _streaming_post(
         )
 
     return asyncio.run(invoke()), consumed
+
+
+def _disconnecting_post(
+    document_api: dict[str, Any],
+    body: bytes,
+    *,
+    headers: dict[str, str],
+) -> Response:
+    async def invoke() -> Response:
+        messages: Iterator[dict[str, object]] = iter(
+            (
+                {"type": "http.request", "body": body, "more_body": False},
+                {"type": "http.disconnect"},
+            )
+        )
+        response_status = 500
+        response_headers: list[tuple[bytes, bytes]] = []
+        response_body = bytearray()
+
+        async def receive() -> dict[str, object]:
+            return next(messages)
+
+        async def send(message: dict[str, Any]) -> None:
+            nonlocal response_status, response_headers
+            if message["type"] == "http.response.start":
+                response_status = message["status"]
+                response_headers = message.get("headers", [])
+            elif message["type"] == "http.response.body":
+                response_body.extend(message.get("body", b""))
+
+        raw_headers = [
+            (key.lower().encode(), value.encode()) for key, value in headers.items()
+        ]
+        await document_api["app"](
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "https",
+                "path": "/api/v1/job-descriptions/extract",
+                "raw_path": b"/api/v1/job-descriptions/extract",
+                "query_string": b"",
+                "root_path": "",
+                "headers": raw_headers,
+                "client": ("127.0.0.1", 50000),
+                "server": ("testserver", 443),
+                "state": {},
+            },
+            receive,
+            send,
+        )
+        return Response(
+            response_status,
+            headers=response_headers,
+            content=bytes(response_body),
+        )
+
+    return asyncio.run(invoke())
 
 
 def test_pdf_extraction_returns_text_without_persisting_domain_rows(
@@ -600,7 +697,7 @@ def test_raw_multipart_rejects_oversized_part_headers(
                         filename="role.pdf",
                         media_type="application/pdf",
                         contents=b"%PDF-1.4",
-                        extra_headers=(("X-Oversized", "x" * 1_025),),
+                        extra_headers=(("X-Oversized", "x" * 8_193),),
                     )
                     + f"--{boundary}--\r\n".encode(),
                 )
@@ -613,6 +710,35 @@ def test_raw_multipart_rejects_oversized_part_headers(
 
     assert response.status_code == 400
     assert response.json() == {"detail": {"code": "job_description_file_required"}}
+
+
+@pytest.mark.parametrize(
+    ("header_bytes", "expected_status"),
+    [(8_192, 200), (8_193, 400)],
+)
+def test_raw_multipart_enforces_the_eight_kibibyte_part_header_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    header_bytes: int,
+    expected_status: int,
+) -> None:
+    with _document_api(monkeypatch, SuccessfulExtractor()) as document_api:
+        boundary = "exact-header-limit-boundary"
+        response, _ = _streaming_post(
+            document_api,
+            [
+                (
+                    "body",
+                    _multipart_part_with_header_bytes(boundary, header_bytes)
+                    + f"--{boundary}--\r\n".encode(),
+                )
+            ],
+            headers={
+                **document_api["headers"],
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+
+    assert response.status_code == expected_status
 
 
 def test_raw_multipart_rejects_too_many_part_headers(
@@ -689,6 +815,7 @@ def test_openapi_documents_stable_extraction_responses() -> None:
         "413",
         "415",
         "422",
+        "499",
         "503",
     }
     assert operation["requestBody"] == {
@@ -722,6 +849,43 @@ def test_extractor_timeout_returns_stable_unavailable_error(
     assert response.json() == {
         "detail": {"code": "job_description_extraction_unavailable"}
     }
+
+
+def test_client_disconnect_during_extraction_is_an_intentional_empty_499(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = DisconnectingExtractionRunner()
+    filename = "confidential-disconnected-role.pdf"
+    boundary = "disconnect-boundary"
+    body = (
+        _multipart_part(
+            boundary,
+            name="file",
+            filename=filename,
+            media_type="application/pdf",
+            contents=readable_pdf(),
+        )
+        + f"--{boundary}--\r\n".encode()
+    )
+    with (
+        _document_api(monkeypatch, runner=runner) as document_api,
+        caplog.at_level(logging.DEBUG),
+    ):
+        response = _disconnecting_post(
+            document_api,
+            body,
+            headers={
+                **document_api["headers"],
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+
+    assert response.status_code == 499
+    assert response.content == b""
+    assert runner.cancelled is True
+    assert filename not in caplog.text
+    assert filename not in response.text
 
 
 def test_timeout_does_not_return_while_real_parser_work_is_still_alive(

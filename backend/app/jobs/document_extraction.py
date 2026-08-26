@@ -1,3 +1,4 @@
+import threading
 from binascii import crc32
 from copy import copy
 from dataclasses import dataclass
@@ -11,9 +12,16 @@ from docx.opc.exceptions import PackageNotFoundError
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from pypdf import PdfReader
+from pypdf import filters as pdf_filters
 from pypdf._page import PageObject
-from pypdf.errors import PyPdfError
-from pypdf.generic import DictionaryObject, IndirectObject, PdfObject, StreamObject
+from pypdf.errors import LimitReachedError, PyPdfError
+from pypdf.generic import (
+    ArrayObject,
+    DictionaryObject,
+    IndirectObject,
+    PdfObject,
+    StreamObject,
+)
 
 from app.core.errors import AppError
 
@@ -40,6 +48,7 @@ ZIP_SIGNATURES = (
 OLE_SIGNATURE = bytes.fromhex("D0 CF 11 E0 A1 B1 1A E1")
 REQUIRED_DOCX_MEMBERS = {"[Content_Types].xml", "word/document.xml"}
 SUPPORTED_DOCX_COMPRESSION = {ZIP_STORED, ZIP_DEFLATED}
+_PDF_DECODE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -101,7 +110,22 @@ class DefaultJobDescriptionExtractor:
         )
 
 
-def _pdf_decoded_stream_bytes(page: PageObject) -> int:
+def _bounded_pdf_stream_data(stream: StreamObject, remaining_bytes: int) -> bytes:
+    with _PDF_DECODE_LOCK:
+        previous_limit = pdf_filters.RUN_LENGTH_MAX_OUTPUT_LENGTH
+        pdf_filters.RUN_LENGTH_MAX_OUTPUT_LENGTH = min(
+            previous_limit,
+            max(0, remaining_bytes),
+        )
+        try:
+            return stream.get_data()
+        except LimitReachedError as error:
+            raise DocumentExtractionError("job_description_file_too_complex") from error
+        finally:
+            pdf_filters.RUN_LENGTH_MAX_OUTPUT_LENGTH = previous_limit
+
+
+def _pdf_decoded_stream_bytes(page: PageObject, remaining_bytes: int) -> int:
     decoded_bytes = 0
     pending_resources: list[PdfObject | None] = [page.get("/Resources")]
     seen_streams: set[tuple[int, int] | int] = set()
@@ -145,7 +169,9 @@ def _pdf_decoded_stream_bytes(page: PageObject) -> int:
                 continue
             seen_streams.add(stream_key)
 
-            decoded_bytes += len(stream.get_data())
+            decoded_bytes += len(
+                _bounded_pdf_stream_data(stream, remaining_bytes - decoded_bytes)
+            )
             if decoded_bytes > MAX_PDF_DECODED_BYTES:
                 raise DocumentExtractionError("job_description_file_too_complex")
 
@@ -153,6 +179,32 @@ def _pdf_decoded_stream_bytes(page: PageObject) -> int:
             if form_resources is not None and not isinstance(form_resources, PdfObject):
                 raise DocumentExtractionError("job_description_file_unreadable")
             pending_resources.append(form_resources)
+    return decoded_bytes
+
+
+def _pdf_decoded_content_bytes(page: PageObject, remaining_bytes: int) -> int:
+    contents_reference = page.get("/Contents")
+    if contents_reference is None:
+        return 0
+    if not isinstance(contents_reference, PdfObject):
+        raise DocumentExtractionError("job_description_file_unreadable")
+    contents = contents_reference.get_object()
+    if isinstance(contents, StreamObject):
+        streams = (contents,)
+    elif isinstance(contents, ArrayObject):
+        streams = tuple(item.get_object() for item in contents)
+        if not all(isinstance(stream, StreamObject) for stream in streams):
+            raise DocumentExtractionError("job_description_file_unreadable")
+    else:
+        raise DocumentExtractionError("job_description_file_unreadable")
+
+    decoded_bytes = 0
+    for stream in streams:
+        decoded_bytes += len(
+            _bounded_pdf_stream_data(stream, remaining_bytes - decoded_bytes)
+        )
+        if decoded_bytes > remaining_bytes:
+            raise DocumentExtractionError("job_description_file_too_complex")
     return decoded_bytes
 
 
@@ -165,12 +217,14 @@ def _pdf_text(data: bytes) -> str:
             raise DocumentExtractionError("job_description_file_too_complex")
         decoded_bytes = 0
         for page in reader.pages:
-            contents = page.get_contents()
-            if contents is not None:
-                decoded_bytes += len(contents.get_data())
-                if decoded_bytes > MAX_PDF_DECODED_BYTES:
-                    raise DocumentExtractionError("job_description_file_too_complex")
-            decoded_bytes += _pdf_decoded_stream_bytes(page)
+            decoded_bytes += _pdf_decoded_content_bytes(
+                page,
+                MAX_PDF_DECODED_BYTES - decoded_bytes,
+            )
+            decoded_bytes += _pdf_decoded_stream_bytes(
+                page,
+                MAX_PDF_DECODED_BYTES - decoded_bytes,
+            )
             if decoded_bytes > MAX_PDF_DECODED_BYTES:
                 raise DocumentExtractionError("job_description_file_too_complex")
         return "\n\n".join(page.extract_text() or "" for page in reader.pages)

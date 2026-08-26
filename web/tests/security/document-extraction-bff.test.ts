@@ -115,6 +115,22 @@ function rawFileOpening(
   ].join("\r\n"))
 }
 
+function rawFileOpeningWithHeaderBytes(
+  boundary: string,
+  headerBytes: number,
+): Uint8Array {
+  const fixedHeaders = [
+    'Content-Disposition: form-data; name="file"; filename="role.pdf"',
+    "Content-Type: application/pdf",
+    "X-Padding: ",
+  ].join("\r\n")
+  const paddingBytes = headerBytes - Buffer.byteLength(fixedHeaders)
+  if (paddingBytes < 0) throw new Error("headerBytes is too small")
+  return rawFileOpening(boundary, [
+    `X-Padding: ${"x".repeat(paddingBytes)}`,
+  ])
+}
+
 async function expectError(
   response: Response,
   status: number,
@@ -394,6 +410,30 @@ describe("document extraction BFF boundary", () => {
 
     await expectError(response, 400, "job_description_file_required")
     expect(callApi).not.toHaveBeenCalled()
+  })
+
+  it("accepts the exact 8,192-byte multipart part-header boundary", async () => {
+    const boundary = "exact-header-boundary"
+    const consumed: number[] = []
+    const callApi = vi.fn().mockResolvedValue({
+      text: "Role",
+      source: { filename: "role.pdf", media_type: "application/pdf" },
+    })
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        rawFileOpeningWithHeaderBytes(boundary, 8_192),
+        textEncoder.encode("%PDF-1.4"),
+        textEncoder.encode(`\r\n--${boundary}--\r\n`),
+      ], consumed, { boundary }),
+      {
+        appUrl,
+        readTenant: async () => tenantId,
+        callApi,
+      },
+    )
+
+    expect(response.status).toBe(200)
+    expect(callApi).toHaveBeenCalledOnce()
   })
 
   it("rejects a preamble that could hide oversized part headers", async () => {

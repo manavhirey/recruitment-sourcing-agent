@@ -20,6 +20,7 @@ from app.core.config import get_worker_settings
 from app.core.database import session_factory as database_session_factory
 from app.crm.service import materialize_run_matches
 from app.identity.schemas import RequestContext, Role
+from app.jobs.seniority import validate_confirmed_seniority
 from app.jobs.service import JobService
 from app.matching.engine import MatchingEngine
 from app.providers.apollo import ApolloGateway
@@ -316,6 +317,27 @@ def execute_match_run(
                 return
             if run.state not in (RunState.MATCHING, RunState.PARTIALLY_READY):
                 raise ValueError("sourcing run is not ready for matching")
+            scorecard = JobService(session, b"internal-worker").get_scorecard(
+                context, run.scorecard_version_id
+            )
+            try:
+                validate_confirmed_seniority(scorecard.seniority)
+            except ValueError:
+                run.state = transition_run(run.state, RunState.FAILED)
+                run.current_stage = RunState.FAILED.value
+                run.error_code = "scorecard_seniority_revision_required"
+                run.error_message = (
+                    "The scorecard must be revised before matching can continue."
+                )
+                run.completed_at = datetime.now(UTC)
+                checkpoint.status = "completed"
+                checkpoint.completed_at = datetime.now(UTC)
+                checkpoint.payload = {
+                    "state": RunState.FAILED.value,
+                    "error_code": "scorecard_seniority_revision_required",
+                }
+                session.commit()
+                return
             unmatched = list(
                 session.scalars(
                     select(RunCandidate)
@@ -363,9 +385,6 @@ def execute_match_run(
                 )
                 session.commit()
                 return
-            scorecard = JobService(session, b"internal-worker").get_scorecard(
-                context, run.scorecard_version_id
-            )
             candidates = CandidateService(session)
             for run_candidate in unmatched:
                 profile = candidates.get_profile(context, run_candidate.candidate_id)

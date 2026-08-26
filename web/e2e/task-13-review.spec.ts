@@ -345,6 +345,45 @@ test("real authenticated route crosses Next BFF and deterministic FastAPI", asyn
   expect(observed.every((entry) => entry.authorization === "present" && entry.tenant === tenantId)).toBe(true)
 })
 
+test("real authenticated route uploads browser FormData through Next BFF", async ({
+  context,
+  page,
+  request,
+}) => {
+  await authenticateRealRoutes(context)
+  const beforeResponse = await request.get(
+    "http://127.0.0.1:8001/__e2e__/observed",
+  )
+  const observedBefore = (await beforeResponse.json() as Array<Record<string, string>>).length
+  await page.goto("/jobs/new")
+  await page.waitForLoadState("networkidle")
+
+  const extractionResponse = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === "/api/bff/job-descriptions/extract",
+  )
+  await page.getByLabel("Upload job description", { exact: true }).setInputFiles({
+    name: "real-route.pdf",
+    mimeType: "application/pdf",
+    buffer: Buffer.from("%PDF-1.4 deterministic browser fixture"),
+  })
+  expect((await extractionResponse).status()).toBe(200)
+
+  await expect(page.getByRole("textbox", { name: "Job description" })).toHaveValue(
+    extractedJobDescription,
+  )
+  const observedResponse = await request.get(
+    "http://127.0.0.1:8001/__e2e__/observed",
+  )
+  const observed = (await observedResponse.json() as Array<Record<string, string>>)
+    .slice(observedBefore)
+  expect(observed).toContainEqual({
+    method: "POST",
+    path: "/api/v1/job-descriptions/extract",
+    tenant: tenantId,
+    authorization: "present",
+  })
+})
+
 test("real invitation fragment is removed before the first server request", async ({
   context,
   page,

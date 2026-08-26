@@ -1,4 +1,5 @@
 import pytest
+from pypdf.generic import EncodedStreamObject
 
 from app.jobs import document_extraction
 from app.jobs.document_extraction import (
@@ -23,6 +24,7 @@ from tests.job_description_fixtures import (
     pdf_with_decoded_content_sizes,
     pdf_with_form_xobject_decoded_sizes,
     pdf_with_pages,
+    pdf_with_run_length_decoded_size,
     readable_docx,
     readable_pdf,
 )
@@ -314,6 +316,36 @@ def test_rejects_pdf_when_nested_form_xobject_exceeds_decoded_budget(
         media_type=PDF_MEDIA_TYPE,
         code="job_description_file_too_complex",
     )
+
+
+def test_rejects_run_length_pdf_before_expanded_stream_is_cached(
+    extractor: DefaultJobDescriptionExtractor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decoded_streams: list[EncodedStreamObject] = []
+    original_get_data = EncodedStreamObject.get_data
+
+    def track_decoded_stream(stream: EncodedStreamObject) -> bytes:
+        try:
+            return original_get_data(stream)
+        finally:
+            if stream.get("/Filter") == "/RunLengthDecode":
+                decoded_streams.append(stream)
+
+    data = pdf_with_run_length_decoded_size(101)
+    monkeypatch.setattr(document_extraction, "MAX_PDF_DECODED_BYTES", 100)
+    monkeypatch.setattr(EncodedStreamObject, "get_data", track_decoded_stream)
+
+    assert_extraction_error(
+        extractor,
+        data=data,
+        filename="hostile.pdf",
+        media_type=PDF_MEDIA_TYPE,
+        code="job_description_file_too_complex",
+    )
+
+    assert decoded_streams
+    assert all(stream.decoded_self is None for stream in decoded_streams)
 
 
 def test_rejects_docx_with_more_than_two_thousand_archive_entries(

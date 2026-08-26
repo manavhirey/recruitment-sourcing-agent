@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -153,6 +154,18 @@ def test_legacy_seniority_draft_reloads_as_editable_with_canonical_options(
         "mid_level",
         "senior",
     ]
+
+
+def test_draft_reload_does_not_mask_unrelated_persisted_corruption(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["target_titles"] = []
+
+    with pytest.raises(ValidationError, match="target_titles"):
+        job_service.get_draft(owner_context, draft_job.id)
 
 
 def test_confirmation_rejects_unapproved_adjacent_industry(

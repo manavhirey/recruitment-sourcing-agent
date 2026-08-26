@@ -12,7 +12,7 @@ from app.jobs.document_extraction import (
 
 MAX_MULTIPART_BODY_BYTES = MAX_FILE_BYTES + 16_384
 MAX_MULTIPART_HEADERS = 8
-MAX_MULTIPART_HEADER_BYTES = 1_024
+MAX_MULTIPART_HEADER_BYTES = 8_192
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,7 @@ class _FilePartCollector:
         self._headers_finished = False
         self._header_field = bytearray()
         self._header_value = bytearray()
+        self._header_bytes = 0
         self._content_disposition: bytes | None = None
         self._content_type: bytes | None = None
 
@@ -57,6 +58,11 @@ class _FilePartCollector:
     def on_header_end(self) -> None:
         field = bytes(self._header_field).lower()
         value = bytes(self._header_value)
+        self._header_bytes += (
+            (2 if self._header_bytes else 0) + len(field) + 2 + len(value)
+        )
+        if self._header_bytes > MAX_MULTIPART_HEADER_BYTES:
+            raise DocumentExtractionError("job_description_file_required")
         if field == b"content-disposition":
             if self._content_disposition is not None:
                 raise DocumentExtractionError("job_description_file_required")

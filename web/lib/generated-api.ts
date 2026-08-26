@@ -2464,6 +2464,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description The client disconnected during extraction. */
+            readonly 499: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Document extraction is temporarily unavailable. */
             readonly 503: {
                 headers: {

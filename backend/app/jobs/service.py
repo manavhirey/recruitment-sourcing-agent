@@ -33,6 +33,16 @@ class JobError(AppError):
         super().__init__(code)
 
 
+def _is_unknown_legacy_seniority_error(error: ValidationError) -> bool:
+    errors = error.errors(include_url=False, include_input=False)
+    if len(errors) != 1 or errors[0]["loc"] != ("seniority",):
+        return False
+    cause = errors[0].get("ctx", {}).get("error")
+    return isinstance(cause, ValueError) and str(cause).startswith(
+        "unknown seniority value:"
+    )
+
+
 class JobService:
     def __init__(
         self,
@@ -525,7 +535,9 @@ class JobService:
         else:
             try:
                 draft = ScorecardDraft.model_validate(job.draft_payload)
-            except ValidationError:
+            except ValidationError as error:
+                if not _is_unknown_legacy_seniority_error(error):
+                    raise
                 draft = EditableScorecardDraft.model_validate(job.draft_payload)
         return ScorecardDraftResponse(
             job_id=job.id,

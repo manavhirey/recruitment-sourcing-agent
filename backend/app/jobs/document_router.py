@@ -2,7 +2,7 @@ import asyncio
 from contextlib import suppress
 from typing import Annotated, NoReturn
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from starlette.requests import ClientDisconnect
 
 from app.identity.dependencies import get_request_context
@@ -83,19 +83,26 @@ async def _run_extraction(
             return_when=asyncio.FIRST_COMPLETED,
         )
         if disconnect in finished:
+            monitor_error = disconnect.exception()
+            if monitor_error is not None:
+                return await worker
             worker.cancel()
             with suppress(asyncio.CancelledError):
                 await worker
             raise ClientDisconnect()
         return await worker
     finally:
-        disconnect.cancel()
         if not worker.done():
             worker.cancel()
             with suppress(asyncio.CancelledError):
                 await worker
-        with suppress(asyncio.CancelledError):
-            await disconnect
+        if disconnect.done():
+            if not disconnect.cancelled():
+                disconnect.exception()
+        else:
+            disconnect.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect
 
 
 @router.post(
@@ -107,6 +114,7 @@ async def _run_extraction(
         413: {"description": "The uploaded file exceeds 10,000,000 bytes."},
         415: {"description": "The uploaded document type is unsupported."},
         422: {"description": "The uploaded document could not be extracted safely."},
+        499: {"description": "The client disconnected during extraction."},
         503: {"description": "Document extraction is temporarily unavailable."},
     },
     openapi_extra={
@@ -132,7 +140,7 @@ async def extract_job_description(
         JobDescriptionExtractionRunner,
         Depends(get_document_extraction_runner),
     ],
-) -> JobDescriptionExtractionResponse:
+) -> JobDescriptionExtractionResponse | Response:
     try:
         upload = await read_job_description_upload(request)
         result = await _run_extraction(
@@ -150,7 +158,7 @@ async def extract_job_description(
     except DocumentExtractionError as error:
         _raise_document_error(error)
     except ClientDisconnect:
-        raise
+        return Response(status_code=499)
     except Exception as error:
         raise HTTPException(
             status_code=503,

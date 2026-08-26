@@ -48,7 +48,7 @@ ALLOWED_TRANSITIONS: dict[RunState, frozenset[RunState]] = {
         }
     ),
     RunState.PARTIALLY_READY: frozenset(
-        {RunState.ENRICHING, RunState.READY, RunState.CANCELLED}
+        {RunState.ENRICHING, RunState.READY, RunState.CANCELLED, RunState.FAILED}
     ),
     RunState.READY: frozenset(),
     RunState.CANCELLED: frozenset(),

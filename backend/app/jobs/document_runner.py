@@ -1,6 +1,8 @@
 import asyncio
 import multiprocessing
+import os
 import sys
+import threading
 from collections.abc import Callable
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -16,6 +18,20 @@ WORKER_CPU_SECONDS = 10
 WORKER_MEMORY_BYTES = 512 * 1024 * 1024
 WORKER_POLL_SECONDS = 0.01
 WORKER_TERMINATE_GRACE_SECONDS = 0.25
+
+
+def _available_cpu_count() -> int:
+    affinity = getattr(os, "sched_getaffinity", None)
+    if affinity is not None:
+        try:
+            return max(1, len(affinity(0)))
+        except OSError:
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
+WORKER_CAPACITY = _available_cpu_count()
+_WORKER_ADMISSION = threading.BoundedSemaphore(WORKER_CAPACITY)
 
 WorkerTarget = Callable[[Connection, bytes, str, str | None], None]
 
@@ -132,6 +148,26 @@ class ProcessJobDescriptionExtractionRunner:
         media_type: str | None,
         timeout_seconds: float,
     ) -> ExtractedJobDescription:
+        if not _WORKER_ADMISSION.acquire(blocking=False):
+            raise DocumentExtractionError("job_description_extraction_unavailable")
+        try:
+            return await self._run_admitted(
+                data=data,
+                filename=filename,
+                media_type=media_type,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            _WORKER_ADMISSION.release()
+
+    async def _run_admitted(
+        self,
+        *,
+        data: bytes,
+        filename: str,
+        media_type: str | None,
+        timeout_seconds: float,
+    ) -> ExtractedJobDescription:
         receiver, sender = self._context.Pipe(duplex=False)
         process = self._context.Process(
             target=self._worker_target,
@@ -154,6 +190,13 @@ class ProcessJobDescriptionExtractionRunner:
                             "document extraction worker closed without a result"
                         ) from error
                 if not process.is_alive():
+                    if receiver.poll():
+                        try:
+                            return _decode_worker_result(receiver.recv())
+                        except EOFError as error:
+                            raise RuntimeError(
+                                "document extraction worker closed without a result"
+                            ) from error
                     raise RuntimeError(
                         "document extraction worker exited without a result"
                     )
