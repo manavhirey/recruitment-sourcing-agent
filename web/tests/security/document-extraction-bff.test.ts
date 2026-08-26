@@ -498,6 +498,40 @@ describe("document extraction BFF boundary", () => {
     expect(callApi).not.toHaveBeenCalled()
   })
 
+  it("rejects duplicate boundary parameters that split the probe from the parser", async () => {
+    const actualBoundary = "actual-boundary"
+    const probeBoundary = "probe-boundary"
+    const declaredBoundary =
+      '"' + actualBoundary + '"; boundary=' + probeBoundary
+    const consumed: number[] = []
+    const callApi = vi.fn().mockResolvedValue({
+      text: "Role",
+      source: { filename: "role.pdf", media_type: "application/pdf" },
+    })
+    const response = await handleDocumentExtraction(
+      rawUploadRequest([
+        textEncoder.encode(
+          "--" + probeBoundary +
+            "\r\nX-Probe: safe\r\n\r\nharmless preamble\r\n",
+        ),
+        rawFileOpening(
+          actualBoundary,
+          Array.from(
+            { length: 6 },
+            (_, index) =>
+              "X-Padding-" + index + ": " + "x".repeat(1_400),
+          ),
+        ),
+        textEncoder.encode("%PDF-1.4"),
+        textEncoder.encode("\r\n--" + actualBoundary + "--\r\n"),
+      ], consumed, { boundary: declaredBoundary }),
+      { appUrl, readTenant: async () => tenantId, callApi },
+    )
+
+    await expectError(response, 400, "job_description_file_required")
+    expect(callApi).not.toHaveBeenCalled()
+  })
+
   it("rejects multipart parts beyond the bounded header count", async () => {
     const boundary = "header-count-boundary"
     const consumed: number[] = []

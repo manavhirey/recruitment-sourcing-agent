@@ -55,6 +55,33 @@ describe("RunStatus", () => {
     expect(screen.queryByText(/token=secret/)).not.toBeInTheDocument()
   })
 
+  it("guides revision for a failed historical-seniority run", () => {
+    const failedRun = {
+      ...run,
+      state: "failed" as const,
+      current_stage: "failed",
+      error_code: "scorecard_seniority_revision_required",
+      error_message: "private persisted detail",
+    }
+    server.use(
+      http.get("/api/bff/runs/" + run.id, () => HttpResponse.json(failedRun)),
+    )
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <RunStatus
+          jobId={run.job_id}
+          initialRun={failedRun}
+        />
+      </QueryClientProvider>,
+    )
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Revise this scorecard's seniority to Early-Career, Mid-Level, or Senior before sourcing again.",
+    )
+    expect(screen.queryByText("private persisted detail")).not.toBeInTheDocument()
+  })
+
   it("requires confirmation before cancellation", async () => {
     const post = vi.fn(() => HttpResponse.json({ ...run, state: "cancelled" }))
     server.use(http.post(`/api/bff/runs/${run.id}/cancel`, post))

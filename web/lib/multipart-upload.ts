@@ -33,8 +33,13 @@ function declaredBodyTooLarge(request: Request): boolean {
 }
 
 function multipartBoundary(contentType: string): string | null {
-  const match = /(?:^|;)\s*boundary=([!#$%&'*+\-.^_`|~0-9A-Za-z]+)\s*(?:;|$)/i.exec(
-    contentType,
+  const segments = contentType.split(";")
+  if (
+    segments.length !== 2 ||
+    segments[0].trim().toLowerCase() !== "multipart/form-data"
+  ) return null
+  const match = /^\s*boundary=([!#$%&'*+\-.^_`|~0-9A-Za-z]+)\s*$/i.exec(
+    segments[1],
   )
   const boundary = match?.[1]
   if (
@@ -66,12 +71,13 @@ export async function readMultipartUpload(
   if (boundary === null) {
     throw new MultipartUploadError("job_description_file_required")
   }
+  const canonicalContentType = "multipart/form-data; boundary=" + boundary
   const openingDelimiter = Buffer.from(`--${boundary}\r\n`, "latin1")
 
   let parser
   try {
     parser = Busboy({
-      headers: { "content-type": contentType },
+      headers: { "content-type": canonicalContentType },
       limits: {
         fields: 0,
         files: 1,

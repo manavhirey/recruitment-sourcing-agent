@@ -471,6 +471,58 @@ def test_latest_job_run_is_deterministic_and_reports_review_counts(
     )
 
 
+def test_run_response_allowlists_revision_guidance_and_redacts_other_errors(
+    sourcing_api: dict[str, Any],
+) -> None:
+    with Session(sourcing_api["engine"], expire_on_commit=False) as session:
+        job = session.get(Job, sourcing_api["job_id"])
+        assert job is not None and job.current_scorecard_id is not None
+        run = SourcingRun(
+            tenant_id=sourcing_api["tenant_id"],
+            job_id=job.id,
+            scorecard_version_id=job.current_scorecard_id,
+            started_by_user_id=sourcing_api["user_id"],
+            state=RunState.FAILED,
+            current_stage=RunState.FAILED.value,
+            error_code="scorecard_seniority_revision_required",
+            error_message="private manager parser detail",
+        )
+        session.add(run)
+        session.commit()
+        run_id = run.id
+
+    response = sourcing_api["api"].get(
+        f"/api/v1/runs/{run_id}",
+        headers=_headers(sourcing_api),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["error_code"] == "scorecard_seniority_revision_required"
+    assert payload["error_message"] == (
+        "The scorecard seniority must be revised before sourcing can continue."
+    )
+    assert "private manager parser detail" not in response.text
+
+    with Session(sourcing_api["engine"]) as session:
+        run = session.get(SourcingRun, run_id)
+        assert run is not None
+        run.error_code = "provider_secret"
+        run.error_message = "token=secret"
+        session.commit()
+
+    redacted = sourcing_api["api"].get(
+        f"/api/v1/runs/{run_id}",
+        headers=_headers(sourcing_api),
+    )
+
+    assert redacted.status_code == 200
+    assert redacted.json()["error_code"] is None
+    assert redacted.json()["error_message"] is None
+    assert "provider_secret" not in redacted.text
+    assert "token=secret" not in redacted.text
+
+
 def test_latest_job_run_collapses_missing_job_and_missing_run(
     sourcing_api: dict[str, Any],
 ) -> None:

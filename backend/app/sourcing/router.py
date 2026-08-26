@@ -33,6 +33,9 @@ _PUBLIC_RUN_ERRORS = {
     "usage_budget_exhausted": "The configured sourcing usage budget was exhausted.",
     "provider_search_failed": "The sourcing provider could not complete the search.",
     "no_usable_results": "The provider returned no usable candidates.",
+    "scorecard_seniority_revision_required": (
+        "The scorecard seniority must be revised before sourcing can continue."
+    ),
 }
 _PUBLIC_ACTIVITY_ACTIONS = frozenset(
     {

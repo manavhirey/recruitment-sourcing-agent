@@ -64,6 +64,7 @@ _MATCH_BATCH_SIZE = 100
 _LOCAL_LOCKS: dict[str, threading.Lock] = {}
 _LOCAL_LOCKS_GUARD = threading.Lock()
 _ENRICHMENT_RETRY_CLAIM_LEASE = timedelta(minutes=15)
+_SENIORITY_REVISION_REQUIRED = "scorecard_seniority_revision_required"
 
 
 class SearchGateway(Protocol):
@@ -243,6 +244,32 @@ def _new_run_people(
     return tuple(selected)
 
 
+def _fail_historical_seniority(
+    run: SourcingRun,
+    checkpoint: RunCheckpoint,
+    seniority: list[str],
+    *,
+    message: str,
+) -> bool:
+    try:
+        validate_confirmed_seniority(seniority)
+    except ValueError:
+        completed_at = datetime.now(UTC)
+        run.state = transition_run(run.state, RunState.FAILED)
+        run.current_stage = RunState.FAILED.value
+        run.error_code = _SENIORITY_REVISION_REQUIRED
+        run.error_message = message
+        run.completed_at = completed_at
+        checkpoint.status = "completed"
+        checkpoint.completed_at = completed_at
+        checkpoint.payload = {
+            "state": RunState.FAILED.value,
+            "error_code": _SENIORITY_REVISION_REQUIRED,
+        }
+        return True
+    return False
+
+
 def execute_plan_run(
     session_factory: sessionmaker[Session],
     run_id: UUID,
@@ -250,26 +277,34 @@ def execute_plan_run(
     *,
     idempotency_key: str = "plan",
     planner: QueryPlanner | None = None,
-) -> None:
+) -> RunState:
     with session_factory() as session:
         _apply_tenant_context(session, context.tenant_id)
         run = _load_run(session, run_id, context.tenant_id, for_update=True)
         checkpoint = _checkpoint(session, run, idempotency_key, "plan")
         if checkpoint.status == "completed":
             session.rollback()
-            return
+            return run.state
         if run.cancellation_requested or run.state is RunState.CANCELLED:
             if run.state is not RunState.CANCELLED:
                 run.state = transition_run(run.state, RunState.CANCELLED)
             checkpoint.status = "completed"
             checkpoint.completed_at = datetime.now(UTC)
             session.commit()
-            return
+            return run.state
         if run.state is not RunState.QUEUED:
             raise ValueError("sourcing run is not queued")
         scorecard = JobService(session, b"internal-worker").get_scorecard(
             context, run.scorecard_version_id
         )
+        if _fail_historical_seniority(
+            run,
+            checkpoint,
+            scorecard.seniority,
+            message="The scorecard must be revised before sourcing can continue.",
+        ):
+            session.commit()
+            return run.state
         queries = (planner or QueryPlanner()).compile(scorecard)
         run.planned_queries = [asdict(query) for query in queries]
         run.started_at = run.started_at or datetime.now(UTC)
@@ -289,6 +324,7 @@ def execute_plan_run(
             payload={"query_count": len(queries), "state": run.state.value},
         )
         session.commit()
+        return run.state
 
 
 def execute_match_run(
@@ -320,22 +356,12 @@ def execute_match_run(
             scorecard = JobService(session, b"internal-worker").get_scorecard(
                 context, run.scorecard_version_id
             )
-            try:
-                validate_confirmed_seniority(scorecard.seniority)
-            except ValueError:
-                run.state = transition_run(run.state, RunState.FAILED)
-                run.current_stage = RunState.FAILED.value
-                run.error_code = "scorecard_seniority_revision_required"
-                run.error_message = (
-                    "The scorecard must be revised before matching can continue."
-                )
-                run.completed_at = datetime.now(UTC)
-                checkpoint.status = "completed"
-                checkpoint.completed_at = datetime.now(UTC)
-                checkpoint.payload = {
-                    "state": RunState.FAILED.value,
-                    "error_code": "scorecard_seniority_revision_required",
-                }
+            if _fail_historical_seniority(
+                run,
+                checkpoint,
+                scorecard.seniority,
+                message="The scorecard must be revised before matching can continue.",
+            ):
                 session.commit()
                 return
             unmatched = list(
@@ -1359,13 +1385,14 @@ def plan_run(
     idempotency_key: str = "plan",
 ) -> None:
     context = _context(tenant_id, user_id)
-    execute_plan_run(
+    planned_state = execute_plan_run(
         database_session_factory,
         UUID(run_id),
         context,
         idempotency_key=idempotency_key,
     )
-    source_run.delay(run_id, tenant_id, user_id, "source")
+    if planned_state is RunState.SOURCING:
+        source_run.delay(run_id, tenant_id, user_id, "source")
 
 
 @celery_app.task(

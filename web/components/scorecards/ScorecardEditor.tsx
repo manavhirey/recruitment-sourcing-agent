@@ -352,6 +352,10 @@ export function ScorecardEditor({
       const code = caught instanceof Error ? caught.message : "request_failed"
       if (existingRunCodes.has(code)) {
         openJobWorkspace()
+      } else if (code === "scorecard_seniority_revision_required") {
+        setError(
+          "Revise this scorecard's seniority to Early-Career, Mid-Level, or Senior before sourcing again.",
+        )
       } else {
         setError("Sourcing was not started. Retry uses the same safe request.")
       }

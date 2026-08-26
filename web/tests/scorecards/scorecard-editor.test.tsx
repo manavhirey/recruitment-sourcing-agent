@@ -549,6 +549,31 @@ describe("ScorecardEditor", () => {
     expect(new Set(sourceKeys).size).toBe(1)
   })
 
+  it("guides historical seniority revision instead of suggesting a retry", async () => {
+    server.use(
+      http.post("/api/bff/jobs/:jobId/runs", () =>
+        HttpResponse.json(
+          { code: "scorecard_seniority_revision_required" },
+          { status: 409 },
+        ),
+      ),
+    )
+    render(
+      <ScorecardEditor
+        draft={scorecardDraftFixture}
+        allowedIndustryCodes={allowedIndustryCodes}
+        alreadyConfirmed
+      />,
+    )
+
+    await userEvent.click(screen.getByRole("button", { name: "Start sourcing" }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Revise this scorecard's seniority to Early-Career, Mid-Level, or Senior before sourcing again.",
+    )
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Retry")
+  })
+
   it("opens the job workspace when sourcing a confirmed scorecard", async () => {
     server.use(
       http.post("/api/bff/jobs/:jobId/runs", () =>
