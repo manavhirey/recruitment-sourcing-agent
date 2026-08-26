@@ -156,6 +156,76 @@ def test_legacy_seniority_draft_reloads_as_editable_with_canonical_options(
     ]
 
 
+def test_legacy_seniority_fallback_rejects_an_inverted_experience_range(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["seniority"] = ["manager"]
+    draft_job.draft_payload["minimum_years"] = 12
+    draft_job.draft_payload["maximum_years"] = 5
+
+    with pytest.raises(
+        ValidationError,
+        match="minimum_years cannot exceed maximum_years",
+    ):
+        job_service.get_draft(owner_context, draft_job.id)
+
+
+def test_legacy_seniority_fallback_rejects_duplicate_criterion_keys(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["seniority"] = ["manager"]
+    criteria = draft_job.draft_payload["criteria"]
+    assert isinstance(criteria, list)
+    criteria.append(dict(criteria[0]))
+
+    with pytest.raises(
+        ValidationError,
+        match="scorecard criterion keys must be unique",
+    ):
+        job_service.get_draft(owner_context, draft_job.id)
+
+
+def test_legacy_seniority_fallback_rejects_duplicate_inferred_confirmations(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["seniority"] = ["manager"]
+    draft_job.draft_payload["confirmed_inferred_items"] = [
+        "criterion:duplicate",
+        "criterion:duplicate",
+    ]
+
+    with pytest.raises(
+        ValidationError,
+        match="inferred item confirmations must be unique",
+    ):
+        job_service.get_draft(owner_context, draft_job.id)
+
+
+def test_legacy_seniority_fallback_rejects_unknown_inferred_confirmation(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["seniority"] = ["manager"]
+    draft_job.draft_payload["confirmed_inferred_items"] = ["criterion:unknown"]
+
+    with pytest.raises(
+        ValidationError,
+        match="unknown inferred item confirmation",
+    ):
+        job_service.get_draft(owner_context, draft_job.id)
+
+
 def test_draft_reload_does_not_mask_unrelated_persisted_corruption(
     job_service: JobService,
     draft_job: Job,

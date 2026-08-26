@@ -116,22 +116,8 @@ class ScorecardContent(BaseModel):
         }
         return criterion_ids | adjacent_ids | uncertainty_ids
 
-
-class ScorecardDraft(ScorecardContent):
-    seniority: list[SeniorityLevel] = Field(max_length=3)  # type: ignore[assignment]
-
-    @field_validator("seniority", mode="before")
-    @classmethod
-    def canonicalize_seniority(cls, value: object) -> object:
-        if not isinstance(value, list):
-            return value
-        return list(normalize_draft_seniority(str(item) for item in value))
-
-    def unresolved_inferred_items(self) -> set[str]:
-        return self.inferred_item_ids() - set(self.confirmed_inferred_items)
-
     @model_validator(mode="after")
-    def validate_scorecard(self) -> "ScorecardDraft":
+    def validate_scorecard_invariants(self) -> "ScorecardContent":
         if (
             self.minimum_years is not None
             and self.maximum_years is not None
@@ -147,6 +133,20 @@ class ScorecardDraft(ScorecardContent):
         if confirmations - self.inferred_item_ids():
             raise ValueError("unknown inferred item confirmation")
         return self
+
+
+class ScorecardDraft(ScorecardContent):
+    seniority: list[SeniorityLevel] = Field(max_length=3)  # type: ignore[assignment]
+
+    @field_validator("seniority", mode="before")
+    @classmethod
+    def canonicalize_seniority(cls, value: object) -> object:
+        if not isinstance(value, list):
+            return value
+        return list(normalize_draft_seniority(str(item) for item in value))
+
+    def unresolved_inferred_items(self) -> set[str]:
+        return self.inferred_item_ids() - set(self.confirmed_inferred_items)
 
 
 class ExtractionStatus(StrEnum):
