@@ -5,7 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -588,6 +588,62 @@ def test_plan_and_match_tasks_replay_through_production_checkpoints(
             )
             == 2
         )
+
+
+def test_completed_plan_replay_returns_state_without_querying_after_rollback(
+    sourcing_scenario: dict[str, Any],
+) -> None:
+    scenario = sourcing_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        run.state = RunState.QUEUED
+        run.current_stage = RunState.QUEUED.value
+        run.planned_queries = []
+        session.commit()
+
+    assert (
+        execute_plan_run(
+            scenario["factory"],
+            scenario["run_id"],
+            context,
+            idempotency_key="plan:rollback-replay",
+        )
+        is RunState.SOURCING
+    )
+
+    engine = scenario["factory"].kw["bind"]
+    rolled_back = False
+
+    def mark_rollback(*_args: object) -> None:
+        nonlocal rolled_back
+        rolled_back = True
+
+    def reject_post_rollback_query(*_args: object) -> None:
+        if rolled_back:
+            raise AssertionError(
+                "plan replay queried after rolling back tenant context"
+            )
+
+    event.listen(engine, "rollback", mark_rollback)
+    event.listen(engine, "before_cursor_execute", reject_post_rollback_query)
+    try:
+        replayed_state = execute_plan_run(
+            scenario["factory"],
+            scenario["run_id"],
+            context,
+            idempotency_key="plan:rollback-replay",
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", reject_post_rollback_query)
+        event.remove(engine, "rollback", mark_rollback)
+
+    assert replayed_state is RunState.SOURCING
 
 
 def test_historical_seniority_plan_task_fails_once_and_replays_as_noop(

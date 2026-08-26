@@ -283,8 +283,9 @@ def execute_plan_run(
         run = _load_run(session, run_id, context.tenant_id, for_update=True)
         checkpoint = _checkpoint(session, run, idempotency_key, "plan")
         if checkpoint.status == "completed":
+            replayed_state = run.state
             session.rollback()
-            return run.state
+            return replayed_state
         if run.cancellation_requested or run.state is RunState.CANCELLED:
             if run.state is not RunState.CANCELLED:
                 run.state = transition_run(run.state, RunState.CANCELLED)
