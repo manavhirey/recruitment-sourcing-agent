@@ -21,6 +21,14 @@ from app.clients.models import ClientCompany  # noqa: F401
 from app.core.database import Base
 from app.identity.models import Tenant
 from app.identity.schemas import RequestContext, Role
+from app.jobs.schemas import (
+    ConfirmedScorecard,
+    CriterionKind,
+    ExtractionStatus,
+    ScorecardCriterion,
+)
+from app.matching.engine import MatchingEngine
+from app.matching.schemas import EvidenceState
 from app.providers.base import ProviderExperience, ProviderPerson
 
 
@@ -467,3 +475,133 @@ def test_repeat_ingestion_does_not_duplicate_provenance(
         )
         == 5
     )
+
+
+def test_persisted_employment_dates_supply_numeric_experience_matching(
+    candidate_session: Session,
+    candidate_service: CandidateService,
+    context: RequestContext,
+    provider_person_factory,
+) -> None:
+    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    result = candidate_service.ingest(
+        context,
+        provider_person_factory(
+            experiences=(
+                ProviderExperience(
+                    title="Product Manager",
+                    company_name="First Employer",
+                    start_date="2018-01-01",
+                    end_date="2022-01-01",
+                ),
+                ProviderExperience(
+                    title="Consultant",
+                    company_name="Concurrent Employer",
+                    start_date="2020-01-01",
+                    end_date="2024-01-01",
+                ),
+                ProviderExperience(
+                    title="Senior Product Manager",
+                    company_name="Current Employer",
+                    start_date="2024-01-01",
+                    end_date=None,
+                ),
+            ),
+        ),
+        source_timestamp=observed_at,
+    )
+    candidate_session.commit()
+    candidate_session.expire_all()
+
+    profile = candidate_service.get_profile(context, result.candidate_id)
+
+    assert profile is not None
+    assert profile.years_experience == pytest.approx(8.0, abs=0.01)
+
+    def scorecard(**bounds: object) -> ConfirmedScorecard:
+        return ConfirmedScorecard(
+            id=uuid4(),
+            job_id=uuid4(),
+            version=1,
+            confirmed_at=observed_at,
+            extraction_status=ExtractionStatus.READY,
+            target_titles=["Product Manager"],
+            criteria=[
+                ScorecardCriterion(
+                    key="product",
+                    label="Product experience",
+                    kind=CriterionKind.PREFERENCE,
+                )
+            ],
+            seniority=bounds["seniority"],
+            minimum_years=bounds["minimum_years"],
+            maximum_years=bounds["maximum_years"],
+            locations=[],
+            industry_code="technology.fintech",
+            suggested_adjacent_industries=[],
+            uncertainties=[],
+        )
+
+    evaluations = [
+        MatchingEngine().evaluate(
+            scorecard(
+                seniority=["mid_level"],
+                minimum_years=None,
+                maximum_years=None,
+            ),
+            profile,
+        ),
+        MatchingEngine().evaluate(
+            scorecard(
+                seniority=["early_career"],
+                minimum_years=7,
+                maximum_years=8,
+            ),
+            profile,
+        ),
+    ]
+    assert all(
+        next(
+            item
+            for item in evaluation.criteria
+            if item.key == "component.years_experience"
+        ).state
+        is EvidenceState.SUPPORTED
+        for evaluation in evaluations
+    )
+
+
+def test_partial_or_unparseable_employment_dates_leave_experience_unknown(
+    candidate_session: Session,
+    candidate_service: CandidateService,
+    context: RequestContext,
+    provider_person_factory,
+) -> None:
+    result = candidate_service.ingest(
+        context,
+        provider_person_factory(
+            current_title="Senior Director",
+            experiences=(
+                ProviderExperience(
+                    title="Senior Director",
+                    company_name="Undated Employer",
+                    start_date="2018",
+                    end_date="present",
+                ),
+                ProviderExperience(
+                    title="Manager",
+                    company_name="Malformed Employer",
+                    start_date="not-a-date",
+                    end_date="2024-01-01",
+                ),
+            ),
+        ),
+        source_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    candidate_session.commit()
+    candidate_session.expire_all()
+
+    profile = candidate_service.get_profile(context, result.candidate_id)
+
+    assert profile is not None
+    assert profile.years_experience is None

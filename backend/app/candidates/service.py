@@ -1,6 +1,7 @@
 import hashlib
 import json
-from datetime import UTC, datetime
+from collections.abc import Sequence
+from datetime import UTC, date, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import select, text
@@ -37,6 +38,7 @@ _DISPLAY_FIELDS = (
     ("location", "location", "normalized_location"),
     ("profile_url", "profile_url", "normalized_profile_url"),
 )
+_CURRENT_DATE_MARKERS = frozenset({"current", "now", "present"})
 
 
 class CandidateService:
@@ -201,12 +203,18 @@ class CandidateService:
             .order_by(CandidateExperience.position, CandidateExperience.id)
         ).all()
         profile_values = CandidateProfile.model_validate(candidate).model_dump()
-        for derived_field in ("experiences", "skills", "industry_codes"):
+        for derived_field in (
+            "experiences",
+            "skills",
+            "industry_codes",
+            "years_experience",
+        ):
             profile_values.pop(derived_field)
         return CandidateProfile(
             **profile_values,
             skills=tuple(candidate.normalized_skills),
             industry_codes=tuple(candidate.industry_codes),
+            years_experience=_years_experience(experiences),
             experiences=tuple(
                 CandidateExperienceProfile.model_validate(item) for item in experiences
             ),
@@ -543,6 +551,44 @@ def _display_value(value: str | None) -> str | None:
         return None
     normalized = " ".join(value.split())
     return normalized or None
+
+
+def _years_experience(experiences: Sequence[CandidateExperience]) -> float | None:
+    intervals: list[tuple[date, date]] = []
+    for experience in experiences:
+        start = _full_date(experience.start_date)
+        if start is None:
+            continue
+        raw_end = (experience.end_date or "").strip()
+        end: date | None
+        if not raw_end or raw_end.casefold() in _CURRENT_DATE_MARKERS:
+            end = _as_utc(experience.source_timestamp).date()
+        else:
+            end = _full_date(raw_end)
+        if end is None or end <= start:
+            continue
+        intervals.append((start, end))
+    if not intervals:
+        return None
+
+    intervals.sort()
+    merged: list[tuple[date, date]] = []
+    for start, end in intervals:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    total_days = sum((end - start).days for start, end in merged)
+    return round(total_days / 365.2425, 2)
+
+
+def _full_date(value: str | None) -> date | None:
+    normalized = (value or "").strip()
+    try:
+        parsed = date.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == normalized else None
 
 
 def _as_utc(value: datetime) -> datetime:

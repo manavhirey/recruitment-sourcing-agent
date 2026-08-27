@@ -170,6 +170,7 @@ export function JobIntakeForm({ clients, onDraftReady }: JobIntakeFormProps) {
         <textarea
           id="job-description"
           rows={12}
+          readOnly={extracting}
           aria-invalid={Boolean(errors.jobDescription)}
           aria-describedby={
             errors.jobDescription

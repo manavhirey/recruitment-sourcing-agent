@@ -115,6 +115,34 @@ describe("JobIntakeForm", () => {
     expect(await screen.findByText("Extracted from role.pdf")).toBeVisible()
   })
 
+  it("locks job-description editing until the deferred extraction response is applied", async () => {
+    let resolveExtraction: ((value: Response) => void) | undefined
+    server.use(http.post("/api/bff/job-descriptions/extract", () => new Promise<Response>((resolve) => {
+      resolveExtraction = resolve
+    })))
+    const user = userEvent.setup()
+    render(<JobIntakeForm clients={authorizedClientsFixture} />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File(["%PDF-1.4"], "role.pdf", { type: "application/pdf" }),
+    )
+    const description = screen.getByLabelText("Job description")
+    expect(await screen.findByRole("status")).toHaveTextContent("Extracting job description…")
+    expect(description).toHaveAttribute("readonly")
+    await user.type(description, "Late text")
+    expect(description).toHaveValue("")
+
+    resolveExtraction?.(HttpResponse.json({
+      text: "Extracted text",
+      source: { filename: "role.pdf", media_type: "application/pdf" },
+    }))
+    expect(await screen.findByText("Extracted from role.pdf")).toBeVisible()
+    expect(description).not.toHaveAttribute("readonly")
+    await user.type(description, " Edited")
+    expect(description).toHaveValue("Extracted text Edited")
+  })
+
   it("does not start an extraction retry while job submission is active", async () => {
     let extractionRequests = 0
     let resolveJob: ((value: Response) => void) | undefined
@@ -178,6 +206,28 @@ describe("JobIntakeForm", () => {
       updated_at: "2026-08-16T00:00:00Z",
     }))
     await vi.waitFor(() => expect(ready).toHaveBeenCalledOnce())
+  })
+
+  it("reauthenticates an expired extraction session with the current callback URL", async () => {
+    window.history.replaceState({}, "", "/jobs?client=authorized")
+    server.use(
+      http.post("/api/bff/job-descriptions/extract", () =>
+        HttpResponse.json({ code: "unauthenticated" }, { status: 401 }),
+      ),
+    )
+    const user = userEvent.setup()
+    render(<JobIntakeForm clients={authorizedClientsFixture} />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File(["%PDF-1.4"], "role.pdf", { type: "application/pdf" }),
+    )
+
+    await vi.waitFor(() => expect(navigationMocks.replace).toHaveBeenCalledWith(
+      "/api/auth/signin?callbackUrl=%2Fjobs%3Fclient%3Dauthorized",
+    ))
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument()
   })
 
   it("reuses the same creation idempotency key when a safe retry is needed", async () => {

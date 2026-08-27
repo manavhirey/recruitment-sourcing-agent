@@ -111,6 +111,45 @@ def test_inferred_numeric_bound_requires_confirmation(client_context) -> None:
     assert result.unresolved_inferred_items() == result.inferred_item_ids()
 
 
+@pytest.mark.parametrize(
+    ("minimum_years", "maximum_years", "uncertainties", "expected"),
+    [
+        (5, None, [], ["Confirm inferred minimum years: 5"]),
+        (None, 8, [], ["Confirm inferred maximum years: 8"]),
+        (
+            5,
+            12,
+            ["Confirm inferred minimum years: 5", "Confirm scope with recruiter"],
+            [
+                "Confirm inferred minimum years: 5",
+                "Confirm scope with recruiter",
+                "Confirm inferred maximum years: 12",
+            ],
+        ),
+    ],
+)
+def test_generated_numeric_bounds_fail_closed_with_exact_uncertainties(
+    client_context,
+    minimum_years: int | None,
+    maximum_years: int | None,
+    uncertainties: list[str],
+    expected: list[str],
+) -> None:
+    draft = {
+        **VALID_DRAFT,
+        "minimum_years": minimum_years,
+        "maximum_years": maximum_years,
+        "uncertainties": uncertainties,
+    }
+    gateway = OpenAIResponsesScorecardGateway(FakeOpenAI([draft]), "gpt-5-mini")
+
+    result = gateway.extract(
+        "Hire a product manager with payments experience.", client_context
+    )
+
+    assert result.uncertainties == expected
+
+
 def test_extraction_instructions_constrain_seniority_and_numeric_inference() -> None:
     instructions = extraction_instructions()
 

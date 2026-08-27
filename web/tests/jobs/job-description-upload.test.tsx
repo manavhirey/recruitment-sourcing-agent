@@ -295,6 +295,45 @@ describe("JobDescriptionUpload", () => {
     expect(keys[0]).toBe(keys[1])
   })
 
+  it("confirms before a deferred retry can replace text entered after the failure", async () => {
+    let attempt = 0
+    let resolveRetry: ((value: Response) => void) | undefined
+    server.use(http.post("/api/bff/job-descriptions/extract", () => {
+      attempt += 1
+      if (attempt === 1) {
+        return HttpResponse.json(
+          { code: "job_description_extraction_unavailable" },
+          { status: 503 },
+        )
+      }
+      return new Promise<Response>((resolve) => {
+        resolveRetry = resolve
+      })
+    }))
+    const user = userEvent.setup()
+    render(<UploadHarness />)
+
+    await user.upload(
+      screen.getByLabelText("Upload job description"),
+      new File(["%PDF-1.4"], "role.pdf", { type: "application/pdf" }),
+    )
+    await user.type(screen.getByLabelText("Job description"), "Keep this retry text")
+    await user.click(await screen.findByRole("button", { name: "Try again" }))
+
+    expect(screen.getByRole("dialog", { name: "Replace job description?" })).toBeVisible()
+    expect(attempt).toBe(1)
+    expect(screen.getByLabelText("Job description")).toHaveValue("Keep this retry text")
+
+    await user.click(screen.getByRole("button", { name: "Replace text" }))
+    await vi.waitFor(() => expect(attempt).toBe(2))
+    expect(screen.getByLabelText("Extraction busy")).toHaveTextContent("true")
+    resolveRetry?.(HttpResponse.json({
+      text: "Extracted retry text",
+      source: { filename: "role.pdf", media_type: "application/pdf" },
+    }))
+    expect(await screen.findByLabelText("Job description")).toHaveValue("Extracted retry text")
+  })
+
   it("disables retry and guards it while submission is active", async () => {
     const called = vi.fn(() =>
       HttpResponse.json(

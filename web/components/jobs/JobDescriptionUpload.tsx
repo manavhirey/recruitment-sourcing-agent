@@ -1,9 +1,13 @@
 "use client"
 
 import { useEffect, useRef, useState, type ChangeEvent } from "react"
+import { useRouter } from "next/navigation"
 
 import { ModalDialog } from "@/components/layout/ModalDialog"
-import { responseJson } from "@/lib/client-response"
+import {
+  reauthenticateExpiredSession,
+  responseJson,
+} from "@/lib/client-response"
 import type { JobDescriptionExtraction } from "@/lib/schemas"
 
 const maximumFileBytes = 10_000_000
@@ -54,6 +58,7 @@ export function JobDescriptionUpload({
   onBusyChange,
   onExtracted,
 }: JobDescriptionUploadProps) {
+  const router = useRouter()
   const [extracting, setExtracting] = useState(false)
   const [confirming, setConfirming] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -94,6 +99,7 @@ export function JobDescriptionUpload({
       intent.current = null
       setCanRetry(false)
     } catch (reason) {
+      if (reauthenticateExpiredSession(reason, router)) return
       showError(reason instanceof Error ? reason.message : "job_description_extraction_unavailable")
     } finally {
       extractionInFlight.current = false
@@ -107,6 +113,15 @@ export function JobDescriptionUpload({
     intent.current = null
     setCanRetry(false)
     setConfirming(false)
+  }
+
+  function retryExtraction() {
+    if (disabled || extractionInFlight.current) return
+    if (currentText.trim()) {
+      setConfirming(true)
+      return
+    }
+    void extract()
   }
 
   function selectFile(event: ChangeEvent<HTMLInputElement>) {
@@ -156,7 +171,7 @@ export function JobDescriptionUpload({
               className="button button-secondary"
               type="button"
               disabled={disabled || extracting}
-              onClick={() => void extract()}
+              onClick={retryExtraction}
             >
               Try again
             </button>
