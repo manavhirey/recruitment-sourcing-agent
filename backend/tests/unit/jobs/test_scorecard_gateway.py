@@ -111,6 +111,28 @@ def test_inferred_numeric_bound_requires_confirmation(client_context) -> None:
     assert result.unresolved_inferred_items() == result.inferred_item_ids()
 
 
+def test_generated_draft_cannot_self_confirm_numeric_bound(client_context) -> None:
+    confirmation_id = (
+        "uncertainty:WyJ1bmNlcnRhaW50eSIsMCwiQ29uZmlybSBpbmZlcnJlZCBtaW5pbXVt"
+        "IHllYXJzOiA1Il0"
+    )
+    draft = {
+        **VALID_DRAFT,
+        "minimum_years": 5,
+        "maximum_years": None,
+        "uncertainties": ["Confirm inferred minimum years: 5"],
+        "confirmed_inferred_items": [confirmation_id],
+    }
+    gateway = OpenAIResponsesScorecardGateway(FakeOpenAI([draft]), "gpt-5-mini")
+
+    result = gateway.extract(
+        "Hire a product manager with payments experience.", client_context
+    )
+
+    assert result.confirmed_inferred_items == []
+    assert confirmation_id in result.unresolved_inferred_items()
+
+
 @pytest.mark.parametrize(
     ("minimum_years", "maximum_years", "uncertainties", "expected"),
     [

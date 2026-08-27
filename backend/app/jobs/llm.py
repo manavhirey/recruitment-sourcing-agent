@@ -86,6 +86,7 @@ class OpenAIResponsesScorecardGateway:
 
 def _require_numeric_bound_confirmation(draft: ScorecardDraft) -> ScorecardDraft:
     values = draft.model_dump()
+    values["confirmed_inferred_items"] = []
     uncertainties = list(draft.uncertainties)
     for label, bound in (
         ("minimum", draft.minimum_years),
