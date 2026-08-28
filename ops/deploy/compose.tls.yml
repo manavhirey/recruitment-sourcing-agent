@@ -1,0 +1,58 @@
+# Production-only TLS override: internal CA-signed TLS for postgres, redis,
+# and minio. Used when TLS_ENABLED=true in the environment file.
+# Expects <repo>/../tls/ layout from ops/deploy/generate-tls.sh:
+#   tls/ca.pem, tls/postgres/{server.crt,server.key},
+#   tls/redis/{server.crt,server.key}, tls/minio/{server.crt,server.key}
+services:
+  postgres:
+    command:
+      ["postgres", "-c", "ssl=on", "-c", "ssl_cert_file=/tls/server.crt", "-c", "ssl_key_file=/tls/server.key"]
+    volumes:
+      - ../tls/postgres/server.crt:/tls/server.crt:ro
+      - ../tls/postgres/server.key:/tls/server.key:ro
+
+  redis:
+    command:
+      ["redis-server", "--port", "0", "--tls-port", "6379",
+       "--tls-cert-file", "/tls/server.crt", "--tls-key-file", "/tls/server.key",
+       "--tls-ca-cert-file", "/tls/ca.pem", "--requirepass", "${REDIS_TLS_PASSWORD:?REDIS_TLS_PASSWORD required}"]
+    volumes:
+      - ../tls/redis/server.crt:/tls/server.crt:ro
+      - ../tls/redis/server.key:/tls/server.key:ro
+      - ../tls/ca.pem:/tls/ca.pem:ro
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_TLS_PASSWORD redis-cli --tls --cacert /tls/ca.pem ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    environment:
+      MINIO_CERT_FILE: /tls/server.crt
+      MINIO_KEY_FILE: /tls/server.key
+    volumes:
+      - ../tls/minio/server.crt:/tls/server.crt:ro
+      - ../tls/minio/server.key:/tls/server.key:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -skf https://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    volumes: ["../tls/ca.pem:/etc/ssl/internal-ca.pem:ro"]
+    environment:
+      AWS_CA_BUNDLE: /etc/ssl/internal-ca.pem
+
+  worker:
+    volumes: ["../tls/ca.pem:/etc/ssl/internal-ca.pem:ro"]
+    environment:
+      AWS_CA_BUNDLE: /etc/ssl/internal-ca.pem
+
+  maintenance-worker:
+    volumes: ["../tls/ca.pem:/etc/ssl/internal-ca.pem:ro"]
+    environment:
+      AWS_CA_BUNDLE: /etc/ssl/internal-ca.pem
+
+  scheduler:
+    volumes: ["../tls/ca.pem:/etc/ssl/internal-ca.pem:ro"]
