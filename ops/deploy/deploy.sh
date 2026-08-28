@@ -33,7 +33,7 @@ echo "==> pulling images (${IMAGE_TAG})"
 compose pull --quiet api web
 
 echo "==> provisioning object store"
-MC_IMAGE="minio/mc:latest@sha256:37d109dddbbb2c95873f5fc81ac93f37023264770fc580a7564148892087b1b7"
+MC_IMAGE="minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
 compose_network="recruitment-${ENV_NAME}_default"
 docker run --rm -i --network "${compose_network}" \
   -e MC_HOST_local="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
