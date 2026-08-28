@@ -4,7 +4,7 @@ FROM python:3.12.14-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b3
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
-WORKDIR /build
+WORKDIR /app
 RUN pip install --no-cache-dir uv==0.8.13
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
@@ -19,7 +19,7 @@ RUN apt-get update \
     && groupadd --gid 10001 sourcing \
     && useradd --uid 10001 --gid sourcing --no-create-home --shell /usr/sbin/nologin sourcing
 WORKDIR /app
-COPY --from=builder --chown=root:root /build/.venv /app/.venv
+COPY --from=builder --chown=root:root /app/.venv /app/.venv
 COPY --chown=root:root alembic.ini ./
 COPY --chown=root:root alembic ./alembic
 COPY --chown=root:root app ./app
