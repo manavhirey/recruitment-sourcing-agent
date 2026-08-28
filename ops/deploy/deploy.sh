@@ -45,17 +45,16 @@ docker run --rm -i --network "${compose_network}" \
   --entrypoint sh "${MC_IMAGE}" <<'MCEOF'
 set -eu
 mc mb --ignore-existing "local/${BUCKET}"
-cat > /tmp/writer.json <<'EOF'
+cat > /tmp/writer.json <<EOF
 {"Version":"2012-10-17","Statement":[
  {"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
  {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::${BUCKET}"]}]}
 EOF
-cat > /tmp/delete.json <<'EOF'
+cat > /tmp/delete.json <<EOF
 {"Version":"2012-10-17","Statement":[
  {"Effect":"Allow","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
  {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::${BUCKET}"]}]}
 EOF
-sed -i "s/\${BUCKET}/${BUCKET}/g" /tmp/writer.json /tmp/delete.json
 mc admin user add "local" "${WRITER_KEY}" "${WRITER_SECRET}" 2>/dev/null || true
 mc admin user add "local" "${DELETE_KEY}" "${DELETE_SECRET}" 2>/dev/null || true
 mc admin policy create local writer-pol /tmp/writer.json 2>/dev/null || mc admin policy update local writer-pol /tmp/writer.json
