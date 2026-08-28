@@ -15,7 +15,13 @@ REPO_DIR="${ROOT}/repo"
 ENV_FILE="${ROOT}/.env"
 
 cd "${REPO_DIR}"
-git fetch --quiet origin "${GIT_REF}"
+for attempt in 1 2 3; do
+  if git fetch --quiet origin "${GIT_REF}"; then
+    break
+  fi
+  [ "${attempt}" -eq 3 ] && { echo "ERROR: git fetch failed for ${GIT_REF}" >&2; exit 1; }
+  sleep 3
+done
 git checkout --quiet --force FETCH_HEAD
 
 # Shell-source the env file so compose interpolation and migration URLs are set.
