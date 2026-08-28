@@ -1,0 +1,96 @@
+{
+  "realm": "sourcing",
+  "enabled": true,
+  "sslRequired": "external",
+  "clients": [
+    {
+      "clientId": "sourcing-web-dev",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "REPLACE_DEV_CLIENT_SECRET",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "https://dev.kunigami.cloud/api/auth/callback/*",
+        "https://dev.kunigami.cloud/*"
+      ],
+      "webOrigins": ["https://dev.kunigami.cloud"],
+      "attributes": {
+        "post.logout.redirect.uris": "https://dev.kunigami.cloud/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience-dev-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "https://dev-api.kunigami.cloud",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "sourcing-web-prod",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "REPLACE_PROD_CLIENT_SECRET",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "https://kunigami.cloud/api/auth/callback/*",
+        "https://kunigami.cloud/*"
+      ],
+      "webOrigins": ["https://kunigami.cloud"],
+      "attributes": {
+        "post.logout.redirect.uris": "https://kunigami.cloud/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience-prod-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "https://api.kunigami.cloud",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "https://dev-api.kunigami.cloud",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": true
+    },
+    {
+      "clientId": "https://api.kunigami.cloud",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": true
+    }
+  ],
+  "users": [
+    {
+      "username": "dev-admin",
+      "enabled": true,
+      "email": "dev-admin@kunigami.cloud",
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "REPLACE_DEV_ADMIN_PASSWORD",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

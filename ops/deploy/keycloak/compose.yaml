@@ -1,0 +1,59 @@
+# Keycloak (OIDC provider) for auth.kunigami.cloud.
+# Deployed on the VPS at /opt/recruitment/keycloak.
+# Requires the external network "traefik-proxy" and /opt/recruitment/keycloak/.env with:
+#   KEYCLOAK_ADMIN, KEYCLOAK_ADMIN_PASSWORD, KC_DB_PASSWORD, KC_HOSTNAME
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0.8@sha256:ecd43971114b0c764f8a3288dddab73f98cb473daccc4feaffe4dc14adeaf866
+    command: ["start", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
+      KC_HOSTNAME: ${KC_HOSTNAME}
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./realm-sourcing.json:/opt/keycloak/data/import/realm-sourcing.json:ro
+    networks: [default, traefik-proxy]
+    depends_on:
+      keycloak-db: { condition: service_healthy }
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-proxy"
+      - "traefik.http.routers.keycloak.rule=Host(`auth.kunigami.cloud`)"
+      - "traefik.http.routers.keycloak.entrypoints=websecure"
+      - "traefik.http.routers.keycloak.tls.certresolver=letsencrypt"
+      - "traefik.http.services.keycloak.loadbalancer.server.port=8080"
+      # The backend fetches "<issuer>/.well-known/jwks.json"; Keycloak serves
+      # the realm JWKS at "<realm>/protocol/openid-connect/certs" instead.
+      - "traefik.http.middlewares.keycloak-jwks.replacepathregex.regex=^/realms/sourcing/.well-known/jwks\\.json$$"
+      - "traefik.http.middlewares.keycloak-jwks.replacepathregex.replacement=/realms/sourcing/protocol/openid-connect/certs"
+      - "traefik.http.routers.keycloak.middlewares=keycloak-jwks"
+
+  keycloak-db:
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    environment:
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KC_DB_PASSWORD}
+      POSTGRES_DB: keycloak
+    volumes:
+      - keycloak_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  keycloak_db_data:
+
+networks:
+  traefik-proxy:
+    external: true
