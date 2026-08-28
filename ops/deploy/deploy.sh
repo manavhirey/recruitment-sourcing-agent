@@ -38,6 +38,9 @@ compose() {
 echo "==> pulling images (${IMAGE_TAG})"
 compose pull --quiet api web
 
+echo "==> starting infrastructure"
+compose up -d --no-build --wait postgres redis minio
+
 echo "==> provisioning object store"
 MC_IMAGE="minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
 compose_network="recruitment-${ENV_NAME}_default"
