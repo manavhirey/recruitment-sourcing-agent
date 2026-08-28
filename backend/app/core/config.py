@@ -152,6 +152,7 @@ class Settings(BaseSettings):
     oidc_audience: str
     openai_api_key: SecretStr
     scorecard_model: str = "gpt-5-mini"
+    scorecard_llm_timeout_seconds: float = Field(default=30, gt=0)
     contact_encryption_key: SecretStr
     suppression_hmac_key: SecretStr
     identity_hmac_key: SecretStr = SecretStr("development-identity-key")

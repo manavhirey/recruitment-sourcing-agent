@@ -24,7 +24,7 @@ from app.jobs.schemas import (
     ScorecardDraftResponse,
     SeniorityOption,
 )
-from app.jobs.seniority import SENIORITY_PRESETS
+from app.jobs.seniority import SENIORITY_PRESETS, UnknownSeniorityError
 
 
 class JobError(AppError):
@@ -38,9 +38,7 @@ def _is_unknown_legacy_seniority_error(error: ValidationError) -> bool:
     if len(errors) != 1 or errors[0]["loc"] != ("seniority",):
         return False
     cause = errors[0].get("ctx", {}).get("error")
-    return isinstance(cause, ValueError) and str(cause).startswith(
-        "unknown seniority value:"
-    )
+    return isinstance(cause, UnknownSeniorityError)
 
 
 class JobService:
@@ -271,7 +269,12 @@ class JobService:
         self._check_revision(job, expected_revision)
         if job.draft_payload is None:
             raise JobError("scorecard_draft_required")
-        draft = ScorecardDraft.model_validate(job.draft_payload)
+        try:
+            draft = ScorecardDraft.model_validate(job.draft_payload)
+        except ValidationError as error:
+            if not _is_unknown_legacy_seniority_error(error):
+                raise
+            raise JobError("scorecard_seniority_revision_required") from error
         scorecard = self._append_scorecard(context, job, draft)
         job.draft_revision += 1
         self.session.flush()

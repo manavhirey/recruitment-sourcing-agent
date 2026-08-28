@@ -60,8 +60,13 @@ def test_fixed_weights_total_one_hundred_for_fully_supported_evidence(
     ("seniority", "years", "state"),
     [
         (["early_career"], 3.0, EvidenceState.SUPPORTED),
+        (["mid_level"], 2.99, EvidenceState.FAILED),
         (["mid_level"], 3.0, EvidenceState.SUPPORTED),
+        (["mid_level"], 9.5, EvidenceState.SUPPORTED),
+        (["mid_level"], 9.99, EvidenceState.SUPPORTED),
         (["mid_level"], 10.0, EvidenceState.FAILED),
+        (["senior"], 10.0, EvidenceState.SUPPORTED),
+        (["senior"], 10.01, EvidenceState.SUPPORTED),
         (["early_career", "senior"], 7.0, EvidenceState.FAILED),
         (["early_career", "senior"], 12.0, EvidenceState.SUPPORTED),
     ],

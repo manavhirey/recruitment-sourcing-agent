@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import suppress
 from typing import Annotated, NoReturn
 
@@ -16,6 +17,7 @@ from app.jobs.document_runner import JobDescriptionExtractionRunner
 from app.jobs.schemas import JobDescriptionExtractionResponse
 
 router = APIRouter(prefix="/api/v1/job-descriptions", tags=["jobs"])
+logger = logging.getLogger("sourcing.jobs.documents")
 
 EXTRACTION_TIMEOUT_SECONDS = 10
 DISCONNECT_POLL_SECONDS = 0.05
@@ -160,6 +162,10 @@ async def extract_job_description(
     except ClientDisconnect:
         return Response(status_code=499)
     except Exception as error:
+        logger.error(
+            "job_description_extraction_unexpected_error error_type=%s",
+            type(error).__name__,
+        )
         raise HTTPException(
             status_code=503,
             detail={"code": "job_description_extraction_unavailable"},

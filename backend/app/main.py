@@ -162,7 +162,11 @@ def create_app(
         else ProcessJobDescriptionExtractionRunner()
     )
     app.state.scorecard_gateway = scorecard_gateway or OpenAIResponsesScorecardGateway(
-        OpenAI(api_key=app.state.settings.openai_api_key.get_secret_value()),
+        OpenAI(
+            api_key=app.state.settings.openai_api_key.get_secret_value(),
+            timeout=app.state.settings.scorecard_llm_timeout_seconds,
+            max_retries=1,
+        ),
         app.state.settings.scorecard_model,
     )
     app.state.sourcing_dispatcher = sourcing_dispatcher or _dispatch_sourcing_run

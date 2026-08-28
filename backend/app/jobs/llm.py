@@ -4,7 +4,11 @@ from typing import Any, Protocol, cast
 from pydantic import ValidationError
 
 from app.core.errors import AppError
-from app.jobs.schemas import ClientContext, ScorecardDraft
+from app.jobs.schemas import (
+    MAX_UNCERTAINTIES,
+    ClientContext,
+    ScorecardDraft,
+)
 
 
 class ScorecardExtractionError(AppError):
@@ -87,14 +91,16 @@ class OpenAIResponsesScorecardGateway:
 def _require_numeric_bound_confirmation(draft: ScorecardDraft) -> ScorecardDraft:
     values = draft.model_dump()
     values["confirmed_inferred_items"] = []
-    uncertainties = list(draft.uncertainties)
-    for label, bound in (
-        ("minimum", draft.minimum_years),
-        ("maximum", draft.maximum_years),
-    ):
-        if bound is None:
-            continue
-        uncertainty = f"Confirm inferred {label} years: {bound}"
+    forced = [
+        f"Confirm inferred {label} years: {bound}"
+        for label, bound in (
+            ("minimum", draft.minimum_years),
+            ("maximum", draft.maximum_years),
+        )
+        if bound is not None
+    ]
+    uncertainties = list(draft.uncertainties)[: MAX_UNCERTAINTIES - len(forced)]
+    for uncertainty in forced:
         if uncertainty not in uncertainties:
             uncertainties.append(uncertainty)
     values["uncertainties"] = uncertainties

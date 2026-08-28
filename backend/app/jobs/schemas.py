@@ -16,6 +16,9 @@ class CriterionKind(StrEnum):
     EXCLUSION = "exclusion"
 
 
+MAX_UNCERTAINTIES = 20
+
+
 def _criterion_text(criterion: "ScorecardCriterion") -> str:
     return " ".join((criterion.key, criterion.label, criterion.source_text or ""))
 
@@ -86,7 +89,7 @@ class ScorecardContent(BaseModel):
     locations: list[str] = Field(max_length=20)
     industry_code: str = Field(min_length=1, max_length=128)
     suggested_adjacent_industries: list[str] = Field(max_length=12)
-    uncertainties: list[str] = Field(max_length=20)
+    uncertainties: list[str] = Field(max_length=MAX_UNCERTAINTIES)
     confirmed_inferred_items: list[str] = Field(default_factory=list, max_length=72)
 
     def inferred_item_ids(self) -> set[str]:
@@ -267,7 +270,7 @@ class EditableScorecardDraft(ScorecardContent):
     suggested_adjacent_industries: list[str] = Field(
         default_factory=list, max_length=12
     )
-    uncertainties: list[str] = Field(default_factory=list, max_length=20)
+    uncertainties: list[str] = Field(default_factory=list, max_length=MAX_UNCERTAINTIES)
     confirmed_inferred_items: list[str] = Field(default_factory=list, max_length=72)
 
 

@@ -1,14 +1,17 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 
+from app.core.config import Settings
 from app.jobs.llm import (
     OpenAIResponsesScorecardGateway,
     ScorecardExtractionError,
     extraction_instructions,
 )
 from app.jobs.schemas import ClientContext, ScorecardDraft
+from app.main import create_app
 
 VALID_DRAFT = {
     "target_titles": ["Product Manager"],
@@ -177,6 +180,59 @@ def test_extraction_instructions_constrain_seniority_and_numeric_inference() -> 
 
     assert "Use only early_career, mid_level, or senior for seniority." in instructions
     assert "numeric bounds override seniority presets" in instructions
+
+
+def test_forced_confirmations_truncate_model_uncertainties_to_cap(
+    client_context,
+) -> None:
+    draft = {
+        **VALID_DRAFT,
+        "uncertainties": [f"Uncertainty {index}" for index in range(20)],
+    }
+    gateway = OpenAIResponsesScorecardGateway(FakeOpenAI([draft]), "gpt-5-mini")
+
+    result = gateway.extract(
+        "Hire a product manager with payments experience.", client_context
+    )
+
+    assert len(result.uncertainties) == 20
+    assert result.uncertainties[:18] == [f"Uncertainty {index}" for index in range(18)]
+    assert "Confirm inferred minimum years: 5" in result.uncertainties
+    assert "Confirm inferred maximum years: 12" in result.uncertainties
+
+
+def test_truncation_preserves_forced_confirmation_present_in_model_list(
+    client_context,
+) -> None:
+    draft = {
+        **VALID_DRAFT,
+        "maximum_years": None,
+        "uncertainties": [f"Uncertainty {index}" for index in range(19)]
+        + ["Confirm inferred minimum years: 5"],
+    }
+    gateway = OpenAIResponsesScorecardGateway(FakeOpenAI([draft]), "gpt-5-mini")
+
+    result = gateway.extract(
+        "Hire a product manager with payments experience.", client_context
+    )
+
+    assert len(result.uncertainties) == 20
+    assert result.uncertainties[-1] == "Confirm inferred minimum years: 5"
+
+
+def test_create_app_wires_openai_client_with_configured_timeout() -> None:
+    settings = Settings.for_test().model_copy(
+        update={"scorecard_llm_timeout_seconds": 7}
+    )
+
+    with patch("app.main.OpenAI") as openai_factory:
+        create_app(settings)
+
+    openai_factory.assert_called_once_with(
+        api_key="test-openai-key",
+        timeout=7,
+        max_retries=1,
+    )
 
 
 def test_two_invalid_extractions_raise_typed_error(client_context) -> None:

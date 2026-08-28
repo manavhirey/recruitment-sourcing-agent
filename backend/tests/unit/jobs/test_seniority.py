@@ -2,6 +2,7 @@ import pytest
 
 from app.jobs.seniority import (
     SeniorityLevel,
+    UnknownSeniorityError,
     effective_experience_intervals,
     normalize_draft_seniority,
 )
@@ -11,13 +12,19 @@ from app.jobs.seniority import (
     ("years", "early", "mid", "senior"),
     [
         (0.0, True, False, False),
+        (2.99, True, False, False),
         (3.0, True, True, False),
         (4.0, False, True, False),
         (9.0, False, True, False),
+        (9.5, False, True, False),
+        (9.99, False, True, False),
         (10.0, False, False, True),
+        (10.01, False, False, True),
     ],
 )
-def test_preset_boundaries_are_inclusive(years, early, mid, senior):
+def test_preset_boundaries_cover_every_non_negative_year_value(
+    years, early, mid, senior
+):
     levels = [
         SeniorityLevel.EARLY_CAREER,
         SeniorityLevel.MID_LEVEL,
@@ -53,5 +60,5 @@ def test_draft_aliases_normalize_and_unknown_values_fail():
         SeniorityLevel.MID_LEVEL,
         SeniorityLevel.SENIOR,
     )
-    with pytest.raises(ValueError, match="unknown seniority value"):
+    with pytest.raises(UnknownSeniorityError, match="unknown seniority value"):
         normalize_draft_seniority(["manager"])

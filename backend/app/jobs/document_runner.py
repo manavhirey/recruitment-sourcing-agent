@@ -3,6 +3,7 @@ import multiprocessing
 import os
 import sys
 import threading
+import time
 from collections.abc import Callable
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -16,8 +17,12 @@ from app.jobs.document_extraction import (
 
 WORKER_CPU_SECONDS = 10
 WORKER_MEMORY_BYTES = 512 * 1024 * 1024
-WORKER_POLL_SECONDS = 0.01
+WORKER_POLL_SECONDS = 0.05
 WORKER_TERMINATE_GRACE_SECONDS = 0.25
+
+
+class _ExtractionAbandoned(Exception):
+    """Raised inside the worker thread after the awaiting task is cancelled."""
 
 
 def _available_cpu_count() -> int:
@@ -160,13 +165,14 @@ class ProcessJobDescriptionExtractionRunner:
         finally:
             _WORKER_ADMISSION.release()
 
-    async def _run_admitted(
+    def _run_worker_synchronously(
         self,
         *,
         data: bytes,
         filename: str,
         media_type: str | None,
         timeout_seconds: float,
+        stop: threading.Event,
     ) -> ExtractedJobDescription:
         receiver, sender = self._context.Pipe(duplex=False)
         process = self._context.Process(
@@ -176,8 +182,7 @@ class ProcessJobDescriptionExtractionRunner:
         )
         started = False
         try:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout_seconds
+            deadline = time.monotonic() + timeout_seconds
             process.start()
             started = True
             sender.close()
@@ -200,13 +205,50 @@ class ProcessJobDescriptionExtractionRunner:
                     raise RuntimeError(
                         "document extraction worker exited without a result"
                     )
-                remaining = deadline - loop.time()
+                if stop.is_set():
+                    raise _ExtractionAbandoned
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("document extraction worker timed out")
-                await asyncio.sleep(min(WORKER_POLL_SECONDS, remaining))
+                time.sleep(min(WORKER_POLL_SECONDS, remaining))
         finally:
             receiver.close()
             if started:
                 _terminate_and_reap(process)
             else:
                 sender.close()
+
+    async def _run_admitted(
+        self,
+        *,
+        data: bytes,
+        filename: str,
+        media_type: str | None,
+        timeout_seconds: float,
+    ) -> ExtractedJobDescription:
+        stop = threading.Event()
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            None,
+            lambda: self._run_worker_synchronously(
+                data=data,
+                filename=filename,
+                media_type=media_type,
+                timeout_seconds=timeout_seconds,
+                stop=stop,
+            ),
+        )
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            stop.set()
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:  # noqa: BLE001 - cancellation discards the result
+                    break
+            if not future.cancelled():
+                future.exception()
+            raise

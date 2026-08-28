@@ -1,14 +1,20 @@
 import asyncio
+import logging
 import multiprocessing
 import os
 import threading
 import time
 from multiprocessing.connection import Connection
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect, Request
 
+from app.identity.dependencies import get_request_context
+from app.identity.schemas import RequestContext, Role
 from app.jobs import document_router, document_runner
 from app.jobs.document_extraction import (
     DocumentExtractionError,
@@ -341,3 +347,63 @@ def test_disconnect_monitor_failure_preserves_valid_worker_completion(
     )
 
     assert result.text == "Worker completed"
+
+
+def test_unexpected_extractor_error_logs_redacted_event() -> None:
+    filename = "confidential-customer-role.pdf"
+
+    class ExplodingRunner:
+        async def run(
+            self,
+            *,
+            data: bytes,
+            filename: str,
+            media_type: str | None,
+            timeout_seconds: float,
+        ) -> ExtractedJobDescription:
+            raise RuntimeError(
+                f"parser exposed {filename}: confidential extracted text"
+            )
+
+    app = FastAPI()
+    app.include_router(document_router.router)
+    app.state.job_description_extraction_runner = ExplodingRunner()
+    app.dependency_overrides[get_request_context] = lambda: RequestContext(
+        tenant_id=uuid4(),
+        user_id=uuid4(),
+        role=Role.OWNER,
+    )
+
+    class _CaptureHandler(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    capture_handler = _CaptureHandler()
+    module_logger = logging.getLogger("sourcing.jobs.documents")
+    module_logger.addHandler(capture_handler)
+    try:
+        response = TestClient(app).post(
+            "/api/v1/job-descriptions/extract",
+            files={"file": (filename, b"%PDF-controlled failure", "application/pdf")},
+        )
+    finally:
+        module_logger.removeHandler(capture_handler)
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "job_description_extraction_unavailable"}
+    }
+    unexpected = [
+        record
+        for record in capture_handler.records
+        if record.getMessage()
+        == "job_description_extraction_unexpected_error error_type=RuntimeError"
+    ]
+    assert unexpected
+    logged_text = "".join(record.getMessage() for record in capture_handler.records)
+    assert filename not in logged_text
+    assert "confidential extracted text" not in logged_text

@@ -83,6 +83,7 @@ def _raise_job_error(error: JobError) -> NoReturn:
         "scorecard_draft_not_found": status.HTTP_404_NOT_FOUND,
         "scorecard_revision_conflict": status.HTTP_409_CONFLICT,
         "scorecard_inferences_unresolved": status.HTTP_409_CONFLICT,
+        "scorecard_seniority_revision_required": status.HTTP_409_CONFLICT,
         "idempotency_conflict": status.HTTP_409_CONFLICT,
     }.get(error.code, status.HTTP_400_BAD_REQUEST)
     raise HTTPException(status_code=status_code, detail={"code": error.code}) from error

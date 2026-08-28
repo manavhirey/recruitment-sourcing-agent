@@ -9,15 +9,24 @@ class SeniorityLevel(StrEnum):
     SENIOR = "senior"
 
 
+class UnknownSeniorityError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class ExperienceInterval:
     minimum_years: int
     maximum_years: int | None
+    maximum_inclusive: bool = True
 
     def contains(self, years: float) -> bool:
-        return years >= self.minimum_years and (
-            self.maximum_years is None or years <= self.maximum_years
-        )
+        if years < self.minimum_years:
+            return False
+        if self.maximum_years is None:
+            return True
+        if self.maximum_inclusive:
+            return years <= self.maximum_years
+        return years < self.maximum_years
 
 
 @dataclass(frozen=True)
@@ -26,12 +35,31 @@ class SeniorityPreset:
     label: str
     minimum_years: int
     maximum_years: int | None
+    interval: ExperienceInterval
 
 
 SENIORITY_PRESETS = (
-    SeniorityPreset(SeniorityLevel.EARLY_CAREER, "Early-Career", 0, 3),
-    SeniorityPreset(SeniorityLevel.MID_LEVEL, "Mid-Level", 3, 9),
-    SeniorityPreset(SeniorityLevel.SENIOR, "Senior", 10, None),
+    SeniorityPreset(
+        SeniorityLevel.EARLY_CAREER,
+        "Early-Career",
+        0,
+        3,
+        ExperienceInterval(0, 3),
+    ),
+    SeniorityPreset(
+        SeniorityLevel.MID_LEVEL,
+        "Mid-Level",
+        3,
+        9,
+        ExperienceInterval(3, 10, maximum_inclusive=False),
+    ),
+    SeniorityPreset(
+        SeniorityLevel.SENIOR,
+        "Senior",
+        10,
+        None,
+        ExperienceInterval(10, None),
+    ),
 )
 _PRESET_BY_LEVEL = {preset.value: preset for preset in SENIORITY_PRESETS}
 _ALIASES = {
@@ -48,7 +76,7 @@ def normalize_draft_seniority(values: Iterable[str]) -> tuple[SeniorityLevel, ..
     for raw in values:
         value = _ALIASES.get(raw.strip().casefold())
         if value is None:
-            raise ValueError(f"unknown seniority value: {raw}")
+            raise UnknownSeniorityError(f"unknown seniority value: {raw}")
         requested.add(value)
     return tuple(
         preset.value for preset in SENIORITY_PRESETS if preset.value in requested
@@ -67,10 +95,4 @@ def effective_experience_intervals(
     if minimum_years is not None or maximum_years is not None:
         return (ExperienceInterval(minimum_years or 0, maximum_years),)
     levels = normalize_draft_seniority(str(value) for value in seniority)
-    return tuple(
-        ExperienceInterval(
-            _PRESET_BY_LEVEL[level].minimum_years,
-            _PRESET_BY_LEVEL[level].maximum_years,
-        )
-        for level in levels
-    )
+    return tuple(_PRESET_BY_LEVEL[level].interval for level in levels)
