@@ -23,7 +23,6 @@ x-api-environment: &api-environment
 
 x-worker-environment: &worker-environment
   <<: *runtime-common
-  OPENAI_API_KEY: ${OPENAI_API_KEY}
   APOLLO_API_KEY: ${APOLLO_API_KEY}
   APOLLO_REVEAL_PERSONAL_EMAILS: ${APOLLO_REVEAL_PERSONAL_EMAILS:-false}
   APOLLO_REVEAL_PHONE_NUMBERS: ${APOLLO_REVEAL_PHONE_NUMBERS:-false}

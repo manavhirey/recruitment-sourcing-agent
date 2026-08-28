@@ -20,6 +20,14 @@ services:
   worker:
     image: ghcr.io/manavhirey/recruitment-sourcing-api:${API_IMAGE_TAG:?API_IMAGE_TAG required}
     pull_policy: always
+    # The sourcing worker imports the shared database session and scorecard
+    # gateway, which construct the full API Settings; the base compose keeps
+    # these capabilities out of the worker, so grant them only at deploy time.
+    environment:
+      OIDC_ISSUER: ${OIDC_ISSUER}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      SCORECARD_MODEL: ${SCORECARD_MODEL:-gpt-5-mini}
 
   maintenance-worker:
     image: ghcr.io/manavhirey/recruitment-sourcing-api:${API_IMAGE_TAG:?API_IMAGE_TAG required}
