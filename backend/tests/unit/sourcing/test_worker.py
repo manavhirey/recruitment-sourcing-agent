@@ -1068,6 +1068,36 @@ def test_nonretryable_provider_failure_marks_run_failed(
     ]
 
 
+@pytest.mark.parametrize(
+    ("planned_state", "expected_dispatches"),
+    [(tasks.RunState.SOURCING, 1), (tasks.RunState.FAILED, 0)],
+)
+def test_plan_wrapper_dispatches_source_only_when_planning_leaves_sourcing(
+    monkeypatch: pytest.MonkeyPatch,
+    planned_state: tasks.RunState,
+    expected_dispatches: int,
+) -> None:
+    run_id = uuid4()
+    tenant_id = uuid4()
+    user_id = uuid4()
+    dispatched: list[tuple[str, str, str, str]] = []
+
+    monkeypatch.setattr(
+        tasks,
+        "execute_plan_run",
+        lambda *args, **kwargs: planned_state,
+    )
+    monkeypatch.setattr(
+        tasks.source_run,
+        "delay",
+        lambda *args: dispatched.append(args),
+    )
+
+    plan_run.run(str(run_id), str(tenant_id), str(user_id), "plan")
+
+    assert len(dispatched) == expected_dispatches
+
+
 def test_source_wrapper_dispatches_match_for_eligible_partial_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,10 +1,12 @@
 "use client"
+/* eslint-disable react-hooks/incompatible-library -- React Hook Form watch keeps reviewed text in its existing single source of truth. */
 
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useRouter } from "next/navigation"
 import { useState } from "react"
 import { useForm } from "react-hook-form"
 
+import { JobDescriptionUpload } from "@/components/jobs/JobDescriptionUpload"
 import {
   reauthenticateExpiredSession,
   responseJson,
@@ -12,6 +14,7 @@ import {
 import type {
   Client,
   Job,
+  JobDescriptionExtraction,
   JobIntakeValues,
   ScorecardDraftResponse,
 } from "@/lib/schemas"
@@ -35,12 +38,16 @@ function mutationKey(): string {
 
 export function JobIntakeForm({ clients, onDraftReady }: JobIntakeFormProps) {
   const [intent, setIntent] = useState<IntakeIntent | null>(null)
+  const [extracting, setExtracting] = useState(false)
+  const [extractedSource, setExtractedSource] = useState<string | null>(null)
   const router = useRouter()
   const [serverError, setServerError] = useState<string | null>(null)
   const {
     register,
     handleSubmit,
     setError,
+    setValue,
+    watch,
     formState: { errors, isSubmitting },
   } = useForm<JobIntakeValues>({
     resolver: zodResolver(jobIntakeSchema),
@@ -146,10 +153,24 @@ export function JobIntakeForm({ clients, onDraftReady }: JobIntakeFormProps) {
       </div>
 
       <div className="field field-wide">
+        <JobDescriptionUpload
+          currentText={watch("jobDescription")}
+          disabled={isSubmitting}
+          onBusyChange={setExtracting}
+          onExtracted={(result: JobDescriptionExtraction) => {
+            setValue("jobDescription", result.text, {
+              shouldDirty: true,
+              shouldTouch: true,
+              shouldValidate: true,
+            })
+            setExtractedSource(result.source.filename)
+          }}
+        />
         <label htmlFor="job-description">Job description</label>
         <textarea
           id="job-description"
           rows={12}
+          readOnly={extracting}
           aria-invalid={Boolean(errors.jobDescription)}
           aria-describedby={
             errors.jobDescription
@@ -161,6 +182,7 @@ export function JobIntakeForm({ clients, onDraftReady }: JobIntakeFormProps) {
         <p id="job-description-hint" className="field-hint">
           Paste the licensed client brief. Candidate and provider data do not belong here.
         </p>
+        {extractedSource ? <p className="extracted-source">Extracted from {extractedSource}</p> : null}
         {errors.jobDescription ? (
           <p id="job-description-error" className="field-error" role="alert">{errors.jobDescription.message}</p>
         ) : null}
@@ -187,7 +209,7 @@ export function JobIntakeForm({ clients, onDraftReady }: JobIntakeFormProps) {
           {serverError}
         </p>
       ) : null}
-      <button className="button button-primary" type="submit" disabled={isSubmitting}>
+      <button className="button button-primary" type="submit" disabled={isSubmitting || extracting}>
         {isSubmitting ? "Generating…" : "Generate scorecard"}
       </button>
     </form>

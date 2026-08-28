@@ -61,6 +61,7 @@ export default async function ScorecardPage({
     draft: draft.draft,
     extraction_status: draft.extraction_status,
     extraction_warning: draft.extraction_warning,
+    seniority_options: draft.seniority_options,
   }
   return (
     <div className="page-stack">

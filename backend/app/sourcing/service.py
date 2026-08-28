@@ -14,6 +14,7 @@ from app.identity.models import IdentityIdempotencyKey
 from app.identity.schemas import RequestContext, Role
 from app.identity.service import IdentityError, MembershipService
 from app.jobs.models import ScorecardVersion
+from app.jobs.seniority import validate_confirmed_seniority
 from app.jobs.service import JobError, JobService
 from app.sourcing.models import (
     EnrichmentRequest,
@@ -94,6 +95,21 @@ class SourcingService:
         idempotency_key: str,
     ) -> StartRunOutcome:
         job = self._job(context, job_id, for_update=True)
+        if job.current_scorecard_id is None:
+            raise SourcingError("scorecard_required")
+        scorecard = self.session.scalar(
+            select(ScorecardVersion).where(
+                ScorecardVersion.id == job.current_scorecard_id,
+                ScorecardVersion.tenant_id == context.tenant_id,
+                ScorecardVersion.job_id == job.id,
+            )
+        )
+        if scorecard is None:
+            raise SourcingError("scorecard_required")
+        try:
+            validate_confirmed_seniority(scorecard.seniority)
+        except ValueError as error:
+            raise SourcingError("scorecard_seniority_revision_required") from error
         record = self._begin(
             context,
             f"start_sourcing_run:{job_id}",
@@ -108,17 +124,6 @@ class SourcingService:
                 replayed,
                 needs_dispatch=replayed.dispatch_pending,
             )
-        if job.current_scorecard_id is None:
-            raise SourcingError("scorecard_required")
-        scorecard = self.session.scalar(
-            select(ScorecardVersion).where(
-                ScorecardVersion.id == job.current_scorecard_id,
-                ScorecardVersion.tenant_id == context.tenant_id,
-                ScorecardVersion.job_id == job.id,
-            )
-        )
-        if scorecard is None:
-            raise SourcingError("scorecard_required")
         active = self.session.scalar(
             select(SourcingRun)
             .where(

@@ -4,6 +4,8 @@ import { createHmac } from "node:crypto"
 import { expect, test, type BrowserContext, type Page } from "@playwright/test"
 import { encode } from "next-auth/jwt"
 
+import { seniorityOptionsFixture } from "@/tests/fixtures"
+
 const evidenceDirectory = path.resolve(
   "../.superpowers/sdd/2026-08-15-recruitment-sourcing-agent-vertical-slice",
 )
@@ -14,6 +16,31 @@ const runId = "00000000-0000-4000-8000-000000000301"
 const scorecardId = "00000000-0000-4000-8000-000000000403"
 const marcusId = "00000000-0000-4000-8000-000000000502"
 const authSecret = "x8V1qM3rT6yB9nC2pL5sF7hJ0kD4wZ6aQ8eR1tY3uI5oP7gH"
+const jobTitle = "Senior Product Manager"
+const extractedJobDescription = "Senior Product Designer\nLead product design for the growth team."
+const recruiterEditedJobDescription = "Senior Product Designer\nLead growth product design."
+
+type ObservedBffRequest = {
+  method: string
+  path: string
+}
+
+type InterceptorChecks = {
+  createJobDescriptionMatched: boolean
+}
+
+const interceptorChecks = new WeakMap<Page, InterceptorChecks>()
+
+function observeBffRequests(page: Page): ObservedBffRequest[] {
+  const observed: ObservedBffRequest[] = []
+  page.on("request", (request) => {
+    const { pathname } = new URL(request.url())
+    if (pathname.startsWith("/api/bff/")) {
+      observed.push({ method: request.method(), path: pathname })
+    }
+  })
+  return observed
+}
 
 const draft = {
   job_id: jobId,
@@ -21,6 +48,7 @@ const draft = {
   original_job_description: "Lead a payments platform and product-led growth strategy.",
   extraction_status: "ready",
   extraction_warning: null,
+  seniority_options: seniorityOptionsFixture,
   draft: {
     target_titles: ["Senior Product Manager"],
     criteria: [
@@ -28,7 +56,7 @@ const draft = {
       { key: "growth", label: "Led product-led growth", kind: "preference", evidence_required: false, source_text: "product-led growth strategy", inferred: false, recruiter_entered: false, lawful_requirement_confirmed: false },
     ],
     seniority: ["senior"],
-    minimum_years: 5,
+    minimum_years: null,
     maximum_years: null,
     locations: ["New York, NY"],
     industry_code: "technology.fintech",
@@ -95,6 +123,7 @@ const marcus = {
 
 async function interceptProductionBff(page: Page) {
   let currentRun = run()
+  interceptorChecks.set(page, { createJobDescriptionMatched: false })
   await page.route("**/api/bff/**", async (route) => {
     const request = route.request()
     const url = new URL(request.url())
@@ -107,7 +136,37 @@ async function interceptProductionBff(page: Page) {
       body: JSON.stringify(body),
     })
 
+    if (pathname.endsWith("/job-descriptions/extract") && method === "POST") {
+      const multipart = request.postDataBuffer()
+      if (multipart?.includes(Buffer.from('filename="encrypted.pdf"'))) {
+        await json({ code: "job_description_file_unreadable" }, 422)
+        return
+      }
+      if (multipart?.includes(Buffer.from('filename="scan.pdf"'))) {
+        await json({ code: "job_description_text_missing" }, 422)
+        return
+      }
+      const sourceFilename = multipart?.includes(Buffer.from('filename="role.docx"'))
+        ? "role.docx"
+        : "role.pdf"
+      await json({
+        text: extractedJobDescription,
+        source: {
+          filename: sourceFilename,
+          media_type: sourceFilename.endsWith(".docx")
+            ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            : "application/pdf",
+        },
+      })
+      return
+    }
     if (pathname === "/api/bff/jobs" && method === "POST") {
+      const requestBody = request.postDataJSON() as { job_description?: unknown }
+      const checks = interceptorChecks.get(page)
+      if (checks) {
+        checks.createJobDescriptionMatched =
+          requestBody.job_description === recruiterEditedJobDescription
+      }
       await json({
         id: jobId,
         tenant_id: tenantId,
@@ -247,8 +306,8 @@ test("real authenticated route crosses Next BFF and deterministic FastAPI", asyn
   await page.goto("/jobs/new")
 
   await expect(page.getByRole("heading", { level: 1, name: "Turn the brief into a scorecard" })).toBeVisible()
-  await page.getByLabel("Job title").fill("Senior Product Manager")
-  await page.getByLabel("Job description").fill("Lead a payments platform and product-led growth strategy.")
+  await page.getByLabel("Job title").fill(jobTitle)
+  await page.getByRole("textbox", { name: "Job description" }).fill("Lead a payments platform and product-led growth strategy.")
   await page.getByLabel("Location").fill("New York, NY")
   await page.getByLabel("Employment model").selectOption("hybrid")
   await page.getByLabel("Client").selectOption(clientId)
@@ -260,9 +319,8 @@ test("real authenticated route crosses Next BFF and deterministic FastAPI", asyn
   expect(createdJobId).toMatch(/^[0-9a-f-]{36}$/)
   await expect(page.getByRole("heading", { level: 1, name: "Senior Product Manager" })).toBeVisible()
   await page.getByRole("button", { name: "Confirm and source" }).click()
-  await expect(page).toHaveURL(/\/jobs$/)
+  await expect(page).toHaveURL(new RegExp(`/jobs/${createdJobId}$`))
 
-  await page.goto(`/jobs/${createdJobId}`)
   await expect(page.getByRole("heading", { level: 1, name: "Senior Product Manager" })).toBeVisible()
   await expect(page.getByRole("button", { name: /Priya Sharma.*92/ })).toBeVisible()
   await page.getByRole("button", { name: "Shortlist" }).click()
@@ -287,6 +345,45 @@ test("real authenticated route crosses Next BFF and deterministic FastAPI", asyn
   expect(observed.every((entry) => entry.authorization === "present" && entry.tenant === tenantId)).toBe(true)
 })
 
+test("real authenticated route uploads browser FormData through Next BFF", async ({
+  context,
+  page,
+  request,
+}) => {
+  await authenticateRealRoutes(context)
+  const beforeResponse = await request.get(
+    "http://127.0.0.1:8001/__e2e__/observed",
+  )
+  const observedBefore = (await beforeResponse.json() as Array<Record<string, string>>).length
+  await page.goto("/jobs/new")
+  await page.waitForLoadState("networkidle")
+
+  const extractionResponse = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === "/api/bff/job-descriptions/extract",
+  )
+  await page.getByLabel("Upload job description", { exact: true }).setInputFiles({
+    name: "real-route.pdf",
+    mimeType: "application/pdf",
+    buffer: Buffer.from("%PDF-1.4 deterministic browser fixture"),
+  })
+  expect((await extractionResponse).status()).toBe(200)
+
+  await expect(page.getByRole("textbox", { name: "Job description" })).toHaveValue(
+    extractedJobDescription,
+  )
+  const observedResponse = await request.get(
+    "http://127.0.0.1:8001/__e2e__/observed",
+  )
+  const observed = (await observedResponse.json() as Array<Record<string, string>>)
+    .slice(observedBefore)
+  expect(observed).toContainEqual({
+    method: "POST",
+    path: "/api/v1/job-descriptions/extract",
+    tenant: tenantId,
+    authorization: "present",
+  })
+})
+
 test("real invitation fragment is removed before the first server request", async ({
   context,
   page,
@@ -308,14 +405,124 @@ test("real invitation fragment is removed before the first server request", asyn
   expect(page.url()).not.toContain(invitationToken)
 })
 
+for (const file of [
+  { name: "role.pdf", mimeType: "application/pdf", buffer: Buffer.from("%PDF-1.4") },
+  {
+    name: "role.docx",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    buffer: Buffer.from("PK\x03\x04"),
+  },
+]) {
+  test(`uploaded ${file.name} populates editable text before generation`, async ({ page }) => {
+    const observed = observeBffRequests(page)
+    await page.goto("/dev-preview?view=task13")
+
+    await page.getByLabel("Upload job description", { exact: true }).setInputFiles(file)
+    const description = page.getByRole("textbox", { name: "Job description" })
+    await expect(description).toHaveValue(extractedJobDescription)
+    await description.fill(recruiterEditedJobDescription)
+    await page.getByLabel("Client").selectOption(clientId)
+    await page.getByLabel("Job title").fill(jobTitle)
+    await page.getByRole("button", { name: "Generate scorecard" }).click()
+
+    await expect(page.getByRole("heading", { level: 1, name: "Review scorecard" })).toBeVisible()
+    expect(interceptorChecks.get(page)?.createJobDescriptionMatched).toBe(true)
+    expect(observed).toEqual([
+      { method: "POST", path: "/api/bff/job-descriptions/extract" },
+      { method: "POST", path: "/api/bff/jobs" },
+      { method: "POST", path: `/api/bff/jobs/${jobId}/scorecard/generate` },
+    ])
+    expect(JSON.stringify(observed)).not.toContain(file.name)
+    expect(JSON.stringify(observed)).not.toContain(file.buffer.toString())
+  })
+}
+
+test("cancelling document replacement keeps reviewed text and skips extraction", async ({ page }) => {
+  const observed = observeBffRequests(page)
+  await page.goto("/dev-preview?view=task13")
+  const description = page.getByRole("textbox", { name: "Job description" })
+  await description.fill("Keep this reviewed job description.")
+
+  await page.getByLabel("Upload job description", { exact: true }).setInputFiles({
+    name: "replacement.pdf",
+    mimeType: "application/pdf",
+    buffer: Buffer.from("%PDF-1.4"),
+  })
+  await expect(page.getByRole("dialog", { name: "Replace job description?" })).toBeVisible()
+  await page.getByRole("button", { name: "Keep existing text" }).click()
+
+  await expect(description).toHaveValue("Keep this reviewed job description.")
+  await expect(page.getByRole("dialog", { name: "Replace job description?" })).toBeHidden()
+  expect(observed).toEqual([])
+})
+
+test("selected early and mid-level presets remain visible under a minimum-only override", async ({ page }) => {
+  await page.goto("/dev-preview?view=task13")
+  await page.getByLabel("Client").selectOption(clientId)
+  await page.getByLabel("Job title").fill(jobTitle)
+  await page.getByRole("textbox", { name: "Job description" }).fill(
+    "Lead a payments platform and product-led growth strategy.",
+  )
+  await page.getByRole("button", { name: "Generate scorecard" }).click()
+  await expect(page.getByRole("heading", { level: 1, name: "Review scorecard" })).toBeVisible()
+
+  const earlyCareer = page.getByRole("checkbox", { name: /Early-Career/ })
+  const midLevel = page.getByRole("checkbox", { name: /Mid-Level/ })
+  const senior = page.getByRole("checkbox", { name: /^Senior/ })
+  await senior.uncheck()
+  await earlyCareer.check()
+  await midLevel.check()
+  await page.getByRole("checkbox", { name: "Use custom experience range" }).check()
+  await page.getByLabel("Minimum years").fill("4")
+
+  await expect(earlyCareer).toBeChecked()
+  await expect(earlyCareer).toBeDisabled()
+  await expect(midLevel).toBeChecked()
+  await expect(midLevel).toBeDisabled()
+  await expect(page.getByLabel("Minimum years")).toHaveValue("4")
+  await expect(page.getByLabel("Maximum years")).toHaveValue("")
+  await expect(page.getByText("This custom range overrides the selected seniority levels.")).toBeVisible()
+})
+
+for (const failure of [
+  {
+    name: "encrypted.pdf",
+    code: "job_description_file_unreadable",
+    message: "The uploaded job description file is corrupted or might be password-protected.",
+  },
+  {
+    name: "scan.pdf",
+    code: "job_description_text_missing",
+    message: "No readable text was found. Upload a text-based document or paste the job description.",
+  },
+]) {
+  test(`${failure.code} stops before OCR or job creation`, async ({ page }) => {
+    const observed = observeBffRequests(page)
+    await page.goto("/dev-preview?view=task13")
+
+    await page.getByLabel("Upload job description", { exact: true }).setInputFiles({
+      name: failure.name,
+      mimeType: "application/pdf",
+      buffer: Buffer.from("%PDF-1.4"),
+    })
+
+    await expect(page.locator(".upload-error [role='alert']")).toHaveText(failure.message)
+    expect(observed).toEqual([
+      { method: "POST", path: "/api/bff/job-descriptions/extract" },
+    ])
+    expect(JSON.stringify(observed)).not.toContain(failure.name)
+    expect(JSON.stringify(observed)).not.toContain("%PDF-1.4")
+  })
+}
+
 test("production intake, scorecard, run, review, and shortlist components work together", async ({ page }, testInfo) => {
   await page.goto("/dev-preview?view=task13")
   await page.waitForLoadState("networkidle")
 
   await expect(page.getByRole("heading", { level: 1, name: "Create sourcing brief" })).toBeVisible()
   await page.getByLabel("Client").selectOption(clientId)
-  await page.getByLabel("Job title").fill("Senior Product Manager")
-  await page.getByLabel("Job description").fill("Lead a payments platform and product-led growth strategy.")
+  await page.getByLabel("Job title").fill(jobTitle)
+  await page.getByRole("textbox", { name: "Job description" }).fill("Lead a payments platform and product-led growth strategy.")
   await page.getByLabel("Location").fill("New York, NY")
   await page.getByLabel("Employment model").selectOption("hybrid")
   await page.getByRole("button", { name: "Generate scorecard" }).click()

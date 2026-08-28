@@ -5,7 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -182,7 +182,7 @@ def sourcing_scenario() -> Generator[dict[str, Any], None, None]:
             job_id=job_id,
             version=1,
             target_titles=["Product Manager"],
-            seniority=["manager"],
+            seniority=["mid_level"],
             minimum_years=None,
             maximum_years=None,
             locations=["New York, NY"],
@@ -575,7 +575,7 @@ def test_plan_and_match_tasks_replay_through_production_checkpoints(
             result.classification in {"main", "near_match"} for result in results
         )
         assert all(result.evidence is not None for result in results)
-        assert all(result.scoring_version == "matching-v1" for result in results)
+        assert all(result.scoring_version == "matching-v2" for result in results)
         assert (
             session.scalar(
                 select(func.count())
@@ -587,6 +587,192 @@ def test_plan_and_match_tasks_replay_through_production_checkpoints(
                 )
             )
             == 2
+        )
+
+
+def test_completed_plan_replay_returns_state_without_querying_after_rollback(
+    sourcing_scenario: dict[str, Any],
+) -> None:
+    scenario = sourcing_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        run.state = RunState.QUEUED
+        run.current_stage = RunState.QUEUED.value
+        run.planned_queries = []
+        session.commit()
+
+    assert (
+        execute_plan_run(
+            scenario["factory"],
+            scenario["run_id"],
+            context,
+            idempotency_key="plan:rollback-replay",
+        )
+        is RunState.SOURCING
+    )
+
+    engine = scenario["factory"].kw["bind"]
+    rolled_back = False
+
+    def mark_rollback(*_args: object) -> None:
+        nonlocal rolled_back
+        rolled_back = True
+
+    def reject_post_rollback_query(*_args: object) -> None:
+        if rolled_back:
+            raise AssertionError(
+                "plan replay queried after rolling back tenant context"
+            )
+
+    event.listen(engine, "rollback", mark_rollback)
+    event.listen(engine, "before_cursor_execute", reject_post_rollback_query)
+    try:
+        replayed_state = execute_plan_run(
+            scenario["factory"],
+            scenario["run_id"],
+            context,
+            idempotency_key="plan:rollback-replay",
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", reject_post_rollback_query)
+        event.remove(engine, "rollback", mark_rollback)
+
+    assert replayed_state is RunState.SOURCING
+
+
+def test_historical_seniority_plan_task_fails_once_and_replays_as_noop(
+    sourcing_scenario: dict[str, Any],
+) -> None:
+    scenario = sourcing_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        run.state = RunState.QUEUED
+        run.current_stage = RunState.QUEUED.value
+        run.planned_queries = []
+        scorecard = session.get(ScorecardVersion, run.scorecard_version_id)
+        assert scorecard is not None
+        scorecard.seniority = ["manager"]
+        session.commit()
+
+    execute_plan_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        idempotency_key="plan:historical-seniority",
+    )
+    execute_plan_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        idempotency_key="plan:historical-seniority",
+    )
+
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        assert run.state is RunState.FAILED
+        assert run.current_stage == RunState.FAILED.value
+        assert run.error_code == "scorecard_seniority_revision_required"
+        assert run.error_message == (
+            "The scorecard must be revised before sourcing can continue."
+        )
+        assert run.completed_at is not None
+        assert run.planned_queries == []
+        checkpoint = session.scalar(
+            select(RunCheckpoint).where(
+                RunCheckpoint.run_id == run.id,
+                RunCheckpoint.idempotency_key == "plan:historical-seniority",
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.status == "completed"
+        assert checkpoint.payload == {
+            "state": "failed",
+            "error_code": "scorecard_seniority_revision_required",
+        }
+
+
+def test_historical_seniority_match_task_fails_once_and_replays_as_noop(
+    sourcing_scenario: dict[str, Any],
+) -> None:
+    scenario = sourcing_scenario
+    context = RequestContext(
+        tenant_id=scenario["tenant_id"],
+        user_id=scenario["user_id"],
+        role=Role.OWNER,
+    )
+    execute_source_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        gateway_factory=HundredPersonGateway,
+        idempotency_key="source:historical-seniority",
+    )
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        scorecard = session.get(ScorecardVersion, run.scorecard_version_id)
+        assert scorecard is not None
+        scorecard.seniority = ["manager"]
+        session.commit()
+
+    execute_match_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        idempotency_key="match:historical-seniority",
+    )
+    execute_match_run(
+        scenario["factory"],
+        scenario["run_id"],
+        context,
+        idempotency_key="match:historical-seniority",
+    )
+
+    with scenario["factory"]() as session:
+        run = session.get(SourcingRun, scenario["run_id"])
+        assert run is not None
+        assert run.state is RunState.FAILED
+        assert run.current_stage == RunState.FAILED.value
+        assert run.error_code == "scorecard_seniority_revision_required"
+        assert run.error_message == (
+            "The scorecard must be revised before matching can continue."
+        )
+        assert run.completed_at is not None
+        checkpoint = session.scalar(
+            select(RunCheckpoint).where(
+                RunCheckpoint.run_id == run.id,
+                RunCheckpoint.idempotency_key == "match:historical-seniority",
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.status == "completed"
+        assert checkpoint.payload == {
+            "state": "failed",
+            "error_code": "scorecard_seniority_revision_required",
+        }
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(RunCandidate)
+                .where(
+                    RunCandidate.run_id == run.id,
+                    RunCandidate.match_score.is_not(None),
+                )
+            )
+            == 0
         )
 
 

@@ -19,6 +19,7 @@ import type {
   ScorecardCriterion,
   ScorecardDraft,
   ScorecardDraftResponse,
+  SeniorityLevel,
   SourcingRun,
 } from "@/lib/schemas"
 
@@ -27,6 +28,10 @@ type ScorecardEditorProps = {
   allowedIndustryCodes: readonly string[]
   alreadyConfirmed?: boolean
   onStarted?: (run: SourcingRun) => void
+}
+
+type ScorecardEditorDraft = Omit<ScorecardDraft, "seniority"> & {
+  seniority: string[]
 }
 
 type ScorecardIntent = {
@@ -43,6 +48,8 @@ type SuggestedItem = {
   label: string
   kind: "criterion" | "adjacent" | "uncertainty"
 }
+
+const existingRunCodes = new Set(["active_run_exists", "scorecard_run_exists"])
 
 function newCriterion(kind: ScorecardCriterion["kind"], position: number): ScorecardCriterion {
   return {
@@ -64,6 +71,10 @@ function listValues(value: string, separator: string): string[] {
     .filter(Boolean)
 }
 
+function isValidExperienceBound(value: number | null): boolean {
+  return value === null || (Number.isInteger(value) && value >= 0 && value <= 50)
+}
+
 export function ScorecardEditor({
   draft: response,
   allowedIndustryCodes,
@@ -71,7 +82,7 @@ export function ScorecardEditor({
   onStarted,
 }: ScorecardEditorProps) {
   const router = useRouter()
-  const [draft, setDraft] = useState<ScorecardDraft>(() => ({
+  const [draft, setDraft] = useState<ScorecardEditorDraft>(() => ({
     target_titles: [...(response.draft.target_titles ?? [])],
     criteria: (response.draft.criteria ?? []).map((criterion) => ({ ...criterion })),
     seniority: [...(response.draft.seniority ?? [])],
@@ -86,8 +97,8 @@ export function ScorecardEditor({
   const [targetTitlesInput, setTargetTitlesInput] = useState(
     () => (response.draft.target_titles ?? []).join(", "),
   )
-  const [seniorityInput, setSeniorityInput] = useState(
-    () => (response.draft.seniority ?? []).join(", "),
+  const [customEnabled, setCustomEnabled] = useState(
+    () => response.draft.minimum_years != null || response.draft.maximum_years != null,
   )
   const [locationsInput, setLocationsInput] = useState(
     () => (response.draft.locations ?? []).join("\n"),
@@ -137,12 +148,22 @@ export function ScorecardEditor({
     .filter((id) => confirmedSuggestions.has(id))
     .sort()
   const allSuggestionsResolved = suggestions.every((item) => confirmedSuggestions.has(item.id))
+  const canonicalSeniority = new Set(
+    response.seniority_options.map((option) => option.value),
+  )
+  const unrecognizedSeniority = draft.seniority.filter(
+    (value) => !canonicalSeniority.has(value as SeniorityLevel),
+  )
   const minimumYears = draft.minimum_years ?? null
   const maximumYears = draft.maximum_years ?? null
-  const yearsValid =
+  const customBoundsPresent = minimumYears !== null || maximumYears !== null
+  const minimumYearsValid = isValidExperienceBound(minimumYears)
+  const maximumYearsValid = isValidExperienceBound(maximumYears)
+  const yearsOrdered =
     minimumYears === null ||
     maximumYears === null ||
     minimumYears <= maximumYears
+  const yearsValid = minimumYearsValid && maximumYearsValid && yearsOrdered
   const structurallyValid =
     draft.target_titles.some((title) => title.trim()) &&
     draft.criteria.length > 0 &&
@@ -152,6 +173,8 @@ export function ScorecardEditor({
       (criterion.recruiter_entered && criterion.lawful_requirement_confirmed),
     ) &&
     Boolean(draft.industry_code) &&
+    unrecognizedSeniority.length === 0 &&
+    (!customEnabled || customBoundsPresent) &&
     yearsValid
 
   function updateCriterion(index: number, patch: Partial<ScorecardCriterion>) {
@@ -208,6 +231,10 @@ export function ScorecardEditor({
     intent.current = null
   }
 
+  function openJobWorkspace() {
+    router.push(`/jobs/${response.job_id}`)
+  }
+
   async function confirmAndSource() {
     if (inFlight.current || !allSuggestionsResolved || !structurallyValid) return
     inFlight.current = true
@@ -215,8 +242,11 @@ export function ScorecardEditor({
     setError(null)
     setIndustryError(null)
     setAdjacencyError(null)
-    const mutationDraft: ScorecardDraft = {
+    const mutationDraft: ScorecardEditorDraft = {
       ...draft,
+      seniority: response.seniority_options
+        .map((option) => option.value)
+        .filter((value) => draft.seniority.includes(value)),
       confirmed_inferred_items: confirmedInferenceIds,
     }
     const fingerprint = JSON.stringify(mutationDraft)
@@ -273,7 +303,7 @@ export function ScorecardEditor({
         }),
       )
       if (onStarted) onStarted(run)
-      else router.push("/jobs")
+      else openJobWorkspace()
     } catch (caught) {
       if (reauthenticateExpiredSession(caught, router)) return
       const code = caught instanceof Error ? caught.message : "request_failed"
@@ -281,6 +311,8 @@ export function ScorecardEditor({
         setIndustryError("Choose an industry assigned to this client.")
       } else if (code === "scorecard_adjacency_not_approved") {
         setAdjacencyError("Delete adjacent industries that are not approved for this client.")
+      } else if (existingRunCodes.has(code)) {
+        openJobWorkspace()
       } else {
         setError(
           code === "scorecard_revision_conflict"
@@ -314,12 +346,16 @@ export function ScorecardEditor({
         }),
       )
       if (onStarted) onStarted(run)
-      else router.push("/jobs")
+      else openJobWorkspace()
     } catch (caught) {
       if (reauthenticateExpiredSession(caught, router)) return
       const code = caught instanceof Error ? caught.message : "request_failed"
-      if (code === "active_run_exists" || code === "scorecard_run_exists") {
-        router.push("/jobs")
+      if (existingRunCodes.has(code)) {
+        openJobWorkspace()
+      } else if (code === "scorecard_seniority_revision_required") {
+        setError(
+          "Revise this scorecard's seniority to Early-Career, Mid-Level, or Senior before sourcing again.",
+        )
       } else {
         setError("Sourcing was not started. Retry uses the same safe request.")
       }
@@ -414,23 +450,82 @@ export function ScorecardEditor({
             </p>
           ) : null}
         </div>
-        <div className="field-row">
-          <div className="field">
-            <label htmlFor="seniority">Seniority</label>
-            <input
-              id="seniority"
-              value={seniorityInput}
-              onChange={(event) => {
-                setSeniorityInput(event.target.value)
-                setDraft((current) => ({
-                  ...current,
-                  seniority: listValues(event.target.value, ","),
-                }))
-                intent.current = null
-              }}
-              placeholder="Senior, lead"
-            />
-          </div>
+        <div className="field-row role-constraints">
+          <fieldset className="field seniority-controls">
+            <legend>Seniority requirements</legend>
+            <div className="seniority-options">
+              {response.seniority_options.map((option) => {
+                const checked = draft.seniority.includes(option.value)
+                const range = option.maximum_years === null
+                  ? `${option.minimum_years}+ years`
+                  : `${option.minimum_years}–${option.maximum_years} years`
+                return (
+                  <label className="check-row" key={option.value}>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={submitting || customEnabled}
+                      onChange={() => {
+                        setDraft((current) => ({
+                          ...current,
+                          seniority: checked
+                            ? current.seniority.filter((value) => value !== option.value)
+                            : [...current.seniority, option.value],
+                        }))
+                        intent.current = null
+                      }}
+                    />
+                    {option.label} — {range}
+                  </label>
+                )
+              })}
+            </div>
+            {unrecognizedSeniority.map((value) => (
+              <div className="field-error legacy-seniority" key={value} role="alert">
+                <span>Unrecognized historical seniority: {value}</span>
+                <button
+                  className="button button-danger-quiet"
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => {
+                    setDraft((current) => ({
+                      ...current,
+                      seniority: current.seniority.filter((item) => item !== value),
+                    }))
+                    intent.current = null
+                  }}
+                >
+                  Remove {value}
+                </button>
+              </div>
+            ))}
+            <label className="check-row custom-range-toggle">
+              <input
+                type="checkbox"
+                checked={customEnabled}
+                disabled={submitting}
+                onChange={(event) => {
+                  if (event.target.checked) {
+                    setCustomEnabled(true)
+                  } else {
+                    setCustomEnabled(false)
+                    setDraft((current) => ({
+                      ...current,
+                      minimum_years: null,
+                      maximum_years: null,
+                    }))
+                  }
+                  intent.current = null
+                }}
+              />
+              Use custom experience range
+            </label>
+            {customEnabled ? (
+              <p className="field-hint" role="status">
+                This custom range overrides the selected seniority levels.
+              </p>
+            ) : null}
+          </fieldset>
           <div className="field">
             <label htmlFor="locations">Locations</label>
             <textarea
@@ -449,52 +544,85 @@ export function ScorecardEditor({
             />
           </div>
         </div>
-        <div className="field-row">
-          <div className="field">
-            <label htmlFor="minimum-years">Minimum years</label>
-            <input
-              id="minimum-years"
-              type="number"
-              min={0}
-              max={50}
-              value={draft.minimum_years ?? ""}
-              onChange={(event) => {
-                setDraft((current) => ({
-                  ...current,
-                  minimum_years: event.target.value === ""
-                    ? null
-                    : Number(event.target.value),
-                }))
-                intent.current = null
-              }}
-            />
-          </div>
-          <div className="field">
-            <label htmlFor="maximum-years">Maximum years</label>
-            <input
-              id="maximum-years"
-              type="number"
-              min={0}
-              max={50}
-              value={draft.maximum_years ?? ""}
-              aria-invalid={!yearsValid || undefined}
-              aria-describedby={!yearsValid ? "years-error" : undefined}
-              onChange={(event) => {
-                setDraft((current) => ({
-                  ...current,
-                  maximum_years: event.target.value === ""
-                    ? null
-                    : Number(event.target.value),
-                }))
-                intent.current = null
-              }}
-            />
-          </div>
-        </div>
-        {!yearsValid ? (
-          <p id="years-error" className="field-error" role="alert">
-            Maximum years cannot be less than minimum years.
-          </p>
+        {customEnabled ? (
+          <>
+            <div className="field-row">
+              <div className="field">
+                <label htmlFor="minimum-years">Minimum years</label>
+                <input
+                  id="minimum-years"
+                  type="number"
+                  min={0}
+                  max={50}
+                  value={draft.minimum_years ?? ""}
+                  aria-invalid={!minimumYearsValid || !yearsOrdered || undefined}
+                  aria-describedby={
+                    !minimumYearsValid
+                      ? "minimum-years-error"
+                      : !yearsOrdered
+                        ? "years-error"
+                        : undefined
+                  }
+                  onChange={(event) => {
+                    setDraft((current) => ({
+                      ...current,
+                      minimum_years: event.target.value === ""
+                        ? null
+                        : Number(event.target.value),
+                    }))
+                    intent.current = null
+                  }}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="maximum-years">Maximum years</label>
+                <input
+                  id="maximum-years"
+                  type="number"
+                  min={0}
+                  max={50}
+                  value={draft.maximum_years ?? ""}
+                  aria-invalid={!maximumYearsValid || !yearsOrdered || undefined}
+                  aria-describedby={
+                    !maximumYearsValid
+                      ? "maximum-years-error"
+                      : !yearsOrdered
+                        ? "years-error"
+                        : undefined
+                  }
+                  onChange={(event) => {
+                    setDraft((current) => ({
+                      ...current,
+                      maximum_years: event.target.value === ""
+                        ? null
+                        : Number(event.target.value),
+                    }))
+                    intent.current = null
+                  }}
+                />
+              </div>
+            </div>
+            {!customBoundsPresent ? (
+              <p className="field-error" role="alert">
+                Enter a minimum or maximum year.
+              </p>
+            ) : null}
+            {!minimumYearsValid ? (
+              <p id="minimum-years-error" className="field-error" role="alert">
+                Minimum years must be a whole number from 0 to 50.
+              </p>
+            ) : null}
+            {!maximumYearsValid ? (
+              <p id="maximum-years-error" className="field-error" role="alert">
+                Maximum years must be a whole number from 0 to 50.
+              </p>
+            ) : null}
+            {!yearsOrdered ? (
+              <p id="years-error" className="field-error" role="alert">
+                Maximum years cannot be less than minimum years.
+              </p>
+            ) : null}
+          </>
         ) : null}
       </section>
 

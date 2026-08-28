@@ -16,18 +16,29 @@ from app.jobs.models import Job, ScorecardCriterionRecord, ScorecardVersion
 from app.jobs.schemas import (
     ClientContext,
     ConfirmedScorecard,
+    CriterionKind,
     EditableScorecardDraft,
     ExtractionStatus,
     ScorecardCriterion,
     ScorecardDraft,
     ScorecardDraftResponse,
+    SeniorityOption,
 )
+from app.jobs.seniority import SENIORITY_PRESETS, UnknownSeniorityError
 
 
 class JobError(AppError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def _is_unknown_legacy_seniority_error(error: ValidationError) -> bool:
+    errors = error.errors(include_url=False, include_input=False)
+    if len(errors) != 1 or errors[0]["loc"] != ("seniority",):
+        return False
+    cause = errors[0].get("ctx", {}).get("error")
+    return isinstance(cause, UnknownSeniorityError)
 
 
 class JobService:
@@ -258,7 +269,12 @@ class JobService:
         self._check_revision(job, expected_revision)
         if job.draft_payload is None:
             raise JobError("scorecard_draft_required")
-        draft = ScorecardDraft.model_validate(job.draft_payload)
+        try:
+            draft = ScorecardDraft.model_validate(job.draft_payload)
+        except ValidationError as error:
+            if not _is_unknown_legacy_seniority_error(error):
+                raise
+            raise JobError("scorecard_seniority_revision_required") from error
         scorecard = self._append_scorecard(context, job, draft)
         job.draft_revision += 1
         self.session.flush()
@@ -481,13 +497,13 @@ class JobService:
             .where(ScorecardCriterionRecord.scorecard_version_id == record.id)
             .order_by(ScorecardCriterionRecord.position)
         )
-        draft = ScorecardDraft(
+        confirmed = ConfirmedScorecard(
             target_titles=record.target_titles,
             criteria=[
                 ScorecardCriterion(
                     key=criterion.key,
                     label=criterion.label,
-                    kind=criterion.kind,
+                    kind=CriterionKind(criterion.kind),
                     evidence_required=criterion.evidence_required,
                     source_text=criterion.source_text,
                     inferred=criterion.inferred,
@@ -505,32 +521,43 @@ class JobService:
             industry_code=record.industry_code,
             suggested_adjacent_industries=record.suggested_adjacent_industries,
             uncertainties=record.uncertainties,
-        )
-        confirmed_draft = draft.model_copy(
-            update={"confirmed_inferred_items": sorted(draft.inferred_item_ids())}
-        )
-        return ConfirmedScorecard(
-            **confirmed_draft.model_dump(),
             id=record.id,
             job_id=record.job_id,
             version=record.version,
             confirmed_at=record.confirmed_at,
             extraction_status=ExtractionStatus(record.extraction_status),
         )
+        return confirmed.model_copy(
+            update={"confirmed_inferred_items": sorted(confirmed.inferred_item_ids())}
+        )
 
     @staticmethod
     def _draft_response(job: Job) -> ScorecardDraftResponse:
+        if job.draft_payload is None:
+            draft: ScorecardDraft | EditableScorecardDraft = EditableScorecardDraft()
+        else:
+            try:
+                draft = ScorecardDraft.model_validate(job.draft_payload)
+            except ValidationError as error:
+                if not _is_unknown_legacy_seniority_error(error):
+                    raise
+                draft = EditableScorecardDraft.model_validate(job.draft_payload)
         return ScorecardDraftResponse(
             job_id=job.id,
             draft_revision=job.draft_revision,
-            draft=(
-                ScorecardDraft.model_validate(job.draft_payload)
-                if job.draft_payload is not None
-                else EditableScorecardDraft()
-            ),
+            draft=draft,
             original_job_description=job.job_description,
             extraction_status=ExtractionStatus(job.draft_extraction_status),
             extraction_warning=job.draft_extraction_warning,
+            seniority_options=tuple(
+                SeniorityOption(
+                    value=preset.value,
+                    label=preset.label,
+                    minimum_years=preset.minimum_years,
+                    maximum_years=preset.maximum_years,
+                )
+                for preset in SENIORITY_PRESETS
+            ),
         )
 
     def _authorize_client(self, context: RequestContext, client_id: UUID):

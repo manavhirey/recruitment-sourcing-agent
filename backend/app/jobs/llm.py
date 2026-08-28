@@ -4,7 +4,11 @@ from typing import Any, Protocol, cast
 from pydantic import ValidationError
 
 from app.core.errors import AppError
-from app.jobs.schemas import ClientContext, ScorecardDraft
+from app.jobs.schemas import (
+    MAX_UNCERTAINTIES,
+    ClientContext,
+    ScorecardDraft,
+)
 
 
 class ScorecardExtractionError(AppError):
@@ -37,6 +41,11 @@ def extraction_instructions() -> str:
     return (
         "Extract only job-relevant criteria. Mark every inference. "
         "Never infer protected characteristics or work authorization. "
+        "Use only early_career, mid_level, or senior for seniority. "
+        "Put explicit numeric experience requirements in minimum_years and maximum_years; "
+        "numeric bounds override seniority presets. If a numeric bound is inferred rather "
+        "than stated, add the exact uncertainty 'Confirm inferred minimum years: N' or "
+        "'Confirm inferred maximum years: N' so recruiter confirmation is required. "
         "Return data that validates against the supplied scorecard schema."
     )
 
@@ -70,9 +79,29 @@ class OpenAIResponsesScorecardGateway:
                     input=request_input,
                     text_format=ScorecardDraft,
                 )
-                return ScorecardDraft.model_validate(response.output_parsed)
+                draft = ScorecardDraft.model_validate(response.output_parsed)
+                return _require_numeric_bound_confirmation(draft)
             except ValidationError as error:
                 validation_errors = error.json(include_url=False)
                 if attempt == 1:
                     raise ScorecardExtractionError(validation_errors) from error
         raise AssertionError("scorecard extraction retry loop did not terminate")
+
+
+def _require_numeric_bound_confirmation(draft: ScorecardDraft) -> ScorecardDraft:
+    values = draft.model_dump()
+    values["confirmed_inferred_items"] = []
+    forced = [
+        f"Confirm inferred {label} years: {bound}"
+        for label, bound in (
+            ("minimum", draft.minimum_years),
+            ("maximum", draft.maximum_years),
+        )
+        if bound is not None
+    ]
+    uncertainties = list(draft.uncertainties)[: MAX_UNCERTAINTIES - len(forced)]
+    for uncertainty in forced:
+        if uncertainty not in uncertainties:
+            uncertainties.append(uncertainty)
+    values["uncertainties"] = uncertainties
+    return ScorecardDraft.model_validate(values)

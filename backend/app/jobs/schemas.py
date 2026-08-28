@@ -7,12 +7,16 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.jobs.legal_policy import DEFAULT_SCORECARD_LEGAL_POLICY
+from app.jobs.seniority import SeniorityLevel, normalize_draft_seniority
 
 
 class CriterionKind(StrEnum):
     MUST_HAVE = "must_have"
     PREFERENCE = "preference"
     EXCLUSION = "exclusion"
+
+
+MAX_UNCERTAINTIES = 20
 
 
 def _criterion_text(criterion: "ScorecardCriterion") -> str:
@@ -74,7 +78,7 @@ class ScorecardCriterion(BaseModel):
         return self
 
 
-class ScorecardDraft(BaseModel):
+class ScorecardContent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     target_titles: list[str] = Field(min_length=1, max_length=12)
@@ -85,7 +89,7 @@ class ScorecardDraft(BaseModel):
     locations: list[str] = Field(max_length=20)
     industry_code: str = Field(min_length=1, max_length=128)
     suggested_adjacent_industries: list[str] = Field(max_length=12)
-    uncertainties: list[str] = Field(max_length=20)
+    uncertainties: list[str] = Field(max_length=MAX_UNCERTAINTIES)
     confirmed_inferred_items: list[str] = Field(default_factory=list, max_length=72)
 
     def inferred_item_ids(self) -> set[str]:
@@ -115,11 +119,8 @@ class ScorecardDraft(BaseModel):
         }
         return criterion_ids | adjacent_ids | uncertainty_ids
 
-    def unresolved_inferred_items(self) -> set[str]:
-        return self.inferred_item_ids() - set(self.confirmed_inferred_items)
-
     @model_validator(mode="after")
-    def validate_scorecard(self) -> "ScorecardDraft":
+    def validate_scorecard_invariants(self) -> "ScorecardContent":
         if (
             self.minimum_years is not None
             and self.maximum_years is not None
@@ -137,9 +138,37 @@ class ScorecardDraft(BaseModel):
         return self
 
 
+class ScorecardDraft(ScorecardContent):
+    seniority: list[SeniorityLevel] = Field(max_length=3)  # type: ignore[assignment]
+
+    @field_validator("seniority", mode="before")
+    @classmethod
+    def canonicalize_seniority(cls, value: object) -> object:
+        if not isinstance(value, list):
+            return value
+        return list(normalize_draft_seniority(str(item) for item in value))
+
+    def unresolved_inferred_items(self) -> set[str]:
+        return self.inferred_item_ids() - set(self.confirmed_inferred_items)
+
+
 class ExtractionStatus(StrEnum):
     READY = "ready"
     MANUAL_REQUIRED = "manual_required"
+
+
+class JobDescriptionSource(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    filename: str
+    media_type: str
+
+
+class JobDescriptionExtractionResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    text: str = Field(min_length=1, max_length=50_000)
+    source: JobDescriptionSource
 
 
 class ClientContext(BaseModel):
@@ -150,7 +179,7 @@ class ClientContext(BaseModel):
     approved_adjacent_industries: tuple[str, ...]
 
 
-class ConfirmedScorecard(ScorecardDraft):
+class ConfirmedScorecard(ScorecardContent):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: UUID
@@ -230,7 +259,7 @@ class ScorecardRevisionRequest(BaseModel):
     draft: ScorecardDraft
 
 
-class EditableScorecardDraft(BaseModel):
+class EditableScorecardDraft(ScorecardContent):
     target_titles: list[str] = Field(default_factory=list, max_length=12)
     criteria: list[ScorecardCriterion] = Field(default_factory=list, max_length=40)
     seniority: list[str] = Field(default_factory=list, max_length=8)
@@ -241,8 +270,17 @@ class EditableScorecardDraft(BaseModel):
     suggested_adjacent_industries: list[str] = Field(
         default_factory=list, max_length=12
     )
-    uncertainties: list[str] = Field(default_factory=list, max_length=20)
+    uncertainties: list[str] = Field(default_factory=list, max_length=MAX_UNCERTAINTIES)
     confirmed_inferred_items: list[str] = Field(default_factory=list, max_length=72)
+
+
+class SeniorityOption(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    value: SeniorityLevel
+    label: str
+    minimum_years: int
+    maximum_years: int | None
 
 
 class ScorecardDraftResponse(BaseModel):
@@ -254,3 +292,4 @@ class ScorecardDraftResponse(BaseModel):
     original_job_description: str
     extraction_status: ExtractionStatus
     extraction_warning: str | None
+    seniority_options: tuple[SeniorityOption, ...]

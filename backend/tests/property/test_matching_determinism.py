@@ -44,7 +44,7 @@ def _scorecard(criteria: list[ScorecardCriterion]) -> ConfirmedScorecard:
         extraction_status=ExtractionStatus.READY,
         target_titles=["Product Manager", "Senior Product Manager"],
         criteria=criteria,
-        seniority=["senior", "director"],
+        seniority=["senior"],
         minimum_years=5,
         maximum_years=12,
         locations=["New York, NY", "Remote"],
@@ -206,7 +206,7 @@ def test_normalized_duplicate_spellings_and_tied_dates_are_deterministic(
         unique=True,
         max_size=3,
     ),
-    seniority=st.one_of(st.none(), st.sampled_from(["senior", "entry"])),
+    seniority=st.one_of(st.none(), st.text(max_size=64)),
     years=st.one_of(st.none(), st.floats(min_value=0, max_value=50)),
     eligibility=st.one_of(
         st.none(),
@@ -250,3 +250,41 @@ def test_scores_remain_bounded_and_equal_the_fixed_component_sum(
     assert 0 <= result.breakdown.industry <= 20
     assert 0 <= result.breakdown.location_and_eligibility <= 10
     assert 0 <= result.breakdown.recency_and_trajectory <= 10
+    assert result.scoring_version == "matching-v2"
+
+
+@given(
+    first_provider_seniority=st.one_of(st.none(), st.text(max_size=64)),
+    second_provider_seniority=st.one_of(st.none(), st.text(max_size=64)),
+    years=st.one_of(st.none(), st.floats(min_value=0, max_value=50)),
+)
+def test_provider_seniority_labels_do_not_change_numeric_experience_matching(
+    first_provider_seniority: str | None,
+    second_provider_seniority: str | None,
+    years: float | None,
+) -> None:
+    engine = MatchingEngine()
+    scorecard = _scorecard([_criterion("payments", CriterionKind.MUST_HAVE)])
+
+    first = engine.evaluate(
+        scorecard,
+        _candidate(
+            skills=("payments",),
+            industry_codes=("financial_services.banking",),
+            experiences=EXPERIENCES,
+            seniority=first_provider_seniority,
+            years=years,
+        ),
+    )
+    second = engine.evaluate(
+        scorecard,
+        _candidate(
+            skills=("payments",),
+            industry_codes=("financial_services.banking",),
+            experiences=EXPERIENCES,
+            seniority=second_provider_seniority,
+            years=years,
+        ),
+    )
+
+    assert first == second

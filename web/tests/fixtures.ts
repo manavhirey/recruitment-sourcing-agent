@@ -1,9 +1,18 @@
+import type { ScorecardDraftResponse, SeniorityOption } from "@/lib/schemas"
+
+export const seniorityOptionsFixture = [
+  { value: "early_career", label: "Early-Career", minimum_years: 0, maximum_years: 3 },
+  { value: "mid_level", label: "Mid-Level", minimum_years: 3, maximum_years: 9 },
+  { value: "senior", label: "Senior", minimum_years: 10, maximum_years: null },
+] as const satisfies readonly SeniorityOption[]
+
 export const scorecardDraftFixture = {
   job_id: "00000000-0000-4000-8000-000000000101",
   draft_revision: 2,
   original_job_description: "Hire a senior product manager for our payments platform.",
   extraction_status: "ready" as const,
   extraction_warning: null,
+  seniority_options: seniorityOptionsFixture,
   draft: {
     target_titles: ["Senior Product Manager"],
     criteria: [
@@ -37,7 +46,7 @@ export const scorecardDraftFixture = {
     uncertainties: ["Confirm ownership of go-to-market strategy"],
     confirmed_inferred_items: [],
   },
-}
+} satisfies ScorecardDraftResponse
 
 export const manualRequiredDraftFixture = {
   ...scorecardDraftFixture,
@@ -56,7 +65,7 @@ export const manualRequiredDraftFixture = {
     uncertainties: [],
     confirmed_inferred_items: [],
   },
-}
+} satisfies ScorecardDraftResponse
 
 export const authorizedClientsFixture = [
   {

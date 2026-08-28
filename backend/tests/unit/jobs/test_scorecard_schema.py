@@ -1,7 +1,67 @@
+from datetime import UTC, datetime
+from uuid import uuid4
+
 import pytest
 from pydantic import ValidationError
 
-from app.jobs.schemas import CriterionKind, ScorecardCriterion, ScorecardDraft
+from app.jobs.schemas import (
+    ConfirmedScorecard,
+    CriterionKind,
+    ScorecardCriterion,
+    ScorecardDraft,
+)
+from app.jobs.seniority import SeniorityLevel
+
+
+def _valid_draft(**overrides: object) -> ScorecardDraft:
+    values: dict[str, object] = {
+        "target_titles": ["Product Designer"],
+        "criteria": [
+            ScorecardCriterion(
+                key="product_design",
+                label="Product design experience",
+                kind=CriterionKind.MUST_HAVE,
+            )
+        ],
+        "seniority": [],
+        "minimum_years": None,
+        "maximum_years": None,
+        "locations": [],
+        "industry_code": "technology.software",
+        "suggested_adjacent_industries": [],
+        "uncertainties": [],
+    }
+    values.update(overrides)
+    return ScorecardDraft.model_validate(values)
+
+
+def test_scorecard_draft_normalizes_known_seniority_aliases() -> None:
+    draft = _valid_draft(seniority=["mid-level", "SENIOR", "senior"])
+
+    assert draft.seniority == [SeniorityLevel.MID_LEVEL, SeniorityLevel.SENIOR]
+
+
+def test_scorecard_draft_rejects_legacy_unknown_seniority() -> None:
+    with pytest.raises(ValidationError, match="unknown seniority value"):
+        _valid_draft(seniority=["manager"])
+
+
+def test_confirmed_historical_scorecard_remains_readable_but_not_reusable() -> None:
+    scorecard = ConfirmedScorecard.model_validate(
+        {
+            **_valid_draft().model_dump(mode="json"),
+            "id": uuid4(),
+            "job_id": uuid4(),
+            "version": 1,
+            "confirmed_at": datetime(2026, 8, 23, tzinfo=UTC),
+            "extraction_status": "ready",
+            "seniority": ["manager"],
+        }
+    )
+
+    assert scorecard.seniority == ["manager"]
+    with pytest.raises(ValidationError, match="unknown seniority value"):
+        scorecard.to_draft()
 
 
 def test_protected_class_exclusion_is_rejected() -> None:

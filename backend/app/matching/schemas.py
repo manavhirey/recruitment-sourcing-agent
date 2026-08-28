@@ -48,7 +48,7 @@ class MatchResult(BaseModel):
     criteria: tuple[CriterionEvaluation, ...]
     failed_must_haves: tuple[str, ...]
     unknown_keys: tuple[str, ...]
-    scoring_version: str = "matching-v1"
+    scoring_version: str = "matching-v2"
 
     @model_validator(mode="after")
     def total_is_component_sum(self) -> Self:

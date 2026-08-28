@@ -45,6 +45,7 @@ from app.core.database import Base, get_db
 from app.crm.service import materialize_run_matches
 from app.identity.models import Membership, Tenant, User
 from app.identity.schemas import IdentityClaims, RequestContext, Role
+from app.jobs.document_extraction import ExtractedJobDescription
 from app.jobs.schemas import (
     ClientContext,
     CriterionKind,
@@ -105,6 +106,23 @@ class DeterministicScorecardGateway:
             industry_code="technology.fintech",
             suggested_adjacent_industries=[],
             uncertainties=[],
+        )
+
+
+class DeterministicDocumentExtractionRunner:
+    async def run(
+        self,
+        *,
+        data: bytes,
+        filename: str,
+        media_type: str | None,
+        timeout_seconds: float,
+    ) -> ExtractedJobDescription:
+        del data, timeout_seconds
+        return ExtractedJobDescription(
+            text=("Senior Product Designer\nLead product design for the growth team."),
+            filename=filename,
+            media_type=media_type or "application/pdf",
         )
 
 
@@ -191,6 +209,7 @@ def dispatch_sourcing_run(
 settings = Settings.for_test()
 app = create_app(
     settings,
+    job_description_extraction_runner=DeterministicDocumentExtractionRunner(),
     scorecard_gateway=DeterministicScorecardGateway(),
     sourcing_dispatcher=dispatch_sourcing_run,
 )

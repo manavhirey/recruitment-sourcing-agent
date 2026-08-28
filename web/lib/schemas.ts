@@ -11,6 +11,10 @@ export type JobSummary = components["schemas"]["JobSummary"]
 export type JobPage = components["schemas"]["JobPage"]
 export type ScorecardDraftResponse =
   components["schemas"]["ScorecardDraftResponse"]
+export type JobDescriptionExtraction =
+  components["schemas"]["JobDescriptionExtractionResponse"]
+export type SeniorityLevel = components["schemas"]["SeniorityLevel"]
+export type SeniorityOption = components["schemas"]["SeniorityOption"]
 export type ScorecardDraft = components["schemas"]["ScorecardDraft"]
 export type ScorecardCriterion = components["schemas"]["ScorecardCriterion"]
 export type ConfirmedScorecard = components["schemas"]["ConfirmedScorecard"]

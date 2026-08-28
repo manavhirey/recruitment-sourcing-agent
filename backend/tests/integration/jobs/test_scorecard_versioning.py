@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -111,7 +112,7 @@ def draft_job(
                     source_text="payments experience",
                 )
             ],
-            seniority=["manager"],
+            seniority=["mid_level"],
             minimum_years=5,
             maximum_years=12,
             locations=["India"],
@@ -135,6 +136,106 @@ def test_confirmed_scorecard_is_immutable(
     assert first.version == 1
     assert second.version == 2
     assert first.id != second.id
+
+
+def test_legacy_seniority_draft_reloads_as_editable_with_canonical_options(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["seniority"] = ["manager"]
+
+    reloaded = job_service.get_draft(owner_context, draft_job.id)
+
+    assert reloaded.draft.seniority == ["manager"]
+    assert [option.value for option in reloaded.seniority_options] == [
+        "early_career",
+        "mid_level",
+        "senior",
+    ]
+
+
+def test_legacy_seniority_fallback_rejects_an_inverted_experience_range(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["seniority"] = ["manager"]
+    draft_job.draft_payload["minimum_years"] = 12
+    draft_job.draft_payload["maximum_years"] = 5
+
+    with pytest.raises(
+        ValidationError,
+        match="minimum_years cannot exceed maximum_years",
+    ):
+        job_service.get_draft(owner_context, draft_job.id)
+
+
+def test_legacy_seniority_fallback_rejects_duplicate_criterion_keys(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["seniority"] = ["manager"]
+    criteria = draft_job.draft_payload["criteria"]
+    assert isinstance(criteria, list)
+    criteria.append(dict(criteria[0]))
+
+    with pytest.raises(
+        ValidationError,
+        match="scorecard criterion keys must be unique",
+    ):
+        job_service.get_draft(owner_context, draft_job.id)
+
+
+def test_legacy_seniority_fallback_rejects_duplicate_inferred_confirmations(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["seniority"] = ["manager"]
+    draft_job.draft_payload["confirmed_inferred_items"] = [
+        "criterion:duplicate",
+        "criterion:duplicate",
+    ]
+
+    with pytest.raises(
+        ValidationError,
+        match="inferred item confirmations must be unique",
+    ):
+        job_service.get_draft(owner_context, draft_job.id)
+
+
+def test_legacy_seniority_fallback_rejects_unknown_inferred_confirmation(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["seniority"] = ["manager"]
+    draft_job.draft_payload["confirmed_inferred_items"] = ["criterion:unknown"]
+
+    with pytest.raises(
+        ValidationError,
+        match="unknown inferred item confirmation",
+    ):
+        job_service.get_draft(owner_context, draft_job.id)
+
+
+def test_draft_reload_does_not_mask_unrelated_persisted_corruption(
+    job_service: JobService,
+    draft_job: Job,
+    owner_context: RequestContext,
+) -> None:
+    assert draft_job.draft_payload is not None
+    draft_job.draft_payload["target_titles"] = []
+
+    with pytest.raises(ValidationError, match="target_titles"):
+        job_service.get_draft(owner_context, draft_job.id)
 
 
 def test_confirmation_rejects_unapproved_adjacent_industry(
@@ -246,7 +347,7 @@ def test_unchanged_extracted_criterion_keeps_server_owned_provenance(
                 source_text="payments experience",
             )
         ],
-        seniority=["manager"],
+        seniority=["mid_level"],
         minimum_years=5,
         maximum_years=12,
         locations=["India"],
@@ -413,7 +514,7 @@ def test_double_extraction_failure_returns_editable_manual_draft(job_api) -> Non
                 "recruiter_entered": True,
             }
         ],
-        "seniority": ["manager"],
+        "seniority": ["mid_level"],
         "minimum_years": 5,
         "maximum_years": 12,
         "locations": ["India"],
@@ -638,7 +739,7 @@ def _draft_payload(title: str, criterion_key: str) -> dict[str, object]:
                 "source_text": f"{criterion_key} experience",
             }
         ],
-        "seniority": ["manager"],
+        "seniority": ["mid_level"],
         "minimum_years": 5,
         "maximum_years": 12,
         "locations": ["India"],
