@@ -32,6 +32,38 @@ compose() {
 echo "==> pulling images (${IMAGE_TAG})"
 compose pull --quiet api web
 
+echo "==> provisioning object store"
+MC_IMAGE="minio/mc:latest@sha256:37d109dddbbb2c95873f5fc81ac93f37023264770fc580a7564148892087b1b7"
+compose_network="recruitment-${ENV_NAME}_default"
+docker run --rm -i --network "${compose_network}" \
+  -e MC_HOST_local="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
+  -e WRITER_KEY="${OBJECT_STORE_WRITER_ACCESS_KEY_ID}" \
+  -e WRITER_SECRET="${OBJECT_STORE_WRITER_SECRET_ACCESS_KEY}" \
+  -e DELETE_KEY="${OBJECT_STORE_DELETE_ACCESS_KEY_ID}" \
+  -e DELETE_SECRET="${OBJECT_STORE_DELETE_SECRET_ACCESS_KEY}" \
+  -e BUCKET="${OBJECT_STORE_BUCKET}" \
+  --entrypoint sh "${MC_IMAGE}" <<'MCEOF'
+set -eu
+mc mb --ignore-existing "local/${BUCKET}"
+cat > /tmp/writer.json <<'EOF'
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
+ {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::${BUCKET}"]}]}
+EOF
+cat > /tmp/delete.json <<'EOF'
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
+ {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::${BUCKET}"]}]}
+EOF
+sed -i "s/\${BUCKET}/${BUCKET}/g" /tmp/writer.json /tmp/delete.json
+mc admin user add "local" "${WRITER_KEY}" "${WRITER_SECRET}" 2>/dev/null || true
+mc admin user add "local" "${DELETE_KEY}" "${DELETE_SECRET}" 2>/dev/null || true
+mc admin policy create local writer-pol /tmp/writer.json 2>/dev/null || mc admin policy update local writer-pol /tmp/writer.json
+mc admin policy create local delete-pol /tmp/delete.json 2>/dev/null || mc admin policy update local delete-pol /tmp/delete.json
+mc admin policy attach local writer-pol --user "${WRITER_KEY}" || true
+mc admin policy attach local delete-pol --user "${DELETE_KEY}" || true
+MCEOF
+
 echo "==> syncing least-privilege database roles"
 API_ROLE_PW=$(sed -n 's|^COMPOSE_DATABASE_URL=postgresql+psycopg://sourcing_api:\([^@]*\)@postgres:.*|\1|p' "${ENV_FILE}")
 MAINT_ROLE_PW=$(sed -n 's|^COMPOSE_MAINTENANCE_DATABASE_URL=postgresql+psycopg://sourcing_maintenance:\([^@]*\)@postgres:.*|\1|p' "${ENV_FILE}")
