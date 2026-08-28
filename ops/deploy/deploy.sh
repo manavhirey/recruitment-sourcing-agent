@@ -32,6 +32,15 @@ compose() {
 echo "==> pulling images (${IMAGE_TAG})"
 compose pull --quiet api web
 
+echo "==> syncing least-privilege database roles"
+API_ROLE_PW=$(sed -n 's|^COMPOSE_DATABASE_URL=postgresql+psycopg://sourcing_api:\([^@]*\)@postgres:.*|\1|p' "${ENV_FILE}")
+MAINT_ROLE_PW=$(sed -n 's|^COMPOSE_MAINTENANCE_DATABASE_URL=postgresql+psycopg://sourcing_maintenance:\([^@]*\)@postgres:.*|\1|p' "${ENV_FILE}")
+test -n "${API_ROLE_PW}" && test -n "${MAINT_ROLE_PW}"
+compose exec -T postgres psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 <<SQL
+ALTER ROLE sourcing_api LOGIN PASSWORD '${API_ROLE_PW}';
+ALTER ROLE sourcing_maintenance LOGIN PASSWORD '${MAINT_ROLE_PW}';
+SQL
+
 echo "==> running migrations"
 compose run --rm -T -e MIGRATION_DATABASE_URL="${COMPOSE_MIGRATION_DATABASE_URL:?COMPOSE_MIGRATION_DATABASE_URL required}" api alembic upgrade head < /dev/null
 
