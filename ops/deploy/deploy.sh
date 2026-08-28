@@ -15,7 +15,13 @@ REPO_DIR="${ROOT}/repo"
 ENV_FILE="${ROOT}/.env"
 
 cd "${REPO_DIR}"
-git fetch --quiet origin "${GIT_REF}"
+for attempt in 1 2 3; do
+  if git fetch --quiet origin "${GIT_REF}"; then
+    break
+  fi
+  [ "${attempt}" -eq 3 ] && { echo "ERROR: git fetch failed for ${GIT_REF}" >&2; exit 1; }
+  sleep 3
+done
 git checkout --quiet --force FETCH_HEAD
 
 # Shell-source the env file so compose interpolation and migration URLs are set.
@@ -35,6 +41,7 @@ compose pull --quiet api web
 echo "==> provisioning object store"
 MC_IMAGE="minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
 compose_network="recruitment-${ENV_NAME}_default"
+docker network inspect "${compose_network}" >/dev/null 2>&1 || docker network create "${compose_network}"
 docker run --rm -i --network "${compose_network}" \
   -e MC_HOST_local="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
   -e WRITER_KEY="${OBJECT_STORE_WRITER_ACCESS_KEY_ID}" \

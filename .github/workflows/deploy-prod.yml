@@ -49,6 +49,6 @@ jobs:
           install -m 600 /dev/null ~/.ssh/id_ed25519
           printf '%s' "$VPS_SSH_KEY" | base64 -d > ~/.ssh/id_ed25519
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
-          ssh -o BatchMode=yes "${VPS_USER}@${VPS_HOST}" \
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${VPS_USER}@${VPS_HOST}" \
             "bash -s" -- prod "${{ github.event.workflow_run.head_sha }}" "$IMAGE_TAG" \
             < ops/deploy/deploy.sh
