@@ -1,0 +1,76 @@
+name: Deploy dev environment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to deploy"
+        required: true
+      pr_head_sha:
+        description: "PR head SHA to deploy"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+concurrency:
+  group: deploy-dev-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  API_IMAGE: ghcr.io/${{ github.repository_owner }}/recruitment-sourcing-api
+  WEB_IMAGE: ghcr.io/${{ github.repository_owner }}/recruitment-sourcing-web
+
+jobs:
+  deploy-dev:
+    runs-on: ubuntu-24.04
+    environment: dev
+    steps:
+      - name: Resolve PR context
+        id: pr
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.inputs.pr_head_sha }}
+        run: |
+          echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "sha=${PR_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=pr-${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+      - name: Build and push images
+        run: |
+          docker build --pull -t "$API_IMAGE:${{ steps.pr.outputs.tag }}" ./backend
+          docker build --pull -t "$WEB_IMAGE:${{ steps.pr.outputs.tag }}" ./web
+          docker push "$API_IMAGE:${{ steps.pr.outputs.tag }}"
+          docker push "$WEB_IMAGE:${{ steps.pr.outputs.tag }}"
+      - name: Deploy over SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ vars.VPS_HOST }}
+          VPS_USER: ${{ vars.VPS_USER || 'deploy' }}
+        run: |
+          mkdir -p ~/.ssh
+          install -m 600 /dev/null ~/.ssh/id_ed25519
+          printf '%s' "$VPS_SSH_KEY" | base64 -d > ~/.ssh/id_ed25519
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          ssh -o BatchMode=yes "${VPS_USER}@${VPS_HOST}" \
+            "bash -s" -- dev "refs/pull/${{ steps.pr.outputs.number }}/head" "${{ steps.pr.outputs.tag }}" \
+            < ops/deploy/deploy.sh
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ steps.pr.outputs.number }}" --body "Dev environment deployed ✅
+          - Web: https://dev.kunigami.cloud
+          - API: https://dev-api.kunigami.cloud
+          - Image tag: \`${{ steps.pr.outputs.tag }}\` @ \`${{ steps.pr.outputs.sha }}\`"

@@ -1,0 +1,48 @@
+# Deployment override: prebuilt GHCR images + Traefik ingress.
+# Used on the VPS as: docker compose -f compose.yaml -f ops/deploy/compose.ghcr.yml
+# Requires env vars (see ops/deploy/env.template):
+#   ENV_NAME, API_HOST, WEB_HOST, API_IMAGE_TAG,
+#   TRAEFIK_NETWORK, TRAEFIK_ENTRYPOINT, TRAEFIK_CERTRESOLVER
+services:
+  api:
+    image: ghcr.io/manavhirey/recruitment-sourcing-api:${API_IMAGE_TAG:?API_IMAGE_TAG required}
+    pull_policy: always
+    ports: !reset []
+    networks: !override [default, metrics-internal, traefik-proxy]
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik-proxy}"
+      - "traefik.http.routers.${ENV_NAME}-api.rule=Host(`${API_HOST}`)"
+      - "traefik.http.routers.${ENV_NAME}-api.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.${ENV_NAME}-api.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.services.${ENV_NAME}-api.loadbalancer.server.port=8000"
+
+  worker:
+    image: ghcr.io/manavhirey/recruitment-sourcing-api:${API_IMAGE_TAG:?API_IMAGE_TAG required}
+    pull_policy: always
+
+  maintenance-worker:
+    image: ghcr.io/manavhirey/recruitment-sourcing-api:${API_IMAGE_TAG:?API_IMAGE_TAG required}
+    pull_policy: always
+
+  scheduler:
+    image: ghcr.io/manavhirey/recruitment-sourcing-api:${API_IMAGE_TAG:?API_IMAGE_TAG required}
+    pull_policy: always
+
+  web:
+    image: ghcr.io/manavhirey/recruitment-sourcing-web:${API_IMAGE_TAG:?API_IMAGE_TAG required}
+    pull_policy: always
+    ports: !reset []
+    networks: !override [default, traefik-proxy]
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik-proxy}"
+      - "traefik.http.routers.${ENV_NAME}-web.rule=Host(`${WEB_HOST}`)"
+      - "traefik.http.routers.${ENV_NAME}-web.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.${ENV_NAME}-web.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.services.${ENV_NAME}-web.loadbalancer.server.port=3000"
+
+networks:
+  traefik-proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik-proxy}
