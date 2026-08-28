@@ -4,6 +4,7 @@
 # Runs on the VPS as the "deploy" user. Expects:
 #   /opt/recruitment/<env>/repo    git checkout of this repository
 #   /opt/recruitment/<env>/.env    environment file (see ops/deploy/env.template)
+#   /opt/recruitment/<env>/tls/    internal CA + service certs (TLS_ENABLED=true only)
 set -euo pipefail
 
 ENV_NAME="${1:?env name required (dev|prod)}"
@@ -24,15 +25,20 @@ for attempt in 1 2 3; do
 done
 git checkout --quiet --force FETCH_HEAD
 
-# Shell-source the env file so compose interpolation and migration URLs are set.
-set -a
-# shellcheck disable=SC1090
-. "${ENV_FILE}"
-set +a
+# Read env values with sed (never shell-source: URLs contain ? and &).
+envget() {
+  sed -n "s|^$1=\(.*\)$|\1|p" "${ENV_FILE}" | head -1
+}
+
 export API_IMAGE_TAG="${IMAGE_TAG}"
 
+COMPOSE_FILES=(-f compose.yaml -f ops/deploy/compose.ghcr.yml)
+if [ "$(envget TLS_ENABLED)" = "true" ]; then
+  COMPOSE_FILES+=(-f ops/deploy/compose.tls.yml)
+fi
+
 compose() {
-  docker compose -p "recruitment-${ENV_NAME}" --env-file "${ENV_FILE}" -f compose.yaml -f ops/deploy/compose.ghcr.yml --profile application "$@"
+  docker compose -p "recruitment-${ENV_NAME}" --env-file "${ENV_FILE}" "${COMPOSE_FILES[@]}" --profile application "$@"
 }
 
 echo "==> pulling images (${IMAGE_TAG})"
@@ -45,13 +51,19 @@ echo "==> provisioning object store"
 MC_IMAGE="minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
 compose_network="recruitment-${ENV_NAME}_default"
 docker network inspect "${compose_network}" >/dev/null 2>&1 || docker network create "${compose_network}"
-docker run --rm -i --network "${compose_network}" \
-  -e MC_HOST_local="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
-  -e WRITER_KEY="${OBJECT_STORE_WRITER_ACCESS_KEY_ID}" \
-  -e WRITER_SECRET="${OBJECT_STORE_WRITER_SECRET_ACCESS_KEY}" \
-  -e DELETE_KEY="${OBJECT_STORE_DELETE_ACCESS_KEY_ID}" \
-  -e DELETE_SECRET="${OBJECT_STORE_DELETE_SECRET_ACCESS_KEY}" \
-  -e BUCKET="${OBJECT_STORE_BUCKET}" \
+MC_SCHEME="http"
+MC_TLS_ARGS=()
+if [ "$(envget TLS_ENABLED)" = "true" ]; then
+  MC_SCHEME="https"
+  MC_TLS_ARGS=(-v "${ROOT}/tls/ca.pem:/etc/ssl/internal-ca.pem:ro" -e SSL_CERT_FILE=/etc/ssl/internal-ca.pem)
+fi
+docker run --rm -i --network "${compose_network}" "${MC_TLS_ARGS[@]}" \
+  -e MC_HOST_local="${MC_SCHEME}://$(envget MINIO_ROOT_USER):$(envget MINIO_ROOT_PASSWORD)@minio:9000" \
+  -e WRITER_KEY="$(envget OBJECT_STORE_WRITER_ACCESS_KEY_ID)" \
+  -e WRITER_SECRET="$(envget OBJECT_STORE_WRITER_SECRET_ACCESS_KEY)" \
+  -e DELETE_KEY="$(envget OBJECT_STORE_DELETE_ACCESS_KEY_ID)" \
+  -e DELETE_SECRET="$(envget OBJECT_STORE_DELETE_SECRET_ACCESS_KEY)" \
+  -e BUCKET="$(envget OBJECT_STORE_BUCKET)" \
   --entrypoint sh "${MC_IMAGE}" <<'MCEOF'
 set -eu
 mc mb --ignore-existing "local/${BUCKET}"
@@ -74,16 +86,32 @@ mc admin policy attach local delete-pol --user "${DELETE_KEY}" || true
 MCEOF
 
 echo "==> syncing least-privilege database roles"
-API_ROLE_PW=$(sed -n 's|^COMPOSE_DATABASE_URL=postgresql+psycopg://sourcing_api:\([^@]*\)@postgres:.*|\1|p' "${ENV_FILE}")
-MAINT_ROLE_PW=$(sed -n 's|^COMPOSE_MAINTENANCE_DATABASE_URL=postgresql+psycopg://sourcing_maintenance:\([^@]*\)@postgres:.*|\1|p' "${ENV_FILE}")
-test -n "${API_ROLE_PW}" && test -n "${MAINT_ROLE_PW}"
-compose exec -T postgres psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 <<SQL
+API_ROLE_PW=$(sed -n 's|^COMPOSE_DATABASE_URL=postgresql+psycopg://sourcing_api:\([^@]*\)@postgres.*|\1|p' "${ENV_FILE}")
+MAINT_ROLE_PW=$(sed -n 's|^COMPOSE_MAINTENANCE_DATABASE_URL=postgresql+psycopg://sourcing_maintenance:\([^@]*\)@postgres.*|\1|p' "${ENV_FILE}")
+MIGRATION_ROLE_PW=$(sed -n 's|^COMPOSE_MIGRATION_DATABASE_URL=postgresql+psycopg://\([^:]*\):\([^@]*\)@postgres.*|\2|p' "${ENV_FILE}")
+MIGRATION_ROLE_USER=$(sed -n 's|^COMPOSE_MIGRATION_DATABASE_URL=postgresql+psycopg://\([^:]*\):\([^@]*\)@postgres.*|\1|p' "${ENV_FILE}")
+test -n "${API_ROLE_PW}" && test -n "${MAINT_ROLE_PW}" && test -n "${MIGRATION_ROLE_PW}"
+MIGRATION_ROLE_SQL=""
+if [ "$(envget ENVIRONMENT)" = "production" ]; then
+  test "${MIGRATION_ROLE_USER}" = "sourcing_migration"
+  MIGRATION_ROLE_SQL="ALTER ROLE sourcing_migration LOGIN PASSWORD '${MIGRATION_ROLE_PW}';
+ALTER ROLE sourcing_migration SUPERUSER;"
+else
+  test "${MIGRATION_ROLE_USER}" = "postgres"
+fi
+compose exec -T postgres psql -U "$(envget POSTGRES_USER)" -d "$(envget POSTGRES_DB)" -v ON_ERROR_STOP=1 <<SQL
+DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sourcing_migration') THEN
+    CREATE ROLE sourcing_migration LOGIN;
+  END IF;
+END \$\$;
 ALTER ROLE sourcing_api LOGIN PASSWORD '${API_ROLE_PW}';
 ALTER ROLE sourcing_maintenance LOGIN PASSWORD '${MAINT_ROLE_PW}';
+${MIGRATION_ROLE_SQL}
 SQL
 
 echo "==> running migrations"
-compose run --rm -T -e MIGRATION_DATABASE_URL="${COMPOSE_MIGRATION_DATABASE_URL:?COMPOSE_MIGRATION_DATABASE_URL required}" api alembic upgrade head < /dev/null
+compose run --rm -T -e MIGRATION_DATABASE_URL="$(envget COMPOSE_MIGRATION_DATABASE_URL)" api alembic upgrade head < /dev/null
 
 echo "==> starting stack"
 compose up -d --no-build --remove-orphans
@@ -91,19 +119,19 @@ compose up -d --no-build --remove-orphans
 echo "==> waiting for API health"
 ok=""
 for _ in $(seq 1 30); do
-  if curl -fsS --max-time 5 "${API_PUBLIC_URL:?API_PUBLIC_URL required}/health/ready" >/dev/null 2>&1; then
+  if curl -fsS --max-time 5 "$(envget API_PUBLIC_URL)/health/ready" >/dev/null 2>&1; then
     ok=1
     break
   fi
   sleep 5
 done
 if [ -z "${ok}" ]; then
-  echo "ERROR: API health check failed for ${API_PUBLIC_URL}" >&2
+  echo "ERROR: API health check failed for $(envget API_PUBLIC_URL)" >&2
   compose ps
   exit 1
 fi
 
 echo "==> deployed ${ENV_NAME} @ ${IMAGE_TAG}"
-echo "    web: ${WEB_PUBLIC_URL:-unknown}"
-echo "    api: ${API_PUBLIC_URL}"
+echo "    web: $(envget WEB_PUBLIC_URL)"
+echo "    api: $(envget API_PUBLIC_URL)"
 compose ps
