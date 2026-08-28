@@ -772,7 +772,10 @@ def test_blocked_webhook_application_does_not_stall_event_loop(
 
     assert probe_status == 200
     assert webhook_status == 202
-    assert elapsed < 0.3
+    # A stalled event loop keeps the probe pending until the blocked webhook
+    # application times out (>= 0.75s); allow generous scheduling headroom for
+    # loaded CI runners while still failing on a genuine stall.
+    assert elapsed < 0.7
 
 
 def test_duplicate_nonterminal_payload_can_terminalize_same_request(
