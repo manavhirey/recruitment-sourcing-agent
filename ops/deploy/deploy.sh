@@ -90,8 +90,15 @@ API_ROLE_PW=$(sed -n 's|^COMPOSE_DATABASE_URL=postgresql+psycopg://sourcing_api:
 MAINT_ROLE_PW=$(sed -n 's|^COMPOSE_MAINTENANCE_DATABASE_URL=postgresql+psycopg://sourcing_maintenance:\([^@]*\)@postgres.*|\1|p' "${ENV_FILE}")
 MIGRATION_ROLE_PW=$(sed -n 's|^COMPOSE_MIGRATION_DATABASE_URL=postgresql+psycopg://\([^:]*\):\([^@]*\)@postgres.*|\2|p' "${ENV_FILE}")
 MIGRATION_ROLE_USER=$(sed -n 's|^COMPOSE_MIGRATION_DATABASE_URL=postgresql+psycopg://\([^:]*\):\([^@]*\)@postgres.*|\1|p' "${ENV_FILE}")
-test -n "${API_ROLE_PW}" && test -n "${MAINT_ROLE_PW}"
-test -n "${MIGRATION_ROLE_PW}" && test "${MIGRATION_ROLE_USER}" = "sourcing_migration"
+test -n "${API_ROLE_PW}" && test -n "${MAINT_ROLE_PW}" && test -n "${MIGRATION_ROLE_PW}"
+MIGRATION_ROLE_SQL=""
+if [ "$(envget ENVIRONMENT)" = "production" ]; then
+  test "${MIGRATION_ROLE_USER}" = "sourcing_migration"
+  MIGRATION_ROLE_SQL="ALTER ROLE sourcing_migration LOGIN PASSWORD '${MIGRATION_ROLE_PW}';
+ALTER ROLE sourcing_migration SUPERUSER;"
+else
+  test "${MIGRATION_ROLE_USER}" = "postgres"
+fi
 compose exec -T postgres psql -U "$(envget POSTGRES_USER)" -d "$(envget POSTGRES_DB)" -v ON_ERROR_STOP=1 <<SQL
 DO \$\$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sourcing_migration') THEN
@@ -100,8 +107,7 @@ DO \$\$ BEGIN
 END \$\$;
 ALTER ROLE sourcing_api LOGIN PASSWORD '${API_ROLE_PW}';
 ALTER ROLE sourcing_maintenance LOGIN PASSWORD '${MAINT_ROLE_PW}';
-ALTER ROLE sourcing_migration LOGIN PASSWORD '${MIGRATION_ROLE_PW}';
-ALTER ROLE sourcing_migration SUPERUSER;
+${MIGRATION_ROLE_SQL}
 SQL
 
 echo "==> running migrations"
