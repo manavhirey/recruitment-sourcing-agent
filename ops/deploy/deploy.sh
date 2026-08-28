@@ -33,7 +33,7 @@ echo "==> pulling images (${IMAGE_TAG})"
 compose pull --quiet api web
 
 echo "==> running migrations"
-compose run --rm -e MIGRATION_DATABASE_URL="${COMPOSE_MIGRATION_DATABASE_URL:?COMPOSE_MIGRATION_DATABASE_URL required}" api alembic upgrade head
+compose run --rm -T -e MIGRATION_DATABASE_URL="${COMPOSE_MIGRATION_DATABASE_URL:?COMPOSE_MIGRATION_DATABASE_URL required}" api alembic upgrade head
 
 echo "==> starting stack"
 compose up -d --no-build --remove-orphans
