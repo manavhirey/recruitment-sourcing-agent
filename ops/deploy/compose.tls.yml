@@ -17,6 +17,8 @@ services:
        "--tls-cert-file", "/tls/server.crt", "--tls-key-file", "/tls/server.key",
        "--tls-ca-cert-file", "/tls/ca.pem", "--tls-auth-clients", "no",
        "--requirepass", "${REDIS_TLS_PASSWORD:?REDIS_TLS_PASSWORD required}"]
+    environment:
+      REDIS_TLS_PASSWORD: ${REDIS_TLS_PASSWORD}
     volumes:
       - ../tls/redis/server.crt:/tls/server.crt:ro
       - ../tls/redis/server.key:/tls/server.key:ro
