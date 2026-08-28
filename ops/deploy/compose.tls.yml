@@ -27,12 +27,9 @@ services:
       retries: 10
 
   minio:
-    environment:
-      MINIO_CERT_FILE: /tls/server.crt
-      MINIO_KEY_FILE: /tls/server.key
     volumes:
-      - ../tls/minio/server.crt:/tls/server.crt:ro
-      - ../tls/minio/server.key:/tls/server.key:ro
+      - ../tls/minio/server.crt:/root/.minio/certs/public.crt:ro
+      - ../tls/minio/server.key:/root/.minio/certs/private.key:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -skf https://localhost:9000/minio/health/live"]
       interval: 5s
