@@ -15,7 +15,8 @@ services:
     command:
       ["redis-server", "--port", "0", "--tls-port", "6379",
        "--tls-cert-file", "/tls/server.crt", "--tls-key-file", "/tls/server.key",
-       "--tls-ca-cert-file", "/tls/ca.pem", "--requirepass", "${REDIS_TLS_PASSWORD:?REDIS_TLS_PASSWORD required}"]
+       "--tls-ca-cert-file", "/tls/ca.pem", "--tls-auth-clients", "no",
+       "--requirepass", "${REDIS_TLS_PASSWORD:?REDIS_TLS_PASSWORD required}"]
     volumes:
       - ../tls/redis/server.crt:/tls/server.crt:ro
       - ../tls/redis/server.key:/tls/server.key:ro
