@@ -49,7 +49,7 @@ jobs:
       - name: Build and push images
         run: |
           docker build --pull -t "$API_IMAGE:${{ steps.pr.outputs.tag }}" ./backend
-          docker build --pull -t "$WEB_IMAGE:${{ steps.pr.outputs.tag }}" ./web
+          docker build --pull --build-arg BUILD_OIDC_ISSUER=https://auth.kunigami.cloud/ -t "$WEB_IMAGE:${{ steps.pr.outputs.tag }}" ./web
           docker push "$API_IMAGE:${{ steps.pr.outputs.tag }}"
           docker push "$WEB_IMAGE:${{ steps.pr.outputs.tag }}"
       - name: Deploy over SSH
