@@ -6,18 +6,23 @@ if (process.env.NODE_ENV === "production") {
   assertProductionEnvironment(process.env)
 }
 
-const contentSecurityPolicy = [
-  "default-src 'self'",
-  "base-uri 'self'",
-  "frame-ancestors 'none'",
-  "form-action 'self'",
-  "img-src 'self' data:",
-  "font-src 'self'",
-  "object-src 'none'",
-  `script-src 'self' 'unsafe-inline'${process.env.NODE_ENV === "production" ? "" : " 'unsafe-eval'"}`,
-  "style-src 'self' 'unsafe-inline'",
-  "connect-src 'self'",
-].join("; ")
+export function contentSecurityPolicyFor(oidcIssuer = process.env.OIDC_ISSUER) {
+  const oidcOrigin = new URL(oidcIssuer ?? "https://identity.build.invalid/").origin
+  return [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+    `form-action 'self' ${oidcOrigin}`,
+    "img-src 'self' data:",
+    "font-src 'self'",
+    "object-src 'none'",
+    `script-src 'self' 'unsafe-inline'${process.env.NODE_ENV === "production" ? "" : " 'unsafe-eval'"}`,
+    "style-src 'self' 'unsafe-inline'",
+    "connect-src 'self'",
+  ].join("; ")
+}
+
+const contentSecurityPolicy = contentSecurityPolicyFor()
 
 const nextConfig: NextConfig = {
   agentRules: false,

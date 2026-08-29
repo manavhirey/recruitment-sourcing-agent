@@ -35,7 +35,7 @@ jobs:
           IMAGE_TAG: main-${{ github.event.workflow_run.head_sha }}
         run: |
           docker build --pull -t "$API_IMAGE:$IMAGE_TAG" ./backend
-          docker build --pull -t "$WEB_IMAGE:$IMAGE_TAG" ./web
+          docker build --pull --build-arg BUILD_OIDC_ISSUER=https://auth.kunigami.cloud/ -t "$WEB_IMAGE:$IMAGE_TAG" ./web
           docker push "$API_IMAGE:$IMAGE_TAG"
           docker push "$WEB_IMAGE:$IMAGE_TAG"
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"

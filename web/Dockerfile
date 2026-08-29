@@ -6,6 +6,7 @@ RUN npm ci
 
 FROM node:22.23.2-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS builder
 WORKDIR /app
+ARG BUILD_OIDC_ISSUER=https://identity.build.invalid/
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY . .
@@ -13,7 +14,7 @@ RUN mkdir -p public \
     && export AUTH_SECRET="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(48).toString("base64url"))')" \
     && export AUTH_URL=https://build.invalid \
     && export API_BASE_URL=https://api.build.invalid \
-    && export OIDC_ISSUER=https://identity.build.invalid/ \
+    && export OIDC_ISSUER="${BUILD_OIDC_ISSUER}" \
     && export OIDC_AUDIENCE=https://api.build.invalid/ \
     && export OIDC_CLIENT_ID=build-only \
     && export OIDC_CLIENT_SECRET="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("base64url"))')" \
